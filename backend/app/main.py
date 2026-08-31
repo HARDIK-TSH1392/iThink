@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from .database import init_db
 from .iLogs.iLogs_api import router as ilogs_router
 from .iNcidents.iNcidents_api import router as incidents_router
+from .iTriage.iTriage_api import router as itriage_router
 
 
 @asynccontextmanager
@@ -24,6 +25,7 @@ app = FastAPI(
 # Include routers
 app.include_router(ilogs_router, prefix="/api/v1", tags=["iLogs"])
 app.include_router(incidents_router, prefix="/api/v1", tags=["iNcidents"])
+app.include_router(itriage_router, prefix="/api/v1", tags=["iTriage"])
 
 
 @app.get("/health")

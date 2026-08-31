@@ -6,6 +6,8 @@ class Settings(BaseSettings):
     # For local development
     database_url: str = "sqlite+aiosqlite:///./ithink_dev.db"
 
+    gemini_api_key: str = ""
+
     class Config:
         env_file = ".env"
 
