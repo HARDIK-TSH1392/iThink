@@ -1,0 +1,51 @@
+# Environments
+.env
+.env.*
+!.env.example
+*.env
+.venv/
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Databases
+*.sqlite3
+*.sqlite3-journal
+*.db
+
+# Alembic (keep migration scripts, ignore local sqlite artifacts already covered above)
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.swp
