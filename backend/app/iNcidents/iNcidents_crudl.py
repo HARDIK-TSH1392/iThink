@@ -30,7 +30,7 @@ async def create_incident(db: AsyncSession, payload: IncidentCreate) -> Incident
     db.add(incident)
     await db.flush()  # assign incident.id before linking logs
 
-    for log_id in payload.log_ids:
+    for log_id in dict.fromkeys(payload.log_ids):  # de-dupe, preserve order
         db.add(IncidentLog(incident_id=incident.id, log_id=log_id))
 
     await db.commit()

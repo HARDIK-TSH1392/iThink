@@ -21,7 +21,7 @@ IncidentPriority = Literal["P1", "P2", "P3"]
 class IncidentCreate(BaseModel):
     """Schema for creating an incident (request body)."""
 
-    title: str
+    title: str = Field(..., min_length=1)
     summary: Optional[str] = None
     region: str
     service: str
@@ -66,5 +66,5 @@ class IncidentApprovalDecision(BaseModel):
     """The single human-approval gate before orchestration/external actions."""
 
     decision: Literal["approve", "reject"]
-    approved_by: str
+    approved_by: str = Field(..., min_length=1)
     reason: Optional[str] = None

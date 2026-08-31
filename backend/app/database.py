@@ -1,3 +1,4 @@
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
@@ -10,6 +11,15 @@ engine = create_async_engine(
     echo=False, # set True to log SQL queries (useful in dev)
     pool_pre_ping=True, # helps detect stale connections
 )
+
+if engine.sync_engine.dialect.name == "sqlite":
+    # SQLite does not enforce FOREIGN KEY constraints (and therefore
+    # ON DELETE CASCADE) unless explicitly turned on per connection.
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 async_session = async_sessionmaker(
     engine,
