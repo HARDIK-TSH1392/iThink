@@ -1,5 +1,6 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import select
 
@@ -21,6 +22,21 @@ from .iTriage_model import TriageResult
 from .iTriage_utils import call_gemini_for_verdict, compute_deterministic_confidence
 
 EVIDENCE_WINDOW_MINUTES = 60
+
+# Serializes the "check for an open incident, else create one" critical
+# section per (source_id, service, region), so a burst of concurrent
+# correlated logs can't race past the dedup check and each create their
+# own duplicate incident. In-process only — correct for a single worker
+# process, which is what this deployment runs.
+_incident_key_locks: Dict[Tuple[str, str, str], asyncio.Lock] = {}
+_locks_registry_guard = asyncio.Lock()
+
+
+async def _get_key_lock(key: Tuple[str, str, str]) -> asyncio.Lock:
+    async with _locks_registry_guard:
+        if key not in _incident_key_locks:
+            _incident_key_locks[key] = asyncio.Lock()
+        return _incident_key_locks[key]
 
 
 async def _fetch_evidence(db, log: ILog) -> List[ILog]:
@@ -84,71 +100,75 @@ async def run_triage_for_log(log_id: int) -> dict:
         if log is None:
             return {"action": "error", "detail": "log not found"}
 
-        existing = await _find_open_incident(db, log)
-        if existing is not None:
-            await link_log(db, existing.id, log.id)
-            return {"action": "linked_existing", "incident_id": existing.id}
+        key = (log.source_id, log.service, log.region)
+        key_lock = await _get_key_lock(key)
 
-        evidence = await _fetch_evidence(db, log)
-        if not evidence:
-            evidence = [log]
+        async with key_lock:
+            existing = await _find_open_incident(db, log)
+            if existing is not None:
+                await link_log(db, existing.id, log.id)
+                return {"action": "linked_existing", "incident_id": existing.id}
 
-        deterministic_confidence = compute_deterministic_confidence(
-            evidence_count=len(evidence),
-            distinct_severities={e.severity for e in evidence},
-            time_span_minutes=(evidence[-1].timestamp - evidence[0].timestamp).total_seconds() / 60,
-        )
-        deterministic_priority = infer_incident_priority(log)
-        deterministic_impact_score = compute_impact_score(log)
+            evidence = await _fetch_evidence(db, log)
+            if not evidence:
+                evidence = [log]
 
-        incident = await create_incident(
-            db,
-            IncidentCreate(
-                title=f"Investigating {log.service} in {log.region}",
-                region=log.region,
-                service=log.service,
-                environment=log.environment,
-                source_id=log.source_id,
-                priority=deterministic_priority,
-                impact_score=deterministic_impact_score,
-                log_ids=[e.id for e in evidence],
-            ),
-        )
-
-        if is_valid_transition(incident.status, STATUS_TRIAGE):
-            incident = await update_status(db, incident, STATUS_TRIAGE)
-
-        prompt = _build_prompt(log, evidence, deterministic_priority, deterministic_impact_score)
-
-        try:
-            verdict = await call_gemini_for_verdict(prompt)
-        except Exception as exc:
-            print(f"[iTriage] Gemini call failed for log_id={log_id}, incident_id={incident.id}: {exc}")
-            return {"action": "gemini_error", "incident_id": incident.id, "detail": str(exc)}
-
-        db.add(
-            TriageResult(
-                log_id=log.id,
-                incident_id=incident.id,
-                deterministic_confidence=deterministic_confidence,
-                verdict=verdict.model_dump(),
+            deterministic_confidence = compute_deterministic_confidence(
+                evidence_count=len(evidence),
+                distinct_severities={e.severity for e in evidence},
+                time_span_minutes=(evidence[-1].timestamp - evidence[0].timestamp).total_seconds() / 60,
             )
-        )
+            deterministic_priority = infer_incident_priority(log)
+            deterministic_impact_score = compute_impact_score(log)
 
-        incident.title = verdict.incident_summary[:255]
-        incident.summary = verdict.incident_summary
-        incident.priority = verdict.priority_assessment
-        await db.commit()
-        await db.refresh(incident)
+            incident = await create_incident(
+                db,
+                IncidentCreate(
+                    title=f"Investigating {log.service} in {log.region}",
+                    region=log.region,
+                    service=log.service,
+                    environment=log.environment,
+                    source_id=log.source_id,
+                    priority=deterministic_priority,
+                    impact_score=deterministic_impact_score,
+                    log_ids=[e.id for e in evidence],
+                ),
+            )
 
-        next_status = STATUS_CLOSED if verdict.incident_likelihood == "low" else STATUS_AWAITING_APPROVAL
-        if is_valid_transition(incident.status, next_status):
-            incident = await update_status(db, incident, next_status)
+            if is_valid_transition(incident.status, STATUS_TRIAGE):
+                incident = await update_status(db, incident, STATUS_TRIAGE)
 
-        return {
-            "action": "triaged",
-            "incident_id": incident.id,
-            "status": incident.status,
-            "deterministic_confidence": deterministic_confidence,
-            "verdict": verdict.model_dump(),
-        }
+            prompt = _build_prompt(log, evidence, deterministic_priority, deterministic_impact_score)
+
+            try:
+                verdict = await call_gemini_for_verdict(prompt)
+            except Exception as exc:
+                print(f"[iTriage] Gemini call failed for log_id={log_id}, incident_id={incident.id}: {exc}")
+                return {"action": "gemini_error", "incident_id": incident.id, "detail": str(exc)}
+
+            db.add(
+                TriageResult(
+                    log_id=log.id,
+                    incident_id=incident.id,
+                    deterministic_confidence=deterministic_confidence,
+                    verdict=verdict.model_dump(),
+                )
+            )
+
+            incident.title = verdict.incident_summary[:255]
+            incident.summary = verdict.incident_summary
+            incident.priority = verdict.priority_assessment
+            await db.commit()
+            await db.refresh(incident)
+
+            next_status = STATUS_CLOSED if verdict.incident_likelihood == "low" else STATUS_AWAITING_APPROVAL
+            if is_valid_transition(incident.status, next_status):
+                incident = await update_status(db, incident, next_status)
+
+            return {
+                "action": "triaged",
+                "incident_id": incident.id,
+                "status": incident.status,
+                "deterministic_confidence": deterministic_confidence,
+                "verdict": verdict.model_dump(),
+            }
