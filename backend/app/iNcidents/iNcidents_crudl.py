@@ -3,9 +3,22 @@ from sqlalchemy import select
 from datetime import datetime, timezone
 from typing import Sequence, Optional, List
 
+from app.iLogs.iLogs_model import ILog
 from .iNcidents_model import Incident, IncidentLog
 from .iNcidents_schema import IncidentCreate
 from .iNcidents_utils import TERMINAL_STATUSES, STATUS_ORCHESTRATING, STATUS_REJECTED
+
+
+async def existing_log_ids(db: AsyncSession, log_ids: List[int]) -> List[int]:
+    """
+    Given candidate log IDs, return the subset that actually exist in iLogs.
+    Used to validate evidence links before persisting them, since SQLite
+    (unlike Postgres) does not enforce the incident_logs FK by default.
+    """
+    if not log_ids:
+        return []
+    result = await db.execute(select(ILog.id).where(ILog.id.in_(log_ids)))
+    return [row[0] for row in result.all()]
 
 
 async def create_incident(db: AsyncSession, payload: IncidentCreate) -> Incident:

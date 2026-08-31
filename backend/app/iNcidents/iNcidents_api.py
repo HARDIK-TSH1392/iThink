@@ -17,6 +17,7 @@ from .iNcidents_crudl import (
     link_log,
     update_status,
     record_approval_decision,
+    existing_log_ids,
 )
 from .iNcidents_utils import is_valid_transition, STATUS_AWAITING_APPROVAL
 
@@ -47,6 +48,15 @@ async def create_incident_endpoint(
     """
     Create a new incident, optionally linking evidence logs at creation time.
     """
+    if payload.log_ids:
+        found = set(await existing_log_ids(db, payload.log_ids))
+        missing = sorted(set(payload.log_ids) - found)
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"log_ids not found in iLogs: {missing}",
+            )
+
     incident = await create_incident(db, payload)
     return await _to_read(db, incident)
 
@@ -102,6 +112,9 @@ async def link_log_endpoint(
     incident = await get_incident(db, incident_id)
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
+
+    if not await existing_log_ids(db, [log_id]):
+        raise HTTPException(status_code=404, detail="Log not found")
 
     await link_log(db, incident_id, log_id)
     return await _to_read(db, incident)
