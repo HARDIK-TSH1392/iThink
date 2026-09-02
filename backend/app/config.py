@@ -8,6 +8,11 @@ class Settings(BaseSettings):
 
     gemini_api_key: str = ""
 
+    # From Agora Console -> Project -> notification config. Empty until a
+    # webhook is actually registered there (needs a public HTTPS URL, so
+    # this stays unset for local dev). See iCall_utils.verify_agora_signature.
+    agora_webhook_secret: str = ""
+
     class Config:
         env_file = ".env"
 
