@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from .database import init_db
@@ -21,6 +22,17 @@ app = FastAPI(
     description="Backend for iThink – EchoSphere 2026",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+# Dev/demo only: the demo dashboard (demo/dashboard.html) is opened as a
+# static file or served from a different port than this API, so the browser
+# needs CORS allowed. Wide open on purpose — this is a local hackathon demo
+# server, not a deployed one; tighten this before it's ever public.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Include routers
