@@ -21,12 +21,14 @@ from .iCall_schema import (
 from .iCall_service import (
     get_or_create_call,
     get_call,
+    get_call_by_channel_name,
     update_call_status,
     record_utterance,
     list_utterances,
+    apply_structuring_update,
     IncidentNotFoundError,
 )
-from .iCall_utils import generate_chat_reply, describe_event_type, verify_agora_signature
+from .iCall_utils import generate_structuring_update, describe_event_type, verify_agora_signature
 
 router = APIRouter(prefix="/icall", tags=["iCall"])
 
@@ -132,25 +134,38 @@ def _sse_chunk(completion_id: str, created: int, model: str, delta: dict, finish
     return f"data: {json.dumps(payload)}\n\n"
 
 
-@router.post("/llm/chat/completions")
-async def chat_completions_endpoint(payload: ChatCompletionRequest):
+@router.post("/channel/{channel_name}/llm/chat/completions")
+async def chat_completions_endpoint(
+    channel_name: str,
+    payload: ChatCompletionRequest,
+    db: AsyncSession = Depends(get_db),
+):
     """
     Agora Custom LLM target (properties.llm.base_url in the agent's join
-    config). Proxy-only for now: forwards the conversation to Gemini and
-    streams the reply back in standard OpenAI chat.completion.chunk SSE
-    format, which is the wire format Agora's Conversational AI Engine
-    expects here. No structuring/conflict-detection logic yet — this
-    endpoint exists purely to prove Agora is calling our own server
-    instead of a stock provider, before any real analysis is layered in.
+    config) — one URL per channel, since Agora's request body carries the
+    conversation but no incident/call id. channel_name in the path is what
+    resolves this request back to a specific IncidentCall row (see
+    iCall_service.get_call_by_channel_name).
+
+    Runs live structuring: extracts new facts/hypotheses/decisions/action
+    items, detects contradictions against what's already recorded, and
+    streams back what the agent should say — in standard OpenAI
+    chat.completion.chunk SSE format, the wire format Agora's engine
+    expects here.
     """
-    reply_text = await generate_chat_reply(payload.messages)
+    call = await get_call_by_channel_name(db, channel_name)
+    if call is None:
+        raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
+
+    update = await generate_structuring_update(payload.messages, call.structured_state or {})
+    await apply_structuring_update(db, call, update)
 
     async def event_stream():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
 
         yield _sse_chunk(completion_id, created, payload.model, {"role": "assistant"}, None)
-        yield _sse_chunk(completion_id, created, payload.model, {"content": reply_text}, None)
+        yield _sse_chunk(completion_id, created, payload.model, {"content": update.spoken_reply}, None)
         yield _sse_chunk(completion_id, created, payload.model, {}, "stop")
         yield "data: [DONE]\n\n"
 

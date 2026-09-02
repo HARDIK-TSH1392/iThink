@@ -7,7 +7,7 @@ from google import genai
 from google.genai import types
 
 from app.config import get_settings
-from .iCall_schema import ChatMessage
+from .iCall_schema import ChatMessage, StructuringUpdate
 
 # -----------------------------------------------------------------------------
 # Call lifecycle status constants
@@ -41,9 +41,10 @@ def generate_channel_name(incident_id: int) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Custom-LLM proxy: proof-of-wiring only, no structuring/conflict logic yet.
-# Mirrors iTriage_utils' Gemini calling pattern (primary/fallback model,
-# concurrency cap) for consistency across the two modules that talk to Gemini.
+# Live structuring: turns iCall from a proven-wiring proxy into the actual
+# incident-commander behavior. Mirrors iTriage_utils' Gemini calling pattern
+# (primary/fallback model, concurrency cap, response_schema) for consistency
+# across the two modules that talk to Gemini.
 # -----------------------------------------------------------------------------
 
 PRIMARY_MODEL = "gemini-3.7-flash"
@@ -66,46 +67,103 @@ FALLBACK_REPLY = (
     "set GEMINI_API_KEY to get an actual response."
 )
 
+STRUCTURING_SYSTEM_INSTRUCTION = """You are iThink, a voice participant in a live
+incident call. Your job is narrow, the same way it is for a human note-taker
+who also happens to be allowed to ask one question: keep the room's shared
+understanding straight, don't investigate or diagnose.
 
-async def generate_chat_reply(messages: List[ChatMessage]) -> str:
+Hard constraints:
+- Never assert or imply a root cause. Never recommend a specific fix,
+  rollback, or remediation action. That judgment belongs to the humans on
+  the call, not you.
+- Only extract facts/hypotheses/decisions/action items that were actually
+  said in this turn. Do not invent details.
+- A "fact" is something stated with confidence as already true or already
+  observed (e.g. "the DB is fine"). A "hypothesis" is a guess or theory
+  being floated, not yet confirmed. Keep them separate — conflating a guess
+  with a confirmed fact is exactly the failure mode this system exists to
+  prevent.
+- Set "conflict" only when something said in this turn contradicts a fact
+  or hypothesis already recorded in the state you were given below. Phrase
+  it as one short, targeted clarifying question you would ask out loud —
+  not a statement, not an accusation.
+- identified_speakers: only include a name/role if someone actually
+  introduced themselves in this turn (e.g. "this is Priya, on-call SRE").
+  Do not guess who is speaking from tone or content alone.
+- spoken_reply is what you will say out loud right now. If there's a
+  conflict, spoken_reply should be that clarifying question. Otherwise keep
+  it to a brief, natural acknowledgment — you are a participant, not a
+  narrator repeating back everything you heard.
+- Output must strictly match the provided response schema.
+"""
+
+
+def _build_structuring_prompt(messages: List[ChatMessage], existing_state: dict) -> str:
+    conversation = "\n".join(f"{m.role}: {m.content}" for m in messages)
+    return f"""Incident state recorded so far (facts/hypotheses/decisions already
+confirmed in this call — use this to detect contradictions, not to repeat):
+{existing_state}
+
+Conversation so far:
+{conversation}
+
+Extract only what is new in the latest turn, and produce your structured
+update per the response schema.
+"""
+
+
+def _fallback_structuring_update() -> StructuringUpdate:
+    return StructuringUpdate(spoken_reply=FALLBACK_REPLY)
+
+
+async def generate_structuring_update(
+    messages: List[ChatMessage], existing_state: dict
+) -> StructuringUpdate:
     """
-    Proxy-only first version: forward the conversation to Gemini and return
-    plain text. No structuring, no conflict detection — this step exists
-    only to prove Agora's Custom LLM is actually calling our server. Real
-    analysis logic is a separate, not-yet-settled prompt-engineering step.
-
-    Degrades to FALLBACK_REPLY (rather than raising) when no API key is
-    configured, so the wiring can be proven end-to-end before a real key
-    is available.
+    One turn of live structuring: given the conversation and what's already
+    recorded for this call, extract new facts/hypotheses/decisions/action
+    items, flag a contradiction if one exists, and produce what the agent
+    should say. Degrades to a plain fallback reply (not an error) when no
+    API key is configured, same reasoning as the original proxy-only version
+    this replaces — prove the wiring survives even without a real key.
     """
     if not get_settings().gemini_api_key:
-        return FALLBACK_REPLY
+        return _fallback_structuring_update()
 
     client = _get_client()
-    contents = "\n".join(f"{m.role}: {m.content}" for m in messages)
+    prompt = _build_structuring_prompt(messages, existing_state)
+    config = types.GenerateContentConfig(
+        system_instruction=STRUCTURING_SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=StructuringUpdate,
+    )
 
     async with _gemini_semaphore:
         try:
             response = await asyncio.to_thread(
                 client.models.generate_content,
                 model=PRIMARY_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=(
-                        "You are a placeholder voice-agent brain used only to "
-                        "prove the Agora Custom LLM wiring works end to end. "
-                        "Keep replies to one short sentence."
-                    ),
-                ),
+                contents=prompt,
+                config=config,
             )
         except Exception:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=FALLBACK_MODEL,
-                contents=contents,
-            )
+            try:
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=FALLBACK_MODEL,
+                    contents=prompt,
+                    config=config,
+                )
+            except Exception:
+                return _fallback_structuring_update()
 
-    return response.text or FALLBACK_REPLY
+    try:
+        return StructuringUpdate.model_validate_json(response.text)
+    except Exception:
+        # Model returned something that didn't match the schema — don't crash
+        # the live call over a malformed extraction, just say something safe
+        # and record nothing rather than guessing at a partial parse.
+        return StructuringUpdate(spoken_reply="Sorry, could you say that again?")
 
 
 # -----------------------------------------------------------------------------

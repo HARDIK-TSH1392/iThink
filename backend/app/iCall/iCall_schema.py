@@ -83,6 +83,42 @@ class AgoraWebhookEvent(BaseModel):
         extra = "allow"
 
 
+class ActionItem(BaseModel):
+    text: str
+    owner: Optional[str] = None
+
+
+class StructuringUpdate(BaseModel):
+    """
+    LLM output shape for one turn of live structuring. Deliberately excludes
+    any root_cause or recommended_fix field — same discipline as iTriage's
+    TriageVerdict — this is a coordination layer, not an autonomous
+    diagnostician.
+
+    facts/hypotheses/decisions/action_items are NEW items only for this
+    turn, not the full running state — iCall_service merges them into
+    IncidentCall.structured_state by appending in code, the same
+    "don't let the LLM freely rewrite state" discipline as iTriage's
+    deterministic confidence scoring. Never replace structured_state
+    wholesale with this object.
+
+    identified_speakers is a best-effort name/role guess from what was said
+    (e.g. "I'm Priya, on-call SRE") — NOT tied to Agora's per-participant
+    UID. Whether Agora's Custom LLM request carries a UID per message isn't
+    confirmed in the docs read so far; real UID-level attribution is a
+    separate, still-open investigation (see the per-speaker-transcription
+    task), not something to fake here.
+    """
+
+    facts: List[str] = Field(default_factory=list)
+    hypotheses: List[str] = Field(default_factory=list)
+    decisions: List[str] = Field(default_factory=list)
+    action_items: List[ActionItem] = Field(default_factory=list)
+    conflict: Optional[str] = None
+    identified_speakers: List[str] = Field(default_factory=list)
+    spoken_reply: str
+
+
 class ChatCompletionRequest(BaseModel):
     """
     Request body Agora's Conversational AI Engine sends to a Custom LLM

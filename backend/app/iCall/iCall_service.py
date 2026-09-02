@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 from app.iNcidents.iNcidents_crudl import get_incident
 
 from .iCall_model import IncidentCall, CallUtterance
-from .iCall_schema import CallUtteranceCreate
+from .iCall_schema import CallUtteranceCreate, StructuringUpdate
 from .iCall_utils import generate_channel_name, CALL_STATUS_SCHEDULED
 
 # Serializes "check for an existing call, else create one" per incident_id,
@@ -72,6 +72,64 @@ async def get_or_create_call(db: AsyncSession, incident_id: int) -> IncidentCall
 
 async def get_call(db: AsyncSession, call_id: int) -> Optional[IncidentCall]:
     return await db.get(IncidentCall, call_id)
+
+
+async def get_call_by_channel_name(db: AsyncSession, channel_name: str) -> Optional[IncidentCall]:
+    """
+    Resolves a call from the Agora channel name alone. This is what the
+    custom-LLM endpoint uses to figure out *which* incident's call it's
+    serving — Agora's request body carries no incident/call id, only the
+    conversation content, so the channel name in the URL path is the only
+    thing tying a given request back to a specific IncidentCall row.
+    """
+    result = await db.execute(
+        select(IncidentCall).where(IncidentCall.channel_name == channel_name)
+    )
+    return result.scalar_one_or_none()
+
+
+async def apply_structuring_update(
+    db: AsyncSession, call: IncidentCall, update: StructuringUpdate
+) -> IncidentCall:
+    """
+    Merges one turn's extraction into structured_state by appending —
+    deliberately never overwrites the existing lists wholesale. Mirrors the
+    "/update overwrites params entirely" gotcha documented for Agora's own
+    agent-update endpoint: the same failure mode (silently losing prior
+    state) is just as real here if this merged the LLM's per-turn output
+    in as the new state instead of adding to what's already recorded.
+
+    Builds brand-new list objects for every key rather than a shallow
+    dict(...) copy — a shallow copy leaves the nested lists shared with
+    call.structured_state's existing lists, so mutating them in place also
+    mutates the "old" value SQLAlchemy compares against, which makes it
+    see old == new and silently skip the UPDATE on second and later calls.
+    Caught this via the two-turn accumulation test, not by inspection.
+    """
+    old = call.structured_state or {}
+    state = {
+        "facts": list(old.get("facts", [])),
+        "hypotheses": list(old.get("hypotheses", [])),
+        "decisions": list(old.get("decisions", [])),
+        "action_items": list(old.get("action_items", [])),
+        "conflicts": list(old.get("conflicts", [])),
+        "identified_speakers": list(old.get("identified_speakers", [])),
+    }
+
+    state["facts"].extend(update.facts)
+    state["hypotheses"].extend(update.hypotheses)
+    state["decisions"].extend(update.decisions)
+    state["action_items"].extend(item.model_dump() for item in update.action_items)
+    if update.conflict:
+        state["conflicts"].append(update.conflict)
+    for speaker in update.identified_speakers:
+        if speaker not in state["identified_speakers"]:
+            state["identified_speakers"].append(speaker)
+
+    call.structured_state = state
+    await db.commit()
+    await db.refresh(call)
+    return call
 
 
 async def update_call_status(db: AsyncSession, call: IncidentCall, status: str) -> IncidentCall:
