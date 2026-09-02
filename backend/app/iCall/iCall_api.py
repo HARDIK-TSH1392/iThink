@@ -15,6 +15,7 @@ from .iCall_service import (
     update_call_status,
     record_utterance,
     list_utterances,
+    IncidentNotFoundError,
 )
 
 router = APIRouter(prefix="/icall", tags=["iCall"])
@@ -39,7 +40,10 @@ async def get_or_create_call_endpoint(
     the meeting invite; the voice agent calls this to know which channel to
     join. Both get the same answer because there's one row, not two guesses.
     """
-    call = await get_or_create_call(db, incident_id)
+    try:
+        call = await get_or_create_call(db, incident_id)
+    except IncidentNotFoundError:
+        raise HTTPException(status_code=404, detail="Incident not found")
     return IncidentCallRead.model_validate(call)
 
 
