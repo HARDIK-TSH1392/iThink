@@ -73,7 +73,14 @@ export function normalizeTranscript(
   localUid: string,
 ) {
   return transcript.map((item) => {
-    const nextUid = item.uid === '0' ? localUid : item.uid
+    // agora-agent-client-toolkit hardcodes uid to "0" for every human
+    // speaker (it assumes a single-remote-user call), but the underlying
+    // STT payload still carries the real Agora RTC uid in metadata.user_id
+    // -- use that when present so multiple humans get attributed correctly
+    // instead of every speaker collapsing onto the local viewer.
+    const realUid = item.metadata?.user_id
+    const nextUid =
+      realUid && realUid !== '0' ? realUid : item.uid === '0' ? localUid : item.uid
     const nextText =
       typeof item.text === 'string' ? normalizeTranscriptSpacing(item.text) : item.text
 

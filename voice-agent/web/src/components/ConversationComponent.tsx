@@ -15,6 +15,7 @@ import {
 } from "@/components/QuickstartPipelineMetrics";
 import { QuickstartTranscriptPanel } from "@/components/QuickstartTranscriptPanel";
 import { DEFAULT_AGENT_UID } from "@/lib/agora";
+import { getNames } from "@/services/api";
 import {
 	getCurrentInProgressMessage,
 	getMessageList,
@@ -33,7 +34,6 @@ import {
 	TranscriptHelperMode,
 	type UserTranscription,
 } from "agora-agent-client-toolkit";
-import { AgentVisualizer } from "agora-agent-uikit";
 import { MicButtonWithVisualizer } from "agora-agent-uikit/rtc";
 import {
 	RemoteUser,
@@ -84,6 +84,7 @@ function isRtmSalStatusPayload(value: unknown): value is RtmSalStatusPayload {
 export default function ConversationComponent({
 	agoraData,
 	rtmClient,
+	localName,
 	onTokenWillExpire,
 	onEndConversation,
 }: ConversationComponentProps) {
@@ -127,6 +128,40 @@ export default function ConversationComponent({
 			setIsConnectionDetailsOpen(true);
 		}
 	}, [connectionIssues.length]);
+
+	// uid -> display name, sourced from the backend's channel name registry
+	// (see LandingPage's setName call and services/api.ts's getNames). Polled
+	// rather than pushed in real time -- simpler and easier to verify than
+	// RTM presence, and a few seconds' staleness on a name label is fine.
+	const [participantNames, setParticipantNames] = useState<Record<string, string>>(
+		() => (localName ? { [agoraData.uid]: localName } : {}),
+	);
+
+	useEffect(() => {
+		let cancelled = false;
+
+		const refresh = () => {
+			getNames(agoraData.channel)
+				.then((names) => {
+					if (cancelled) return;
+					setParticipantNames((prev) => {
+						const merged = { ...prev, ...names };
+						const changed = Object.keys(merged).some((k) => merged[k] !== prev[k]);
+						return changed ? merged : prev;
+					});
+				})
+				.catch((error) => {
+					console.error("Failed to fetch participant names:", error);
+				});
+		};
+
+		refresh();
+		const interval = setInterval(refresh, 3000);
+		return () => {
+			cancelled = true;
+			clearInterval(interval);
+		};
+	}, [agoraData.channel]);
 
 	const [isReady, setIsReady] = useState(false);
 	useEffect(() => {
@@ -344,6 +379,24 @@ export default function ConversationComponent({
 		if (user.uid.toString() === agentUID) setIsAgentConnected(false);
 	});
 
+	// Per-participant speaking indicator for the grid view -- Agora reports
+	// volume levels for every uid in the channel (local + remote) on each
+	// tick; anything above a small threshold counts as "speaking" this tick.
+	const [speakingUids, setSpeakingUids] = useState<Set<string>>(new Set());
+
+	useEffect(() => {
+		client.enableAudioVolumeIndicator();
+	}, [client]);
+
+	useClientEvent(client, "volume-indicator", (volumes) => {
+		const SPEAKING_THRESHOLD = 15;
+		const next = new Set<string>();
+		for (const v of volumes) {
+			if (v.level > SPEAKING_THRESHOLD) next.add(String(v.uid));
+		}
+		setSpeakingUids(next);
+	});
+
 	useEffect(() => {
 		const isAgentInRemoteUsers = remoteUsers.some(
 			(user) => user.uid.toString() === agentUID,
@@ -451,19 +504,76 @@ export default function ConversationComponent({
 					messageList={messageList}
 					currentInProgressMessage={currentInProgressMessage}
 					agentUID={agentUID}
+					localUid={agoraData.uid}
+					participantNames={participantNames}
 				/>
 			}
 			visualizer={
 				<section
-					className="relative flex h-full min-h-[20rem] w-full max-w-4xl items-center justify-center"
+					className="relative flex h-full min-h-[20rem] w-full max-w-4xl flex-col items-center justify-center gap-6"
 					aria-label="AI agent status visualization"
 				>
-					<AgentVisualizer state={visualizerState} size="lg" />
 					{remoteUsers.map((user) => (
 						<div key={user.uid} className="hidden">
 							<RemoteUser user={user} />
 						</div>
 					))}
+
+					{/* Meet/Zoom-style participant grid. No video (audio-only call) --
+					    each tile is an avatar circle + label, with a pulsing ring while
+					    that participant's volume level is above the speaking threshold
+					    (see the volume-indicator listener above). Names come from RTM
+					    presence state (participantNames); falls back to a bare UID
+					    label if a participant hasn't published a name yet. */}
+					<div
+						className="grid w-full max-w-4xl grid-cols-2 gap-6 sm:grid-cols-3"
+						aria-label="Call participants"
+					>
+						{(() => {
+							const localUid = agoraData.uid;
+							const tiles = [
+								{
+									uid: localUid,
+									label: "You",
+									isAgent: false,
+									speaking: speakingUids.has(String(localUid)) && isEnabled,
+								},
+								...remoteUsers.map((user) => {
+									const isAgent = String(user.uid) === String(agentUID);
+									return {
+										uid: user.uid,
+										label: isAgent
+											? "iThink Agent"
+											: (participantNames[String(user.uid)] ??
+												`Participant ${user.uid}`),
+										isAgent,
+										speaking: isAgent
+											? visualizerState === "talking"
+											: speakingUids.has(String(user.uid)),
+									};
+								}),
+							];
+
+							return tiles.map((tile) => (
+								<div
+									key={tile.uid}
+									className="flex flex-col items-center gap-3 rounded-2xl border border-border bg-card/60 px-5 py-8"
+								>
+									<div
+										className={`flex h-24 w-24 items-center justify-center rounded-full text-4xl transition-shadow ${
+											tile.isAgent ? "bg-primary/15 text-primary" : "bg-muted text-foreground"
+										} ${tile.speaking ? "ring-4 ring-primary/70 animate-pulse" : ""}`}
+										aria-hidden="true"
+									>
+										{tile.isAgent ? "\u{1F916}" : "\u{1F464}"}
+									</div>
+									<span className="max-w-full truncate text-sm font-medium text-foreground">
+										{tile.label}
+									</span>
+								</div>
+							));
+						})()}
+					</div>
 				</section>
 			}
 			controls={

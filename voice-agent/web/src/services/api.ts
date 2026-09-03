@@ -34,7 +34,19 @@ export async function getConfig(options?: { channel?: string; uid?: string | num
   return result.data
 }
 
-export async function startAgent(channelName: string, rtcUid: number, userUid: number): Promise<string> {
+export interface StartAgentResponse {
+  agentId: string
+  // The uid actually running the agent in this channel -- may differ from
+  // the rtcUid this call passed in, if another participant already started
+  // it (see server/src/agent.py's per-channel dedup).
+  agentUid: string
+}
+
+export async function startAgent(
+  channelName: string,
+  rtcUid: number,
+  userUid: number,
+): Promise<StartAgentResponse> {
   const payload = { channelName, rtcUid, userUid }
 
   const response = await fetch(`${API_BASE_URL}/startAgent`, {
@@ -52,7 +64,7 @@ export async function startAgent(channelName: string, rtcUid: number, userUid: n
   if (result.code !== 0 || !result.data?.agent_id) {
     throw new Error(result.msg || 'Failed to start agent')
   }
-  return result.data.agent_id
+  return { agentId: result.data.agent_id, agentUid: String(result.data.agent_uid) }
 }
 
 export async function stopAgent(agentId: string): Promise<void> {
@@ -68,4 +80,31 @@ export async function stopAgent(agentId: string): Promise<void> {
     const error = await response.json()
     throw new Error(error.detail || `HTTP ${response.status}`)
   }
+}
+
+export async function setName(channelName: string, uid: string, name: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/setName`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channelName, uid, name }),
+  })
+
+  if (!response.ok) {
+    const error = await response.json()
+    throw new Error(error.detail || `HTTP ${response.status}`)
+  }
+}
+
+export async function getNames(channelName: string): Promise<Record<string, string>> {
+  const response = await fetch(
+    `${API_BASE_URL}/getNames?channel=${encodeURIComponent(channelName)}`,
+  )
+
+  if (!response.ok) {
+    const error = await response.json()
+    throw new Error(error.detail || `HTTP ${response.status}`)
+  }
+
+  const result = await response.json()
+  return result.data ?? {}
 }
