@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     # this stays unset for local dev). See iCall_utils.verify_agora_signature.
     agora_webhook_secret: str = ""
 
+    # Slack Incoming Webhook URL, for the minimal notify-on-approval
+    # orchestration action. Empty until one is configured.
+    slack_webhook_url: str = ""
+
     class Config:
         env_file = ".env"
 
