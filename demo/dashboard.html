@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>iThink — Demo Control Panel</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 820px; margin: 40px auto; padding: 0 20px; color: #1a1a2e; background: #fafafa; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 16px; margin-top: 0; color: #444; }
+  .step { background: white; border: 1px solid #ddd; border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+  .step.disabled { opacity: 0.5; pointer-events: none; }
+  button { background: #2b5cff; color: white; border: none; padding: 10px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; margin-right: 8px; }
+  button.secondary { background: #eee; color: #333; }
+  button.danger { background: #d64545; }
+  button:disabled { background: #ccc; cursor: not-allowed; }
+  pre { background: #f4f4f8; padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; }
+  .incident { border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px; margin-top: 10px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+  .badge.awaiting_approval { background: #fff3cd; color: #856404; }
+  .badge.approved, .badge.orchestrating { background: #d4edda; color: #155724; }
+  .badge.detected, .badge.triage { background: #d1ecf1; color: #0c5460; }
+  .badge.rejected, .badge.closed { background: #f8d7da; color: #721c24; }
+  a.join-link { display: inline-block; margin-top: 10px; background: #16a34a; color: white; padding: 8px 14px; border-radius: 6px; text-decoration: none; font-size: 14px; }
+  .note { font-size: 12px; color: #888; }
+</style>
+</head>
+<body>
+
+<h1>iThink — Demo Control Panel</h1>
+<p class="note">Talks directly to the iThink backend at <code id="api-base-display"></code>. Change API_BASE below the script if it's running elsewhere.</p>
+
+<div class="step">
+  <h2>1. Simulate an incoming signal</h2>
+  <p>Fires a real log event at <code>POST /ilogs/ingest</code> — iTriage picks it up automatically in the background.</p>
+  <button onclick="simulateIncident()">🔥 Simulate: auth-api production down (us-east)</button>
+  <pre id="ingest-result"></pre>
+</div>
+
+<div class="step">
+  <h2>2. Incidents &amp; human approval</h2>
+  <p>Every incident iTriage created, newest first. Approve/reject only shows while an incident is <code>awaiting_approval</code> — that's the human-confirmation gate, not a formality.</p>
+  <button class="secondary" onclick="loadIncidents()">↻ Refresh</button>
+  <div id="incidents-list"></div>
+</div>
+
+<div class="step">
+  <h2>3. Voice room</h2>
+  <p>Pick an incident id below to create (or fetch) its room, then join it as a human — the agent joins the same named room via the same call.</p>
+  <input id="call-incident-id" type="number" placeholder="incident id" style="padding:8px;border:1px solid #ccc;border-radius:6px;width:120px;">
+  <button onclick="createCall()">Create / get room</button>
+  <pre id="call-result"></pre>
+  <div id="join-link-container"></div>
+</div>
+
+<script>
+const API_BASE = "http://127.0.0.1:8123/api/v1";
+const WEB_CLIENT_BASE = "http://localhost:3000";
+document.getElementById("api-base-display").textContent = API_BASE;
+
+async function simulateIncident() {
+  const out = document.getElementById("ingest-result");
+  out.textContent = "sending...";
+  const res = await fetch(`${API_BASE}/ilogs/ingest`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      source_id: "demo-source-1",
+      source_type: "k8s_deployment",
+      region: "us-east",
+      service: "auth-api",
+      environment: "production",
+      severity: "prod_down",
+      timestamp: new Date().toISOString(),
+      message: "auth-api returning 5xx across all pods"
+    })
+  });
+  const data = await res.json();
+  out.textContent = JSON.stringify(data, null, 2);
+  setTimeout(loadIncidents, 1500); // give the iTriage background task a moment
+}
+
+async function loadIncidents() {
+  const container = document.getElementById("incidents-list");
+  container.textContent = "loading...";
+  const res = await fetch(`${API_BASE}/incidents/`);
+  const incidents = await res.json();
+  if (incidents.length === 0) {
+    container.innerHTML = "<p class='note'>No incidents yet — try step 1.</p>";
+    return;
+  }
+  container.innerHTML = incidents.map(inc => `
+    <div class="incident">
+      <strong>#${inc.id} ${inc.title}</strong>
+      <span class="badge ${inc.status}">${inc.status}</span>
+      ${inc.priority ? `<span class="badge">${inc.priority}</span>` : ""}
+      <div class="note">${inc.region} / ${inc.service}</div>
+      ${inc.summary ? `<p>${inc.summary}</p>` : ""}
+      ${inc.status === "awaiting_approval" ? `
+        <button onclick="decide(${inc.id}, 'approve')">✅ Approve</button>
+        <button class="danger" onclick="decide(${inc.id}, 'reject')">Reject</button>
+      ` : ""}
+    </div>
+  `).join("");
+}
+
+async function decide(incidentId, decision) {
+  await fetch(`${API_BASE}/incidents/${incidentId}/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ decision, approved_by: "demo-presenter" })
+  });
+  loadIncidents();
+}
+
+async function createCall() {
+  const incidentId = document.getElementById("call-incident-id").value;
+  const out = document.getElementById("call-result");
+  const linkContainer = document.getElementById("join-link-container");
+  if (!incidentId) { out.textContent = "enter an incident id first"; return; }
+
+  out.textContent = "creating/fetching room...";
+  const res = await fetch(`${API_BASE}/icall/incidents/${incidentId}/call`, { method: "POST" });
+  if (!res.ok) {
+    out.textContent = `error: ${res.status} ${await res.text()}`;
+    linkContainer.innerHTML = "";
+    return;
+  }
+  const call = await res.json();
+  out.textContent = JSON.stringify(call, null, 2);
+  const joinUrl = `${WEB_CLIENT_BASE}/?channel=${encodeURIComponent(call.channel_name)}`;
+  linkContainer.innerHTML = `<a class="join-link" href="${joinUrl}" target="_blank">🎙️ Join "${call.channel_name}" as a human →</a>`;
+}
+
+loadIncidents();
+</script>
+
+</body>
+</html>
