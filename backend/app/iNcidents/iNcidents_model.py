@@ -6,7 +6,6 @@ from typing import Optional
 from app.database import Base
 from .iNcidents_utils import STATUS_DETECTED
 
-
 class Incident(Base):
     __tablename__ = "incidents"
 
