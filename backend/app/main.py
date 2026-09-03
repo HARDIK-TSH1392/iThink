@@ -8,6 +8,7 @@ from .iNcidents.iNcidents_api import router as incidents_router
 from .iTriage.iTriage_api import router as itriage_router
 from .iCall.iCall_api import router as icall_router
 from .iDirectory.iDirectory_api import router as idirectory_router
+from .iOrchestrate.iOrchestrate_api import router as iorchestrate_router
 
 
 @asynccontextmanager
@@ -42,6 +43,7 @@ app.include_router(incidents_router, prefix="/api/v1", tags=["iNcidents"])
 app.include_router(itriage_router, prefix="/api/v1", tags=["iTriage"])
 app.include_router(icall_router, prefix="/api/v1", tags=["iCall"])
 app.include_router(idirectory_router, prefix="/api/v1", tags=["iDirectory"])
+app.include_router(iorchestrate_router, prefix="/api/v1", tags=["iOrchestrate"])
 
 
 @app.get("/health")

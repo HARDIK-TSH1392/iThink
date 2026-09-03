@@ -21,7 +21,7 @@ from .iNcidents_crudl import (
 )
 from .iNcidents_utils import is_valid_transition, STATUS_AWAITING_APPROVAL, STATUS_ORCHESTRATING
 from app.iOrchestrate.iOrchestrate_utils import (
-    post_incident_approved_notification,
+    notify_incident_approved,
     notify_approval_needed,
 )
 
@@ -180,12 +180,5 @@ async def decide_incident_endpoint(
     )
 
     if incident.status == STATUS_ORCHESTRATING:
-        await post_incident_approved_notification(
-            incident_id=incident.id,
-            title=incident.title,
-            priority=incident.priority or "unset",
-            service=incident.service,
-            region=incident.region,
-            approved_by=incident.approved_by,
-        )
+        await notify_incident_approved(db, incident)
     return await _to_read(db, incident)

@@ -28,7 +28,14 @@ from .iCall_service import (
     apply_structuring_update,
     IncidentNotFoundError,
 )
-from .iCall_utils import generate_structuring_update, describe_event_type, verify_agora_signature
+from .iCall_utils import (
+    generate_structuring_update,
+    describe_event_type,
+    verify_agora_signature,
+    CALL_STATUS_COMPLETED,
+)
+from app.iNcidents.iNcidents_crudl import get_incident
+from app.iOrchestrate.iOrchestrate_utils import post_call_summary_notification
 
 router = APIRouter(prefix="/icall", tags=["iCall"])
 
@@ -87,6 +94,12 @@ async def update_call_status_endpoint(
         raise HTTPException(status_code=404, detail="Call not found")
 
     call = await update_call_status(db, call, payload.status)
+
+    if call.status == CALL_STATUS_COMPLETED:
+        incident = await get_incident(db, call.incident_id)
+        if incident:
+            await post_call_summary_notification(incident, call)
+
     return IncidentCallRead.model_validate(call)
 
 
