@@ -49,10 +49,10 @@ def format_call_summary(structured_state: dict) -> str:
 
 async def post_call_summary_notification(incident, call) -> bool:
     """
-    Posts the post-call brief to the channel once a call is marked
-    completed, with a "Create Jira Ticket" / "Skip" action -- the second
-    human-approval gate before any Jira action, mirroring the same
-    Approve/Reject button mechanism already built for incident approval.
+    Posts the post-call brief to the channel, purely informational -- no
+    buttons here. The Jira approval ask is a separate, private DM to the
+    resolved approver (see notify_jira_approval_needed), same "approval
+    goes to the team lead, not the channel" rule as incident approval.
     """
     summary = format_call_summary(call.structured_state)
     text = (
@@ -60,33 +60,65 @@ async def post_call_summary_notification(incident, call) -> bool:
         f"*{incident.title}*  |  `{incident.service}` in `{incident.region}`\n\n"
         f"{summary}"
     )
+    ok = await _post_to_slack(text)
+    if ok:
+        print(f"[iOrchestrate] Post-call summary posted for incident {incident.id} / call {call.id}")
+    return ok
 
-    blocks = [
+
+def _build_jira_approval_blocks(call_id: int, text: str) -> list:
+    return [
         {"type": "section", "text": {"type": "mrkdwn", "text": text}},
         {
             "type": "actions",
-            "block_id": f"jira_decision_{call.id}",
+            "block_id": f"jira_decision_{call_id}",
             "elements": [
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "📋 Create Jira Ticket"},
                     "style": "primary",
                     "action_id": "create_jira_ticket",
-                    "value": str(call.id),
+                    "value": str(call_id),
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Skip"},
                     "action_id": "skip_jira_ticket",
-                    "value": str(call.id),
+                    "value": str(call_id),
                 },
             ],
         },
     ]
 
+
+async def notify_jira_approval_needed(db, incident, call) -> bool:
+    """
+    Second human-approval gate: DMs the resolved approver privately asking
+    whether to create a Jira ticket from this call's captured discussion.
+    Falls back to the channel if the approver has no real Slack ID on
+    file -- same reasoning as notify_approval_needed.
+    """
+    from app.iDirectory.iDirectory_crudl import resolve_approver
+
+    approver = await resolve_approver(db, incident.service)
+    summary = format_call_summary(call.structured_state)
+    text = (
+        f"*Jira ticket approval needed: Incident #{incident.id}* :memo:\n"
+        f"*{incident.title}*  |  `{incident.service}` in `{incident.region}`\n\n"
+        f"{summary}"
+    )
+    blocks = _build_jira_approval_blocks(call.id, text)
+
+    if approver and approver.slack_user_id:
+        ok = await _post_dm_to_slack_user(approver.slack_user_id, text, blocks=blocks)
+        if ok:
+            print(f"[iOrchestrate] Jira-approval DM sent to {approver.slack_user_id} for call {call.id}")
+            return True
+        print(f"[iOrchestrate] Jira-approval DM failed for call {call.id}, falling back to channel post")
+
     ok = await _post_to_slack(text, blocks=blocks)
     if ok:
-        print(f"[iOrchestrate] Post-call summary posted for incident {incident.id} / call {call.id}")
+        print(f"[iOrchestrate] Jira-approval request posted to channel for call {call.id}")
     return ok
 
 

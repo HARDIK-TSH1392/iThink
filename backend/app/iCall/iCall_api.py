@@ -35,7 +35,7 @@ from .iCall_utils import (
     CALL_STATUS_COMPLETED,
 )
 from app.iNcidents.iNcidents_crudl import get_incident
-from app.iOrchestrate.iOrchestrate_utils import post_call_summary_notification
+from app.iOrchestrate.iOrchestrate_utils import post_call_summary_notification, notify_jira_approval_needed
 
 router = APIRouter(prefix="/icall", tags=["iCall"])
 
@@ -99,6 +99,7 @@ async def update_call_status_endpoint(
         incident = await get_incident(db, call.incident_id)
         if incident:
             await post_call_summary_notification(incident, call)
+            await notify_jira_approval_needed(db, incident, call)
 
     return IncidentCallRead.model_validate(call)
 
