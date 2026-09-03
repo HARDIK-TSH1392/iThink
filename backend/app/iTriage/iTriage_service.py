@@ -17,6 +17,7 @@ from app.iNcidents.iNcidents_utils import (
     STATUS_CLOSED,
     is_valid_transition,
 )
+from app.iOrchestrate.iOrchestrate_utils import notify_approval_needed
 
 from .iTriage_model import TriageResult
 from .iTriage_utils import call_gemini_for_verdict, compute_deterministic_confidence
@@ -164,6 +165,8 @@ async def run_triage_for_log(log_id: int) -> dict:
             next_status = STATUS_CLOSED if verdict.incident_likelihood == "low" else STATUS_AWAITING_APPROVAL
             if is_valid_transition(incident.status, next_status):
                 incident = await update_status(db, incident, next_status)
+                if incident.status == STATUS_AWAITING_APPROVAL:
+                    await notify_approval_needed(db, incident)
 
             return {
                 "action": "triaged",

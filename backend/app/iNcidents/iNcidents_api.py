@@ -20,7 +20,10 @@ from .iNcidents_crudl import (
     existing_log_ids,
 )
 from .iNcidents_utils import is_valid_transition, STATUS_AWAITING_APPROVAL, STATUS_ORCHESTRATING
-from app.iOrchestrate.iOrchestrate_utils import post_incident_approved_notification
+from app.iOrchestrate.iOrchestrate_utils import (
+    post_incident_approved_notification,
+    notify_approval_needed,
+)
 
 
 router = APIRouter(prefix="/incidents", tags=["iNcidents"])
@@ -142,6 +145,10 @@ async def update_status_endpoint(
         )
 
     incident = await update_status(db, incident, payload.status)
+
+    if incident.status == STATUS_AWAITING_APPROVAL:
+        await notify_approval_needed(db, incident)
+
     return await _to_read(db, incident)
 
 
