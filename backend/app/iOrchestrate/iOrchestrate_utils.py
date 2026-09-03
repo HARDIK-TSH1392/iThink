@@ -341,6 +341,7 @@ async def post_incident_approved_notification(
     region: str,
     approved_by: str,
     responders: Optional[list] = None,
+    meeting_link: Optional[str] = None,
 ) -> bool:
     """
     Minimal orchestration action: post a Slack message when an incident is
@@ -354,6 +355,11 @@ async def post_incident_approved_notification(
     member. Nobody is actually invited to the channel here -- that needs a
     Slack scope we deliberately skipped for now (low payoff tonight, since
     only real accounts can be invited at all).
+
+    `meeting_link` is optional and omitted from the message entirely when
+    room creation failed rather than posting a broken/missing link -- see
+    notify_incident_approved, which is the only caller and always tries to
+    create the room first.
     """
     text = (
         f"*Incident #{incident_id} approved* :rotating_light:\n"
@@ -361,6 +367,9 @@ async def post_incident_approved_notification(
         f"Priority: *{priority}*  |  Service: `{service}`  |  Region: `{region}`\n"
         f"Approved by: {approved_by}"
     )
+
+    if meeting_link:
+        text += f"\nJoin the incident room: {meeting_link}"
 
     if responders:
         names = [
@@ -378,14 +387,29 @@ async def post_incident_approved_notification(
 async def notify_incident_approved(db, incident) -> bool:
     """
     Single entry point for "an incident was just approved" -- resolves
-    responders via iDirectory and posts the announcement. Mirrors
-    notify_approval_needed's shape so both approval paths (the manual API
-    and the Slack button) call one function instead of duplicating the
-    resolve+notify logic.
+    responders via iDirectory, creates the incident's room via iCall (this
+    is the one place that actually happens; previously nothing wired the
+    two together, so approval never produced a joinable link), and posts
+    the announcement. Mirrors notify_approval_needed's shape so both
+    approval paths (the manual API and the Slack button) call one function
+    instead of duplicating the resolve+notify+room-create logic.
+
+    Room creation failing does not block the Slack announcement -- same
+    fire-and-forget discipline as everything else here; the message just
+    omits the link rather than the whole notification failing.
     """
     from app.iDirectory.iDirectory_crudl import resolve_responders
+    from app.iCall.iCall_service import get_or_create_call
 
     responders = await resolve_responders(db, incident.service)
+
+    meeting_link = None
+    try:
+        call = await get_or_create_call(db, incident.id)
+        meeting_link = f"{get_settings().voice_client_base_url}/?channel={call.channel_name}"
+    except Exception as exc:
+        print(f"[iOrchestrate] Room creation failed for incident {incident.id}: {exc}")
+
     return await post_incident_approved_notification(
         incident_id=incident.id,
         title=incident.title,
@@ -394,6 +418,7 @@ async def notify_incident_approved(db, incident) -> bool:
         region=incident.region,
         approved_by=incident.approved_by,
         responders=responders,
+        meeting_link=meeting_link,
     )
 
 
