@@ -47,8 +47,11 @@ def generate_channel_name(incident_id: int) -> str:
 # across the two modules that talk to Gemini.
 # -----------------------------------------------------------------------------
 
-PRIMARY_MODEL = "gemini-3.7-flash"
-FALLBACK_MODEL = "gemini-2.5-flash"
+
+# See iTriage_utils.py's identical constants for why both are the same
+# verified model rather than a primary + a guessed fallback name.
+PRIMARY_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
 _gemini_semaphore = asyncio.Semaphore(4)
 
