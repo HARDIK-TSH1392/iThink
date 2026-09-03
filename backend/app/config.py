@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     jira_api_token: str = ""
     jira_project_key: str = ""
 
+    # Base URL of the voice-agent web client (voice-agent/web) that a
+    # responder actually clicks to join the call. Defaults to localhost --
+    # only reachable from this machine -- swap for a real public URL (once
+    # a stable tunnel/deployment exists) without touching any calling code.
+    voice_agent_web_base_url: str = "http://localhost:3000"
+
     class Config:
         env_file = ".env"
 

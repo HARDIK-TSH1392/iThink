@@ -216,6 +216,7 @@ export default function LandingPage() {
 							isLoading={isLoading}
 							error={error}
 							onStartConversation={handleStartConversation}
+							channel={channelFromUrl}
 						/>
 					) : agoraData && rtmClient ? (
 						<>
