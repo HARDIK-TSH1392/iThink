@@ -8,7 +8,10 @@ const nextConfig: NextConfig = {
     root: path.resolve(__dirname, '..'),
   },
   // Lets a teammate on the same LAN load the dev server (and its HMR
-  // websocket) from this machine's local IP instead of localhost.
+  // websocket) from this machine's local IP instead of localhost. This IP
+  // is machine- and network-specific (DHCP can reassign it) -- update it
+  // locally to whatever `ipconfig`/`hostname -I` reports for your own
+  // machine's LAN adapter rather than relying on this committed value.
   allowedDevOrigins: ['192.168.1.8'],
 
   // Optimize images
