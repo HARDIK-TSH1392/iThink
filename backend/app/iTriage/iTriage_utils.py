@@ -14,8 +14,16 @@ from .iTriage_schema import TriageVerdict
 # retired, region restrictions, etc). Both are Gemini flash-tier models
 # suited to fast structured-output tasks rather than long-form generation.
 
-PRIMARY_MODEL = "gemini-3.7-flash"
-FALLBACK_MODEL = "gemini-2.5-flash"
+
+# Both verified directly against this project's API key on 2026-09-03 --
+# gemini-3.7-flash and gemini-2.5-flash (the previous values here) were
+# retired/unavailable and caused a real, hard-to-diagnose outage: primary
+# failed silently, fell through to a dead fallback name, and the whole
+# triage pipeline stalled at "triage" status with the failure hidden below
+# an unlogged except. Using the same verified model for both isn't ideal
+# redundancy, but a guessed second name reintroduces exactly this bug.
+PRIMARY_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
 # Caps concurrent Gemini calls so a burst of correlated log events can't fire
 # off unbounded parallel API calls (cost + rate-limit protection).

@@ -360,7 +360,9 @@ async def post_incident_approved_notification(
     channel -- whoever opens it first and clicks "Start Conversation" also
     starts the AI agent for everyone in the room (joining the room and
     starting the agent are independent Agora operations; this UI just
-    triggers both from one click).
+    triggers both from one click). Optional and omitted from the message
+    entirely when room creation failed, rather than posting a broken link
+    -- see notify_incident_approved, which is the only caller.
     """
     text = (
         f"*Incident #{incident_id} approved* :rotating_light:\n"
@@ -392,14 +394,23 @@ async def notify_incident_approved(db, incident) -> bool:
     the announcement with a join link. Mirrors notify_approval_needed's
     shape so both approval paths (the manual API and the Slack button)
     call one function instead of duplicating the resolve+notify logic.
+
+    Room creation failing does not block the Slack announcement -- same
+    fire-and-forget discipline as everything else here; the message just
+    omits the link rather than the whole notification failing.
     """
     from app.iDirectory.iDirectory_crudl import resolve_responders
     from app.iCall.iCall_service import get_or_create_call
 
     responders = await resolve_responders(db, incident.service)
-    call = await get_or_create_call(db, incident.id)
-    settings = get_settings()
-    join_url = f"{settings.voice_agent_web_base_url.rstrip('/')}/?channel={call.channel_name}"
+
+    join_url = None
+    try:
+        call = await get_or_create_call(db, incident.id)
+        settings = get_settings()
+        join_url = f"{settings.voice_agent_web_base_url.rstrip('/')}/?channel={call.channel_name}"
+    except Exception as exc:
+        print(f"[iOrchestrate] Room creation failed for incident {incident.id}: {exc}")
 
     return await post_incident_approved_notification(
         incident_id=incident.id,

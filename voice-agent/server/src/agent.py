@@ -3,6 +3,7 @@ Agent
 
 High-level API for managing Agora Conversational AI Agents.
 """
+import asyncio
 import logging
 import os
 import time
@@ -57,6 +58,21 @@ class Agent:
         # same incident's call skip starting a duplicate agent (and hearing
         # a second greeting) -- only the first joiner actually starts one.
         self._channel_agents: Dict[str, tuple] = {}
+        # channel_name -> lock serializing start() for that channel. Without
+        # this, two people opening the shared join link within the same
+        # instant both read self._channel_agents before either had a chance
+        # to write it (the check and the write are separated by an awaited
+        # Agora API call), so both would start a real agent -- two agents in
+        # one room, double greeting, duplicate note-taking. One lock per
+        # channel keeps unrelated incidents' starts fully concurrent.
+        self._channel_locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_channel_lock(self, channel_name: str) -> asyncio.Lock:
+        lock = self._channel_locks.get(channel_name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._channel_locks[channel_name] = lock
+        return lock
 
     async def start(
         self,
@@ -71,9 +87,22 @@ class Agent:
         if agent_uid <= 0:
             raise ValueError("agent_uid is required and cannot be empty")
 
+        async with self._get_channel_lock(channel_name):
+            return await self._start_locked(channel_name, agent_uid, user_uid, output_audio_codec)
+
+    async def _start_locked(
+        self,
+        channel_name: str,
+        agent_uid: int,
+        user_uid: int,
+        output_audio_codec: Optional[str],
+    ) -> Dict[str, Any]:
         # An agent is already running in this channel (a prior joiner started
         # it) -- return that result instead of starting a second agent, which
-        # would greet the room again and duplicate note-taking.
+        # would greet the room again and duplicate note-taking. Re-checked
+        # here, inside the per-channel lock, since a concurrent start() for
+        # this same channel may have finished while this call was waiting
+        # for the lock.
         existing = self._channel_agents.get(channel_name)
         if existing is not None:
             existing_agent_id, existing_result = existing
