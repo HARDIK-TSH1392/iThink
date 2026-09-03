@@ -1,13 +1,14 @@
 "use client";
 
 import { Loader2 } from "lucide-react";
+import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 
 type QuickstartPreCallCardProps = {
 	isLoading: boolean;
 	error: string | null;
-	onStartConversation: () => void;
+	onStartConversation: (name: string) => void;
 	channel?: string;
 };
 
@@ -26,6 +27,8 @@ export function QuickstartPreCallCard({
 	channel,
 }: QuickstartPreCallCardProps) {
 	const label = incidentLabel(channel);
+	const [name, setName] = useState("");
+	const trimmedName = name.trim();
 
 	return (
 		<div
@@ -44,10 +47,21 @@ export function QuickstartPreCallCard({
 					: "iThink's AI incident commander, powered by Agora Conversational AI."}
 			</p>
 
-			<Button
-				onClick={onStartConversation}
+			<input
+				type="text"
+				value={name}
+				onChange={(e) => setName(e.target.value)}
+				placeholder="Your name"
 				disabled={isLoading}
-				className="mt-12 h-10 w-full rounded-lg border border-primary bg-primary text-sm font-medium text-black hover:border-white hover:bg-white hover:text-black disabled:hover:border-primary disabled:hover:bg-primary disabled:hover:text-black"
+				maxLength={40}
+				aria-label="Your name"
+				className="mt-8 h-10 w-full rounded-lg border border-[#3a3a3a] bg-transparent px-3 text-sm text-white placeholder:text-muted-foreground focus:border-primary focus:outline-none"
+			/>
+
+			<Button
+				onClick={() => onStartConversation(trimmedName)}
+				disabled={isLoading || !trimmedName}
+				className="mt-4 h-10 w-full rounded-lg border border-primary bg-primary text-sm font-medium text-black hover:border-white hover:bg-white hover:text-black disabled:hover:border-primary disabled:hover:bg-primary disabled:hover:text-black"
 				aria-label={
 					isLoading ? "Joining incident call" : "Join incident call"
 				}

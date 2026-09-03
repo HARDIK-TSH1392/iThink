@@ -13,6 +13,8 @@ type QuickstartTranscriptPanelProps = {
 	messageList: TranscriptMessage[];
 	currentInProgressMessage: TranscriptMessage | null;
 	agentUID: string;
+	localUid: string;
+	participantNames: Record<string, string>;
 };
 
 function formatMessageTime(createdAt?: number) {
@@ -27,6 +29,8 @@ export function QuickstartTranscriptPanel({
 	messageList,
 	currentInProgressMessage,
 	agentUID,
+	localUid,
+	participantNames,
 }: QuickstartTranscriptPanelProps) {
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const messages = useMemo(
@@ -65,8 +69,14 @@ export function QuickstartTranscriptPanel({
 					</div>
 				) : (
 					messages.map((message, index) => {
-						const isAgent = String(message.uid) === agentUID;
-						const label = isAgent ? "Agent" : "You";
+						const uidStr = String(message.uid);
+						const isAgent = uidStr === agentUID;
+						const isLocal = uidStr === localUid;
+						const label = isAgent
+							? "Agent"
+							: isLocal
+								? "You"
+								: (participantNames[uidStr] ?? `Participant ${uidStr}`);
 						const text = message.text?.trim();
 						const time = formatMessageTime(message.createdAt);
 

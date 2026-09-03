@@ -7,6 +7,9 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: path.resolve(__dirname, '..'),
   },
+  // Lets a teammate on the same LAN load the dev server (and its HMR
+  // websocket) from this machine's local IP instead of localhost.
+  allowedDevOrigins: ['192.168.1.8'],
 
   // Optimize images
   images: {
@@ -31,6 +34,14 @@ const nextConfig: NextConfig = {
       {
         source: '/api/stopAgent',
         destination: `${backendUrl}/stopAgent`,
+      },
+      {
+        source: '/api/setName',
+        destination: `${backendUrl}/setName`,
+      },
+      {
+        source: '/api/getNames',
+        destination: `${backendUrl}/getNames`,
       },
     ]
   },
