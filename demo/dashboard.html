@@ -64,7 +64,13 @@ async function simulateIncident() {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      source_id: "demo-source-1",
+      // Unique per click on purpose: a fixed source_id meant every click
+      // after the first silently attached to whatever incident was still
+      // open (iTriage's dedup treats same source_id+service+region as the
+      // same ongoing incident until it reaches a terminal status) -- so
+      // the button looked broken after one use when it was actually
+      // working exactly as designed, just always hitting the same row.
+      source_id: `demo-source-${Date.now()}`,
       source_type: "k8s_deployment",
       region: "us-east",
       service: "auth-api",
