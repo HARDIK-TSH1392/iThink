@@ -10,7 +10,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { LoadingSkeleton } from "@/components/LoadingSkeleton";
 import { QuickstartPreCallCard } from "@/components/QuickstartPreCallCard";
 import { ShareButton } from "@/components/share-button";
-import { getConfig, startAgent, stopAgent } from "@/services/api";
+import { getConfig, setName, startAgent } from "@/services/api";
 import type { AgoraRenewalTokens, AgoraTokenData } from "@/types/conversation";
 
 const ConversationComponent = dynamic(
@@ -93,6 +93,10 @@ export default function LandingPage() {
 	// POST /icall/incidents/{id}/call is the one a human actually joins.
 	const searchParams = useSearchParams();
 	const channelFromUrl = searchParams.get("channel") ?? undefined;
+	// Lets two people share a join link with fixed UIDs (e.g. ?uid=1001 for
+	// one teammate, ?uid=1002 for the other) so they land in the same room
+	// instead of each getting a randomly generated UID.
+	const uidFromUrl = searchParams.get("uid") ?? undefined;
 
 	const [showConversation, setShowConversation] = useState(false);
 	const [agoraData, setAgoraData] = useState<AgoraTokenData | null>(null);
@@ -100,19 +104,21 @@ export default function LandingPage() {
 	const [isLoading, setIsLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [agentJoinError, setAgentJoinError] = useState(false);
+	const [localName, setLocalName] = useState("");
 
 	useEffect(() => {
 		import("agora-rtc-react").catch(() => {});
 		import("agora-rtm").catch(() => {});
 	}, []);
 
-	const handleStartConversation = async () => {
+	const handleStartConversation = async (name: string) => {
 		setIsLoading(true);
 		setError(null);
 		setAgentJoinError(false);
+		setLocalName(name);
 
 		try {
-			const config = await getConfig({ channel: channelFromUrl });
+			const config = await getConfig({ channel: channelFromUrl, uid: uidFromUrl });
 			const appId = config.app_id;
 
 			const [agentIdResult, rtm] = await Promise.all([
@@ -133,6 +139,11 @@ export default function LandingPage() {
 					await nextRtm.subscribe(config.channel_name);
 					return nextRtm;
 				})(),
+				// Best-effort: publish our display name so other participants can
+				// label us properly. Shouldn't block joining the call if it fails.
+				setName(config.channel_name, config.uid, name).catch((err) => {
+					console.error("Failed to publish display name:", err);
+				}),
 			]);
 
 			setRtmClient(rtm);
@@ -141,8 +152,11 @@ export default function LandingPage() {
 				uid: config.uid,
 				channel: config.channel_name,
 				appId: config.app_id,
-				agentUid: config.agent_uid,
-				agentId: agentIdResult,
+				// Use the uid the backend confirms is actually running the
+				// agent, not our own pre-join guess (config.agent_uid) --
+				// they differ whenever someone else already started it.
+				agentUid: agentIdResult?.agentUid ?? config.agent_uid,
+				agentId: agentIdResult?.agentId,
 			});
 			setShowConversation(true);
 		} catch (nextError) {
@@ -181,13 +195,11 @@ export default function LandingPage() {
 	);
 
 	const handleEndConversation = async () => {
-		if (agoraData?.agentId) {
-			try {
-				await stopAgent(agoraData.agentId);
-			} catch (nextError) {
-				console.error("Failed to stop agent:", nextError);
-			}
-		}
+		// Deliberately doesn't call stopAgent: with remote_rtc_uids: ["*"] one
+		// agent is shared by everyone on the call, so "end conversation" must
+		// only leave the channel for *this* participant, not kill the agent
+		// for whoever's still on the call. The agent's own idle_timeout (see
+		// agent.py) stops it a few seconds after the last human leaves.
 
 		rtmClient?.logout().catch((err) => console.error("RTM logout error:", err));
 		setRtmClient(null);
@@ -216,6 +228,7 @@ export default function LandingPage() {
 							isLoading={isLoading}
 							error={error}
 							onStartConversation={handleStartConversation}
+							channel={channelFromUrl}
 						/>
 					) : agoraData && rtmClient ? (
 						<>
@@ -231,6 +244,7 @@ export default function LandingPage() {
 										<ConversationComponent
 											agoraData={agoraData}
 											rtmClient={rtmClient}
+											localName={localName}
 											onTokenWillExpire={handleTokenWillExpire}
 											onEndConversation={handleEndConversation}
 										/>

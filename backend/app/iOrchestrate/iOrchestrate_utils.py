@@ -341,7 +341,7 @@ async def post_incident_approved_notification(
     region: str,
     approved_by: str,
     responders: Optional[list] = None,
-    meeting_link: Optional[str] = None,
+    join_url: Optional[str] = None,
 ) -> bool:
     """
     Minimal orchestration action: post a Slack message when an incident is
@@ -356,10 +356,13 @@ async def post_incident_approved_notification(
     Slack scope we deliberately skipped for now (low payoff tonight, since
     only real accounts can be invited at all).
 
-    `meeting_link` is optional and omitted from the message entirely when
-    room creation failed rather than posting a broken/missing link -- see
-    notify_incident_approved, which is the only caller and always tries to
-    create the room first.
+    `join_url` is the voice-agent web client link for this incident's
+    channel -- whoever opens it first and clicks "Start Conversation" also
+    starts the AI agent for everyone in the room (joining the room and
+    starting the agent are independent Agora operations; this UI just
+    triggers both from one click). Optional and omitted from the message
+    entirely when room creation failed, rather than posting a broken link
+    -- see notify_incident_approved, which is the only caller.
     """
     text = (
         f"*Incident #{incident_id} approved* :rotating_light:\n"
@@ -368,15 +371,15 @@ async def post_incident_approved_notification(
         f"Approved by: {approved_by}"
     )
 
-    if meeting_link:
-        text += f"\nJoin the incident room: {meeting_link}"
-
     if responders:
         names = [
             f"<@{r.slack_user_id}> ({r.name})" if r.slack_user_id else r.name
             for r in responders
         ]
         text += f"\nResponders needed: {', '.join(names)}"
+
+    if join_url:
+        text += f"\nJoin the incident call: {join_url}"
 
     ok = await _post_to_slack(text)
     if ok:
@@ -387,12 +390,10 @@ async def post_incident_approved_notification(
 async def notify_incident_approved(db, incident) -> bool:
     """
     Single entry point for "an incident was just approved" -- resolves
-    responders via iDirectory, creates the incident's room via iCall (this
-    is the one place that actually happens; previously nothing wired the
-    two together, so approval never produced a joinable link), and posts
-    the announcement. Mirrors notify_approval_needed's shape so both
-    approval paths (the manual API and the Slack button) call one function
-    instead of duplicating the resolve+notify+room-create logic.
+    responders via iDirectory, ensures the call/channel exists, and posts
+    the announcement with a join link. Mirrors notify_approval_needed's
+    shape so both approval paths (the manual API and the Slack button)
+    call one function instead of duplicating the resolve+notify logic.
 
     Room creation failing does not block the Slack announcement -- same
     fire-and-forget discipline as everything else here; the message just
@@ -403,10 +404,11 @@ async def notify_incident_approved(db, incident) -> bool:
 
     responders = await resolve_responders(db, incident.service)
 
-    meeting_link = None
+    join_url = None
     try:
         call = await get_or_create_call(db, incident.id)
-        meeting_link = f"{get_settings().voice_client_base_url}/?channel={call.channel_name}"
+        settings = get_settings()
+        join_url = f"{settings.voice_agent_web_base_url.rstrip('/')}/?channel={call.channel_name}"
     except Exception as exc:
         print(f"[iOrchestrate] Room creation failed for incident {incident.id}: {exc}")
 
@@ -418,7 +420,7 @@ async def notify_incident_approved(db, incident) -> bool:
         region=incident.region,
         approved_by=incident.approved_by,
         responders=responders,
-        meeting_link=meeting_link,
+        join_url=join_url,
     )
 
 

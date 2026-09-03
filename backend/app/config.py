@@ -31,13 +31,11 @@ class Settings(BaseSettings):
     jira_api_token: str = ""
     jira_project_key: str = ""
 
-    # Base URL of the voice-agent web client (voice-agent/web), used to build
-    # the join link put in the approved-incident Slack message: {this}/?channel={name}.
-    # Only correct for whoever's machine is actually running that client --
-    # sharing the resulting link across machines needs that client to be
-    # reachable from wherever the recipient is, same class of problem as the
-    # Agora/Slack webhook public-URL requirement, not solved by this setting.
-    voice_client_base_url: str = "http://localhost:3000"
+    # Base URL of the voice-agent web client (voice-agent/web) that a
+    # responder actually clicks to join the call. Defaults to localhost --
+    # only reachable from this machine -- swap for a real public URL (once
+    # a stable tunnel/deployment exists) without touching any calling code.
+    voice_agent_web_base_url: str = "http://localhost:3000"
 
     class Config:
         env_file = ".env"

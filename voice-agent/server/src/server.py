@@ -89,6 +89,20 @@ class StopAgentRequest(BaseModel):
     agentId: str
 
 
+class SetNameRequest(BaseModel):
+    """Request body for POST /setName"""
+    channelName: str
+    uid: str
+    name: str
+
+
+# channel_name -> {uid: name}. In-memory and best-effort: lets every
+# participant on a call see everyone else's display name without needing
+# RTM presence or any coordination ahead of time. Cleared implicitly when
+# the process restarts -- fine for a live call, not meant to persist.
+_channel_names: Dict[str, Dict[str, str]] = {}
+
+
 # API endpoints
 def _generate_channel_name() -> str:
     return f"ai-conversation-{int(time.time())}-{random.randint(1000, 9999)}"
@@ -191,6 +205,22 @@ async def stop_agent(request: StopAgentRequest):
     except Exception as e:
         _log_route_error("/stopAgent", e, agentId=request.agentId)
         raise _to_http_error(e)
+
+
+@router.post("/setName")
+async def set_name(request: SetNameRequest):
+    """Record a participant's display name for a channel."""
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required and cannot be empty")
+    _channel_names.setdefault(request.channelName, {})[request.uid] = name
+    return {"code": 0, "msg": "success"}
+
+
+@router.get("/getNames")
+async def get_names(channel: str = Query(...)):
+    """Return the uid -> name map recorded so far for a channel."""
+    return {"code": 0, "data": _channel_names.get(channel, {}), "msg": "success"}
 
 
 app.include_router(router)

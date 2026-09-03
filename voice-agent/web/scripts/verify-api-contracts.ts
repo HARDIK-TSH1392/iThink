@@ -137,6 +137,7 @@ async function verifyApiClientRequests() {
         code: 0,
         data: {
           agent_id: 'mock-agent-id',
+          agent_uid: '9999',
           channel_name: 'test-channel',
           status: 'started',
         },
@@ -158,10 +159,11 @@ async function verifyApiClientRequests() {
     const config = await getConfig({ uid: 1234, channel: 'test-channel' })
     assert(config.token === 'stub-token', 'GET /api/get_config should return response data')
 
-    const agentId = await startAgent('test-channel', 9999, 1234)
-    assert(agentId === 'mock-agent-id', 'POST /api/startAgent should return the agent id')
+    const startResult = await startAgent('test-channel', 9999, 1234)
+    assert(startResult.agentId === 'mock-agent-id', 'POST /api/startAgent should return the agent id')
+    assert(startResult.agentUid === '9999', 'POST /api/startAgent should return the running agent_uid')
 
-    await stopAgent(agentId)
+    await stopAgent(startResult.agentId)
 
     assert(
       JSON.stringify(seenPaths) === JSON.stringify(['/api/get_config', '/api/startAgent', '/api/stopAgent']),

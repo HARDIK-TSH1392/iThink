@@ -3,6 +3,7 @@ Agent
 
 High-level API for managing Agora Conversational AI Agents.
 """
+import asyncio
 import logging
 import os
 import time
@@ -14,14 +15,18 @@ from agora_agent.agentkit.vendors import CustomLLM, DeepgramSTT, MiniMaxTTS, Ope
 
 logger = logging.getLogger("uvicorn.error")
 
-ADA_PROMPT = """You are Ada, an agentic developer advocate from Agora. You help developers understand and build with Agora's Conversational AI platform.
+ADA_PROMPT = """You are iThink, an AI incident commander joining a live incident
+call. Your job is to keep the room's shared understanding straight: track
+facts, hypotheses, decisions, and action items as they're said. You do not
+investigate, diagnose, or recommend fixes -- that judgment belongs to the
+humans on the call.
 
-Agora is a real-time communications company. The product you represent is the Agora Conversational AI Engine.
-
-If you do not know a specific fact about Agora, say so plainly and suggest checking docs.agora.io. Keep most replies to one or two sentences unless the user explicitly asks for more detail.
+Keep replies brief -- most turns need only a short acknowledgment. Speak up
+only when something needs it: a contradiction with what's already been said,
+or a targeted clarifying question.
 """
 
-DEFAULT_GREETING = "Hi there! I'm Ada, your virtual assistant from Agora. How can I help?"
+DEFAULT_GREETING = "Hi, this is iThink. I'll listen in and keep track of what's discussed -- let me know if you'd like a recap."
 
 
 class Agent:
@@ -48,6 +53,26 @@ class Agent:
 
         # Track active sessions by agent_id
         self._sessions: Dict[str, Any] = {}
+        # channel_name -> (agent_id, result) for the currently-running agent
+        # in that channel, if any. Lets a second/third person joining the
+        # same incident's call skip starting a duplicate agent (and hearing
+        # a second greeting) -- only the first joiner actually starts one.
+        self._channel_agents: Dict[str, tuple] = {}
+        # channel_name -> lock serializing start() for that channel. Without
+        # this, two people opening the shared join link within the same
+        # instant both read self._channel_agents before either had a chance
+        # to write it (the check and the write are separated by an awaited
+        # Agora API call), so both would start a real agent -- two agents in
+        # one room, double greeting, duplicate note-taking. One lock per
+        # channel keeps unrelated incidents' starts fully concurrent.
+        self._channel_locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_channel_lock(self, channel_name: str) -> asyncio.Lock:
+        lock = self._channel_locks.get(channel_name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._channel_locks[channel_name] = lock
+        return lock
 
     async def start(
         self,
@@ -61,6 +86,32 @@ class Agent:
             raise ValueError("channel_name is required and cannot be empty")
         if agent_uid <= 0:
             raise ValueError("agent_uid is required and cannot be empty")
+
+        async with self._get_channel_lock(channel_name):
+            return await self._start_locked(channel_name, agent_uid, user_uid, output_audio_codec)
+
+    async def _start_locked(
+        self,
+        channel_name: str,
+        agent_uid: int,
+        user_uid: int,
+        output_audio_codec: Optional[str],
+    ) -> Dict[str, Any]:
+        # An agent is already running in this channel (a prior joiner started
+        # it) -- return that result instead of starting a second agent, which
+        # would greet the room again and duplicate note-taking. Re-checked
+        # here, inside the per-channel lock, since a concurrent start() for
+        # this same channel may have finished while this call was waiting
+        # for the lock.
+        existing = self._channel_agents.get(channel_name)
+        if existing is not None:
+            existing_agent_id, existing_result = existing
+            logger.info(
+                "Agent already running for channel=%s agent_id=%s, skipping duplicate start",
+                channel_name,
+                existing_agent_id,
+            )
+            return existing_result
         if user_uid <= 0:
             raise ValueError("user_uid is required and cannot be empty")
 
@@ -154,10 +205,18 @@ class Agent:
             .with_tts(tts)
         )
 
+        # "*" subscribes the agent to every human in the channel, not just
+        # whoever's join triggered the start -- remote_rtc_uids only takes a
+        # single explicit uid per Agora's docs, so listing multiple uids
+        # here silently only honors one. This also means idle_timeout now
+        # correctly counts from when *everyone* has left, not just the
+        # original joiner.
+        remote_uids = ["*"]
+
         session = agora_agent.create_async_session(
             channel=channel_name,
             agent_uid=str(agent_uid),
-            remote_uids=[str(user_uid)],
+            remote_uids=remote_uids,
             enable_string_uid=False,
             idle_timeout=30,
             expires_in=3600,
@@ -192,16 +251,30 @@ class Agent:
             user_uid,
         )
         
-        return {
+        result = {
             "agent_id": agent_id,
             "channel_name": channel_name,
             "status": "started",
+            # The uid that actually started (or is already running) in this
+            # channel -- callers must not assume it's their own agent_uid
+            # guess, since a later joiner's /startAgent gets short-circuited
+            # to whichever agent the first joiner actually started (see the
+            # existing-channel check above).
+            "agent_uid": str(agent_uid),
         }
+        self._channel_agents[channel_name] = (agent_id, result)
+        return result
 
     async def stop(self, agent_id: str) -> None:
         """Stop a running agent. Falls back to the stateless client path."""
         if not agent_id or not str(agent_id).strip():
             raise ValueError("agent_id is required and cannot be empty")
+
+        stale_channels = [
+            channel for channel, (aid, _) in self._channel_agents.items() if aid == agent_id
+        ]
+        for channel in stale_channels:
+            self._channel_agents.pop(channel, None)
 
         session = self._sessions.pop(agent_id, None)
         if session:
