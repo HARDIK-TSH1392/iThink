@@ -54,6 +54,11 @@
 
 <script>
 const API_BASE = "http://127.0.0.1:8123/api/v1";
+// localhost only resolves on whichever machine has this page open --
+// override locally (LAN IP, or a tunnel URL) if you need teammates on a
+// different machine to join. Matches backend/.env's
+// VOICE_AGENT_WEB_BASE_URL, used for the same join link in the Slack
+// approval message -- keep both pointed at the same place if you change it.
 const WEB_CLIENT_BASE = "http://localhost:3000";
 document.getElementById("api-base-display").textContent = API_BASE;
 
