@@ -101,6 +101,29 @@ MALFORMED_RESPONSE_FALLBACK = "Sorry, could you say that again?"
 # literally be shared across the two services.
 WAKE_WORD = "ithink"
 
+
+def _is_direct_address(text: str) -> bool:
+    """
+    True if this turn looks like someone deliberately addressing the agent
+    by name, not just using it as ordinary conversation.
+
+    "iThink" isn't a real word, so live speech-to-text has no reason to
+    transcribe it as the literal unspaced "ithink" -- Deepgram will most
+    naturally write two spoken syllables as "I think", indistinguishable
+    from the extremely common hedge phrase ("I think the DB is fine", "I
+    think we should roll back") that shows up constantly in incident calls
+    without addressing anyone. Matching bare "i think" here would make the
+    agent interrupt on nearly every other sentence, which defeats the
+    entire point of this gate. Requiring "hey" alongside "i think" keeps a
+    natural way to say the wake word out loud ("Hey iThink, ...") while
+    staying rare in ordinary speech; "ithink" with no space is kept too in
+    case STT (or a text/chat caller) ever does produce it as one token.
+    """
+    lowered = text.lower()
+    if WAKE_WORD in lowered:
+        return True
+    return "hey" in lowered and "i think" in lowered
+
 # Spoken when StructuringUpdate.is_wrapping_up is true. Deliberately a fixed
 # string, not LLM-generated -- see StructuringUpdate.is_wrapping_up's
 # docstring: the model only detects the moment, this is the guaranteed-
@@ -437,7 +460,7 @@ def should_speak_aloud(update: StructuringUpdate, latest_user_message: Optional[
         return True
     if update.missing_info:
         return True
-    if latest_user_message and WAKE_WORD in latest_user_message.lower():
+    if latest_user_message and _is_direct_address(latest_user_message):
         return True
     return False
 
