@@ -13,6 +13,7 @@ class IncidentCallRead(BaseModel):
     channel_name: str
     status: str
     structured_state: dict
+    participant_roles: dict = Field(default_factory=dict)
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     created_at: datetime
@@ -31,6 +32,10 @@ class CallUtteranceCreate(BaseModel):
     """Schema for recording one attributed transcript line."""
 
     speaker_uid: str = Field(..., min_length=1)
+    # Best-known display name at post time (from the join-screen name
+    # registry). Optional since a line could arrive before a name's been
+    # published yet -- role-inference just treats those as unnamed.
+    speaker_name: Optional[str] = None
     text: str = Field(..., min_length=1)
     turn_index: int = Field(..., ge=0)
     timestamp: datetime
@@ -42,6 +47,7 @@ class CallUtteranceRead(BaseModel):
     id: int
     call_id: int
     speaker_uid: str
+    speaker_name: Optional[str] = None
     text: str
     turn_index: int
     timestamp: datetime
@@ -95,28 +101,108 @@ class StructuringUpdate(BaseModel):
     TriageVerdict — this is a coordination layer, not an autonomous
     diagnostician.
 
-    facts/hypotheses/decisions/action_items are NEW items only for this
-    turn, not the full running state — iCall_service merges them into
-    IncidentCall.structured_state by appending in code, the same
+    facts/hypotheses/decisions/action_items/missing_info are NEW items only
+    for this turn, not the full running state — iCall_service merges them
+    into IncidentCall.structured_state by appending in code, the same
     "don't let the LLM freely rewrite state" discipline as iTriage's
     deterministic confidence scoring. Never replace structured_state
     wholesale with this object.
 
     identified_speakers is a best-effort name/role guess from what was said
     (e.g. "I'm Priya, on-call SRE") — NOT tied to Agora's per-participant
-    UID. Whether Agora's Custom LLM request carries a UID per message isn't
-    confirmed in the docs read so far; real UID-level attribution is a
-    separate, still-open investigation (see the per-speaker-transcription
-    task), not something to fake here.
+    UID; this live per-turn path still can't attribute speech to a UID
+    (Agora's Custom LLM request carries no per-message speaker id, only
+    merged role/content). Real UID-level attribution now exists, but as a
+    separate pipeline: attributed client-side utterances -> end-of-call
+    role classification (see iCall_service.infer_and_store_participant_roles)
+    -- deliberately not duplicated here.
+
+    is_wrapping_up flags that this turn sounds like the call concluding
+    (e.g. "I think that covers everything," explicit goodbyes). iCall_api's
+    endpoint -- not this model, not the LLM -- decides the actual closing
+    line spoken to the room when this is true, so what gets promised about
+    Slack/Jira is always accurate rather than whatever the model
+    paraphrases.
     """
 
     facts: List[str] = Field(default_factory=list)
     hypotheses: List[str] = Field(default_factory=list)
     decisions: List[str] = Field(default_factory=list)
     action_items: List[ActionItem] = Field(default_factory=list)
+    # Gaps or open questions noticed this turn -- e.g. "no one has confirmed
+    # which region is affected." Distinct from a hypothesis (a guess someone
+    # floated) and from a conflict (two things said that contradict).
+    missing_info: List[str] = Field(default_factory=list)
     conflict: Optional[str] = None
     identified_speakers: List[str] = Field(default_factory=list)
+    is_wrapping_up: bool = False
     spoken_reply: str
+    # Optional, additional to spoken_reply -- something worth flagging that
+    # doesn't warrant interrupting a conversation that's actively flowing
+    # (e.g. a secondary observation, a connection between two facts that
+    # isn't urgent). Rendered as a written note in the call UI, never
+    # spoken aloud. spoken_reply still always happens; this is a second,
+    # non-disruptive channel, not a replacement for it.
+    agent_chat_note: Optional[str] = None
+
+
+class RoleScore(BaseModel):
+    """One category's relevance score for one speaker. Scores are
+    independent (not required to sum to 1) -- someone can plausibly score
+    high on both "devops" and "backend_engineer"."""
+
+    role: str
+    score: float = Field(ge=0, le=1)
+
+
+class SpeakerRoleClassification(BaseModel):
+    """
+    One speaker's role inference from everything they said in the call.
+    best_role/rationale are what iCall_service actually uses when there's
+    no directory match; scores are kept for transparency/debugging, not
+    because anything currently consumes the full distribution.
+    """
+
+    speaker_uid: str
+    speaker_name: str
+    scores: List[RoleScore] = Field(default_factory=list)
+    best_role: str
+    rationale: str
+
+
+class CallRoleClassification(BaseModel):
+    """LLM output shape for one call's end-of-call role inference pass."""
+
+    speakers: List[SpeakerRoleClassification] = Field(default_factory=list)
+
+
+class ActionItemOwnerAssignment(BaseModel):
+    """
+    One action item's role-based owner assignment. item_index refers back
+    to the position in the unresolved-items list this was asked about, not
+    the item's position in the call's full action_items list -- iCall_service
+    maps it back.
+    """
+
+    item_index: int
+    owner_uid: Optional[str] = None
+    rationale: str
+
+
+class ActionItemOwnerAssignments(BaseModel):
+    """LLM output shape for the end-of-call role-based ownership pass."""
+
+    assignments: List[ActionItemOwnerAssignment] = Field(default_factory=list)
+
+
+class UnresolvedRisksSummary(BaseModel):
+    """
+    LLM output shape for the end-of-call risk synthesis: what's still open
+    or uncertain across everything recorded, for the final summary. Not a
+    diagnosis or a fix -- see iCall_utils.UNRESOLVED_RISKS_SYSTEM_INSTRUCTION.
+    """
+
+    risks: List[str] = Field(default_factory=list)
 
 
 class ChatCompletionRequest(BaseModel):
