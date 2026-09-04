@@ -60,6 +60,17 @@ def generate_channel_name(incident_id: int) -> str:
 PRIMARY_MODEL = "gemini-3.5-flash-lite"
 FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
+# None of the four Gemini call sites below had a timeout before this --
+# found via a dry run that hit a genuine hang (90+s, zero output, not even
+# the fast ~1-3s failure a real 503 returns) on one of the end-of-call
+# passes. Without this, a stuck request blocks whatever awaits it
+# indefinitely: for the per-turn structuring call, that's the live
+# conversation itself (Agora's Custom LLM hook has nothing to send back to
+# the room); for the end-of-call passes, that's the client's "End
+# Conversation" request just hanging. 25s matches the margin already used
+# for the GitHub deploy-check call elsewhere in this file.
+GEMINI_CALL_TIMEOUT_S = 25
+
 _gemini_semaphore = asyncio.Semaphore(4)
 
 _client: "genai.Client | None" = None
@@ -285,21 +296,33 @@ async def generate_structuring_update(
 
     async with _gemini_semaphore:
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=PRIMARY_MODEL,
-                contents=prompt,
-                config=config,
-            )
-        except Exception:
-            try:
-                response = await asyncio.to_thread(
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
                     client.models.generate_content,
-                    model=FALLBACK_MODEL,
+                    model=PRIMARY_MODEL,
                     contents=prompt,
                     config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            print(f"[iCall] Structuring primary call failed/timed out, trying fallback: {exc}")
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=FALLBACK_MODEL,
+                        contents=prompt,
+                        config=config,
+                    ),
+                    timeout=GEMINI_CALL_TIMEOUT_S,
                 )
-            except Exception:
+            except Exception as exc2:
+                # This is the live per-turn call -- a hang here previously
+                # had no ceiling at all and would have frozen the actual
+                # conversation (Agora's Custom LLM hook has nothing to send
+                # back to the room until this returns).
+                print(f"[iCall] Structuring failed on both attempts, falling back: {exc2}")
                 return _fallback_structuring_update()
 
     try:
@@ -435,26 +458,40 @@ async def classify_participant_roles(
 
     async with _gemini_semaphore:
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=PRIMARY_MODEL,
-                contents=prompt,
-                config=config,
-            )
-        except Exception:
-            try:
-                response = await asyncio.to_thread(
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
                     client.models.generate_content,
-                    model=FALLBACK_MODEL,
+                    model=PRIMARY_MODEL,
                     contents=prompt,
                     config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            print(f"[iCall] Role classification primary call failed/timed out, trying fallback: {exc}")
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=FALLBACK_MODEL,
+                        contents=prompt,
+                        config=config,
+                    ),
+                    timeout=GEMINI_CALL_TIMEOUT_S,
                 )
-            except Exception:
+            except Exception as exc2:
+                # Runs once, at call end, with no retry beyond this -- a
+                # silent failure here means role recognition for this call
+                # is permanently empty with nothing in the logs to explain
+                # why. Caught by a dry run that happened to hit a transient
+                # failure with no visible cause until this was added.
+                print(f"[iCall] Role classification failed on both attempts, leaving roles unresolved: {exc2}")
                 return CallRoleClassification()
 
     try:
         return CallRoleClassification.model_validate_json(response.text)
-    except Exception:
+    except Exception as exc:
+        print(f"[iCall] Role classification response didn't match schema, leaving roles unresolved: {exc}")
         return CallRoleClassification()
 
 
@@ -524,26 +561,35 @@ async def assign_action_item_owners(
 
     async with _gemini_semaphore:
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=PRIMARY_MODEL,
-                contents=prompt,
-                config=config,
-            )
-        except Exception:
-            try:
-                response = await asyncio.to_thread(
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
                     client.models.generate_content,
-                    model=FALLBACK_MODEL,
+                    model=PRIMARY_MODEL,
                     contents=prompt,
                     config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            print(f"[iCall] Owner assignment primary call failed/timed out, trying fallback: {exc}")
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=FALLBACK_MODEL,
+                        contents=prompt,
+                        config=config,
+                    ),
+                    timeout=GEMINI_CALL_TIMEOUT_S,
                 )
-            except Exception:
+            except Exception as exc2:
+                print(f"[iCall] Owner assignment failed on both attempts, leaving items unassigned: {exc2}")
                 return ActionItemOwnerAssignments()
 
     try:
         return ActionItemOwnerAssignments.model_validate_json(response.text)
-    except Exception:
+    except Exception as exc:
+        print(f"[iCall] Owner assignment response didn't match schema, leaving items unassigned: {exc}")
         return ActionItemOwnerAssignments()
 
 
@@ -599,26 +645,35 @@ async def summarize_unresolved_risks(structured_state: dict) -> UnresolvedRisksS
 
     async with _gemini_semaphore:
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=PRIMARY_MODEL,
-                contents=prompt,
-                config=config,
-            )
-        except Exception:
-            try:
-                response = await asyncio.to_thread(
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
                     client.models.generate_content,
-                    model=FALLBACK_MODEL,
+                    model=PRIMARY_MODEL,
                     contents=prompt,
                     config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            print(f"[iCall] Unresolved-risks primary call failed/timed out, trying fallback: {exc}")
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=FALLBACK_MODEL,
+                        contents=prompt,
+                        config=config,
+                    ),
+                    timeout=GEMINI_CALL_TIMEOUT_S,
                 )
-            except Exception:
+            except Exception as exc2:
+                print(f"[iCall] Unresolved-risks summary failed on both attempts, leaving risks empty: {exc2}")
                 return UnresolvedRisksSummary()
 
     try:
         return UnresolvedRisksSummary.model_validate_json(response.text)
-    except Exception:
+    except Exception as exc:
+        print(f"[iCall] Unresolved-risks response didn't match schema, leaving risks empty: {exc}")
         return UnresolvedRisksSummary()
 
 
