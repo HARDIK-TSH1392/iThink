@@ -20,8 +20,31 @@
   .badge.approved, .badge.orchestrating { background: #d4edda; color: #155724; }
   .badge.detected, .badge.triage { background: #d1ecf1; color: #0c5460; }
   .badge.rejected, .badge.closed { background: #f8d7da; color: #721c24; }
+  .badge.scheduled { background: #e0e0f0; color: #3a3a6e; }
+  .badge.in_progress { background: #d4edda; color: #155724; }
+  .badge.completed { background: #d1ecf1; color: #0c5460; }
   a.join-link { display: inline-block; margin-top: 10px; background: #16a34a; color: white; padding: 8px 14px; border-radius: 6px; text-decoration: none; font-size: 14px; }
   .note { font-size: 12px; color: #888; }
+  .tl-entry { border-left: 3px solid #ccc; padding: 6px 0 6px 12px; margin-bottom: 4px; font-size: 13px; }
+  .tl-entry .tl-time { color: #999; font-size: 11px; margin-right: 6px; }
+  .tl-entry.fact { border-color: #2b5cff; }
+  .tl-entry.hypothesis { border-color: #b8860b; }
+  .tl-entry.decision { border-color: #16a34a; }
+  .tl-entry.action_item { border-color: #7c3aed; }
+  .tl-entry.missing_info { border-color: #d97706; }
+  .tl-entry.conflict { border-color: #d64545; font-weight: 600; }
+  .tl-entry.chat_note { border-color: #999; font-style: italic; color: #666; }
+  .tl-entry.pattern_nudge { border-color: #0b7285; background: #e3f3f5; font-weight: 600; }
+  .tl-type { display: inline-block; font-size: 10px; text-transform: uppercase; font-weight: 700; letter-spacing: 0.03em; color: #666; margin-right: 6px; }
+  .roster { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .roster .person { background: #f4f4f8; border-radius: 6px; padding: 6px 10px; font-size: 12px; }
+  .roster .person .role { color: #666; }
+  .roster .person .src { font-size: 10px; color: #999; }
+  .risk-list li { color: #a13048; }
+  .health-badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 11px; font-weight: 700; margin-left: 8px; }
+  .health-badge.good { background: #d4edda; color: #155724; }
+  .health-badge.ok { background: #fff3cd; color: #856404; }
+  .health-badge.low { background: #f8d7da; color: #721c24; }
 </style>
 </head>
 <body>
@@ -50,6 +73,18 @@
   <button onclick="createCall()">Create / get room</button>
   <pre id="call-result"></pre>
   <div id="join-link-container"></div>
+</div>
+
+<div class="step">
+  <h2>4. Live incident timeline</h2>
+  <p>Renders <code>IncidentCall.structured_state</code> as it actually accumulates — facts, hypotheses, decisions, action items (with resolved owners once the call ends), missing info, conflicts, and chat notes, in the order they were recorded. The <strong>coordination health</strong> badge and any teal <strong>pattern nudge</strong> entries are the AI noticing a pattern across everything recorded so far (conflicts piling up, a stale unowned action item, competing theories, or a sharp drop in health) and speaking up on its own — not a reaction to any single thing just said. Auto-refreshes every 3s while a call id is set.</p>
+  <input id="timeline-call-id" type="number" placeholder="call id (auto-filled from step 3)" style="padding:8px;border:1px solid #ccc;border-radius:6px;width:220px;">
+  <button onclick="startTimelinePolling()">▶ Watch this call</button>
+  <button class="secondary" onclick="stopTimelinePolling()">⏸ Stop</button>
+  <div id="timeline-status" class="note" style="margin-top:8px;"></div>
+  <div id="timeline-roster"></div>
+  <div id="timeline-risks"></div>
+  <div id="timeline-entries" style="margin-top:12px;"></div>
 </div>
 
 <script>
@@ -140,6 +175,108 @@ async function createCall() {
   out.textContent = JSON.stringify(call, null, 2);
   const joinUrl = `${WEB_CLIENT_BASE}/?channel=${encodeURIComponent(call.channel_name)}`;
   linkContainer.innerHTML = `<a class="join-link" href="${joinUrl}" target="_blank">🎙️ Join "${call.channel_name}" as a human →</a>`;
+
+  // Step 4 watches whatever call step 3 most recently created/fetched --
+  // one less manual copy-paste for the common path, without removing the
+  // manual input for watching a different call than the one just created.
+  document.getElementById("timeline-call-id").value = call.id;
+  startTimelinePolling();
+}
+
+// -----------------------------------------------------------------------------
+// Step 4: live timeline. Polls IncidentCallRead (already returns the full
+// structured_state — no new backend endpoint needed) and renders it as an
+// ordered list instead of leaving it as JSON someone has to read by eye.
+// -----------------------------------------------------------------------------
+let timelinePollHandle = null;
+
+function stopTimelinePolling() {
+  if (timelinePollHandle) {
+    clearInterval(timelinePollHandle);
+    timelinePollHandle = null;
+  }
+  document.getElementById("timeline-status").textContent = "stopped.";
+}
+
+function startTimelinePolling() {
+  const callId = document.getElementById("timeline-call-id").value;
+  if (!callId) {
+    document.getElementById("timeline-status").textContent = "enter a call id first (or create a room in step 3).";
+    return;
+  }
+  stopTimelinePolling();
+  fetchAndRenderTimeline(callId);
+  timelinePollHandle = setInterval(() => fetchAndRenderTimeline(callId), 3000);
+}
+
+function _escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+async function fetchAndRenderTimeline(callId) {
+  const statusEl = document.getElementById("timeline-status");
+  const res = await fetch(`${API_BASE}/icall/${callId}`);
+  if (!res.ok) {
+    statusEl.textContent = `error fetching call ${callId}: ${res.status}`;
+    return;
+  }
+  const call = await res.json();
+  const history = (call.structured_state || {}).health_score_history || [];
+  const latestScore = history.length ? history[history.length - 1].score : null;
+  const healthHtml = latestScore === null ? "" : `<span class="health-badge ${_healthTier(latestScore)}">coordination health: ${latestScore}</span>`;
+  statusEl.innerHTML = `call #${call.id} · channel <code>${call.channel_name}</code> · <span class="badge ${call.status}">${call.status}</span>${healthHtml} · last refreshed ${new Date().toLocaleTimeString()}`;
+  renderRoster(call.participant_roles || {});
+  renderRisks((call.structured_state || {}).unresolved_risks || []);
+  renderTimelineEntries((call.structured_state || {}).timeline || []);
+}
+
+function _healthTier(score) {
+  if (score >= 75) return "good";
+  if (score >= 45) return "ok";
+  return "low";
+}
+
+function renderRoster(participantRoles) {
+  const el = document.getElementById("timeline-roster");
+  const uids = Object.keys(participantRoles);
+  if (uids.length === 0) {
+    el.innerHTML = "";
+    return;
+  }
+  el.innerHTML = `<div class="note" style="margin-top:10px;">Participants (role recognition runs once, at call end):</div>
+    <div class="roster">${uids.map(uid => {
+      const p = participantRoles[uid];
+      const role = p.final_role || "role unresolved";
+      const src = p.source ? `(${p.source})` : "";
+      return `<div class="person"><strong>${_escapeHtml(p.name || uid)}</strong> — <span class="role">${_escapeHtml(role)}</span> <span class="src">${src}</span></div>`;
+    }).join("")}</div>`;
+}
+
+function renderRisks(risks) {
+  const el = document.getElementById("timeline-risks");
+  if (!risks.length) {
+    el.innerHTML = "";
+    return;
+  }
+  el.innerHTML = `<div class="note" style="margin-top:10px;">Unresolved risks (final summary):</div>
+    <ul class="risk-list">${risks.map(r => `<li>${_escapeHtml(r)}</li>`).join("")}</ul>`;
+}
+
+function renderTimelineEntries(entries) {
+  const el = document.getElementById("timeline-entries");
+  if (!entries.length) {
+    el.innerHTML = "<p class='note'>No timeline entries yet — join the call and start talking.</p>";
+    return;
+  }
+  // Newest first -- the thing that just happened is what you want to see
+  // without scrolling, same reasoning as the incidents list above.
+  el.innerHTML = entries.slice().reverse().map(e => {
+    const time = new Date(e.timestamp).toLocaleTimeString();
+    const text = typeof e.text === "string" ? e.text : JSON.stringify(e.text);
+    return `<div class="tl-entry ${e.type}"><span class="tl-time">${time}</span><span class="tl-type">${e.type.replace('_', ' ')}</span>${_escapeHtml(text)}</div>`;
+  }).join("");
 }
 
 loadIncidents();

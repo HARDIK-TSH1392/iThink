@@ -16,6 +16,7 @@ from .iCall_utils import (
     assign_action_item_owners,
     summarize_unresolved_risks,
     CALL_STATUS_SCHEDULED,
+    HEALTH_SCORE_HISTORY_MAX_LEN,
 )
 
 # Serializes "check for an existing call, else create one" per incident_id,
@@ -123,7 +124,18 @@ async def apply_structuring_update(
     freely construct derived state" discipline as everything else here.
     """
     old = call.structured_state or {}
-    state = {
+    # Start from a shallow copy so any key this function doesn't know about
+    # (health_score_history, unresolved_risks, and anything added later)
+    # passes through untouched, instead of being silently dropped by an
+    # explicit key list -- found via a dry run that fed health_score_history
+    # through record_health_score, then watched apply_structuring_update
+    # wipe it on the very next turn. Safe specifically because a shallow
+    # copy only breaks when a nested object is later mutated in place; the
+    # fields below are all deliberately rebuilt as fresh lists (the actual
+    # fix for that original bug), and anything just passed through here is
+    # never mutated by this function at all.
+    state = dict(old)
+    state.update({
         "facts": list(old.get("facts", [])),
         "hypotheses": list(old.get("hypotheses", [])),
         "decisions": list(old.get("decisions", [])),
@@ -133,7 +145,7 @@ async def apply_structuring_update(
         "identified_speakers": list(old.get("identified_speakers", [])),
         "timeline": list(old.get("timeline", [])),
         "chat_notes": list(old.get("chat_notes", [])),
-    }
+    })
 
     now = datetime.now(timezone.utc).isoformat()
 
@@ -173,6 +185,59 @@ async def apply_structuring_update(
         _add_timeline_entry("chat_note", update.agent_chat_note)
 
     call.structured_state = state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def record_health_score(db: AsyncSession, call: IncidentCall, score: int) -> IncidentCall:
+    """
+    Appends this turn's coordination-health score to a rolling history --
+    needed because detect_health_score_drop cares about a SHARP DROP, not
+    a static low value, which is only knowable with history to compare
+    against. Capped at HEALTH_SCORE_HISTORY_MAX_LEN entries since only the
+    recent window matters for drop detection; an unbounded list would grow
+    for the entire life of a long call for no benefit.
+
+    Same rebuild-fresh-objects discipline as apply_structuring_update --
+    dict(old) plus a new list, never mutating call.structured_state's
+    existing nested objects in place.
+    """
+    old = call.structured_state or {}
+    history = list(old.get("health_score_history", []))
+    history.append({"score": score, "timestamp": datetime.now(timezone.utc).isoformat()})
+    history = history[-HEALTH_SCORE_HISTORY_MAX_LEN:]
+
+    new_state = dict(old)
+    new_state["health_score_history"] = history
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def record_pattern_nudge(db: AsyncSession, call: IncidentCall, pattern: str, message: str) -> IncidentCall:
+    """
+    Logs a CEP-pattern-triggered nudge into the timeline -- unlike an
+    ordinary spoken_reply (never persisted, see apply_structuring_update's
+    docstring), this content didn't come from the model reacting to what
+    was just said, it came from code noticing a pattern across everything
+    recorded so far. Worth keeping in the auditable record specifically
+    because "why did the AI say that" should be answerable after the
+    fact, the same explainability the whole pattern-watching design is
+    for.
+    """
+    old = call.structured_state or {}
+    timeline = list(old.get("timeline", []))
+    timeline.append({
+        "type": "pattern_nudge",
+        "text": f"[{pattern}] {message}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+    new_state = dict(old)
+    new_state["timeline"] = timeline
+    call.structured_state = new_state
     await db.commit()
     await db.refresh(call)
     return call
