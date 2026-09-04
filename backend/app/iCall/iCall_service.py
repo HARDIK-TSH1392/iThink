@@ -3,6 +3,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from typing import Dict, List, Optional
 
 from app.iNcidents.iNcidents_crudl import get_incident
@@ -275,9 +276,29 @@ async def update_call_status(db: AsyncSession, call: IncidentCall, status: str) 
 async def record_utterance(
     db: AsyncSession, call_id: int, event: CallUtteranceCreate
 ) -> CallUtterance:
+    """
+    A duplicate post of a turn_index already recorded for this call isn't a
+    new utterance -- it's the same race as get_or_create_call below and
+    TeamService.set_owner (iDirectory_crudl): the browser's own de-dupe
+    (postedTurnIds, a useRef) isn't atomic across two independent mounts of
+    the same effect, so two concurrent posts can both pass it. The unique
+    constraint on (call_id, turn_index) is what actually enforces
+    exclusivity; this just turns the loser's IntegrityError into "return
+    what's already there" instead of a 500.
+    """
     utterance = CallUtterance(call_id=call_id, **event.model_dump())
     db.add(utterance)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        existing = await db.execute(
+            select(CallUtterance).where(
+                CallUtterance.call_id == call_id,
+                CallUtterance.turn_index == event.turn_index,
+            )
+        )
+        return existing.scalar_one()
     await db.refresh(utterance)
     return utterance
 
