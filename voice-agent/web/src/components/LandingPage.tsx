@@ -11,7 +11,14 @@ import { LoadingSkeleton } from "@/components/LoadingSkeleton";
 import { PreCallBackdrop } from "@/components/PreCallBackdrop";
 import { QuickstartPreCallCard } from "@/components/QuickstartPreCallCard";
 import { ShareButton } from "@/components/share-button";
-import { getConfig, markCallCompleted, removeName, setName, startAgent } from "@/services/api";
+import {
+	getConfig,
+	markCallCompleted,
+	removeName,
+	setName,
+	startAgent,
+	type SharedScreen,
+} from "@/services/api";
 import type { AgoraRenewalTokens, AgoraTokenData } from "@/types/conversation";
 
 const ConversationComponent = dynamic(
@@ -107,6 +114,7 @@ export default function LandingPage() {
 	const [agentJoinError, setAgentJoinError] = useState(false);
 	const [localName, setLocalName] = useState("");
 	const [lateJoinRecap, setLateJoinRecap] = useState<string | null>(null);
+	const [initialSharedScreens, setInitialSharedScreens] = useState<SharedScreen[]>([]);
 
 	useEffect(() => {
 		import("agora-rtc-react").catch(() => {});
@@ -169,12 +177,13 @@ export default function LandingPage() {
 				// catch-up recap meant for us alone -- see setLateJoinRecap below.
 				setName(config.channel_name, config.uid, name).catch((err) => {
 					console.error("Failed to publish display name:", err);
-					return { recap: null };
+					return { recap: null, sharedScreens: [] };
 				}),
 			]);
 
 			setRtmClient(rtm);
 			setLateJoinRecap(setNameResult.recap);
+			setInitialSharedScreens(setNameResult.sharedScreens);
 			setAgoraData({
 				token: config.token,
 				uid: config.uid,
@@ -292,6 +301,7 @@ export default function LandingPage() {
 											rtmClient={rtmClient}
 											localName={localName}
 											lateJoinRecap={lateJoinRecap}
+											initialSharedScreens={initialSharedScreens}
 											onTokenWillExpire={handleTokenWillExpire}
 											onEndConversation={handleEndConversation}
 										/>

@@ -51,6 +51,23 @@ class Settings(BaseSettings):
     # "separate local service, plain HTTP" pattern.
     voice_agent_server_url: str = "http://localhost:8002"
 
+    # Agora's project App ID (same value as voice-agent/server's
+    # AGORA_APP_ID) -- this backend needs it too to build the Signaling
+    # REST API URL for broadcasting shared-screen events. Duplicated across
+    # the two services' env files since they're separate processes, same
+    # as voice_agent_server_url above.
+    agora_app_id: str = ""
+
+    # Agora Console -> RESTful API credentials -- a DIFFERENT credential
+    # pair from AGORA_APP_ID/APP_CERTIFICATE (those are for RTC/RTM client
+    # tokens). Used only for the server-to-channel Signaling message API
+    # (see iCall_utils.broadcast_shared_screen), authenticated with HTTP
+    # Basic auth. Empty until generated -- broadcasting is skipped (not an
+    # error) when unset, same "prove the wiring, don't crash the call"
+    # discipline as every other optional integration here.
+    agora_customer_key: str = ""
+    agora_customer_secret: str = ""
+
     class Config:
         env_file = ".env"
 

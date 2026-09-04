@@ -230,33 +230,39 @@ async def stop_agent(request: StopAgentRequest):
         raise _to_http_error(e)
 
 
-async def _fetch_late_joiner_recap(channel_name: str) -> Optional[str]:
+async def _fetch_late_joiner_catchup(channel_name: str) -> Dict[str, Any]:
     """
     A participant just joined a channel where others were already present
-    -- fetch iThink's live catch-up recap for this call so set_name can
-    hand it straight back to that one joiner (never broadcast through
-    _channel_chat_messages, which every participant polls -- a late-join
-    recap is meant for the joiner alone, not a message "sent" to the room).
-    Best-effort throughout: a slow/unreachable iThink backend should never
-    block someone from joining the call.
+    -- fetch iThink's live catch-up (text recap + any shared screens shown
+    so far, e.g. GitHub commits or server logs pulled up earlier in the
+    call) so set_name can hand it straight back to that one joiner (never
+    broadcast through _channel_chat_messages, which every participant
+    polls -- a late-join catch-up is meant for the joiner alone, not a
+    message "sent" to the room). Best-effort throughout: a slow/
+    unreachable iThink backend should never block someone from joining.
     """
     ithink_base = os.getenv("ITHINK_BACKEND_BASE_URL", "http://127.0.0.1:8123/api/v1")
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             response = await client.get(f"{ithink_base}/icall/channel/{channel_name}/recap")
             response.raise_for_status()
-            return response.json().get("data", {}).get("recap")
+            data = response.json().get("data", {})
+            return {
+                "recap": data.get("recap"),
+                "sharedScreens": data.get("shared_screens", []),
+            }
     except Exception:
-        logger.warning("Failed to fetch late-joiner recap for channel=%s", channel_name, exc_info=True)
-        return None
+        logger.warning("Failed to fetch late-joiner catch-up for channel=%s", channel_name, exc_info=True)
+        return {"recap": None, "sharedScreens": []}
 
 
 @router.post("/setName")
 async def set_name(request: SetNameRequest):
     """
     Record a participant's display name for a channel. When this is a
-    genuine late join, the response also carries a private catch-up recap
-    for this caller only -- see _fetch_late_joiner_recap.
+    genuine late join, the response also carries a private catch-up (text
+    recap + past shared screens) for this caller only -- see
+    _fetch_late_joiner_catchup.
     """
     name = request.name.strip()
     if not name:
@@ -271,9 +277,12 @@ async def set_name(request: SetNameRequest):
     is_late_join = request.uid not in existing_names and len(existing_names) > 0
     existing_names[request.uid] = name
 
-    recap = await _fetch_late_joiner_recap(request.channelName) if is_late_join else None
+    catchup = await _fetch_late_joiner_catchup(request.channelName) if is_late_join else {
+        "recap": None,
+        "sharedScreens": [],
+    }
 
-    return {"code": 0, "msg": "success", "data": {"recap": recap}}
+    return {"code": 0, "msg": "success", "data": catchup}
 
 
 @router.get("/getNames")

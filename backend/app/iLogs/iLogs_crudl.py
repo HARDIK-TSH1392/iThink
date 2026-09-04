@@ -1,3 +1,4 @@
+from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import Sequence, Optional
@@ -30,6 +31,7 @@ async def list_logs(
     region: Optional[str] = None,
     service: Optional[str] = None,
     severity: Optional[str] = None,
+    since: Optional[datetime] = None,
     limit: int = 100,
     offset: int = 0,
 ) -> Sequence[ILog]:
@@ -45,6 +47,8 @@ async def list_logs(
         query = query.where(ILog.service == service)
     if severity:
         query = query.where(ILog.severity == severity)
+    if since:
+        query = query.where(ILog.timestamp >= since)
 
     query = (
         query

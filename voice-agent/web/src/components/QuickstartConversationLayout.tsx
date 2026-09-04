@@ -1,19 +1,22 @@
 "use client";
 
-import { FileText, MessageSquare, PhoneOff } from "lucide-react";
+import { FileText, GitCommitHorizontal, MessageSquare, PhoneOff } from "lucide-react";
 import Image from "next/image";
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
-type SidePanel = "transcript" | "chat" | null;
+type SidePanel = "transcript" | "chat" | "screens" | null;
 
 type QuickstartConversationLayoutProps = {
 	statusPanel: ReactNode;
 	pipelineMetrics: ReactNode;
 	transcriptPanel: ReactNode;
 	chatPanel: ReactNode;
+	screensPanel: ReactNode;
 	visualizer: ReactNode;
 	controls: ReactNode;
 	onEndConversation: () => void;
+	/** Increments on every new live shared-screen broadcast -- forces the panel open for everyone. */
+	autoOpenScreensSignal: number;
 };
 
 export function QuickstartConversationLayout({
@@ -25,15 +28,31 @@ export function QuickstartConversationLayout({
 	pipelineMetrics: _pipelineMetrics,
 	transcriptPanel,
 	chatPanel,
+	screensPanel,
 	visualizer,
 	controls,
 	onEndConversation,
+	autoOpenScreensSignal,
 }: QuickstartConversationLayoutProps) {
 	const [activePanel, setActivePanel] = useState<SidePanel>("transcript");
 
 	const togglePanel = (panel: SidePanel) => {
 		setActivePanel((current) => (current === panel ? null : panel));
 	};
+
+	// A new shared screen just arrived for everyone on the call -- pull the
+	// panel open even if the viewer currently has transcript/chat selected
+	// (or nothing at all), so it's genuinely visible to everyone, not just
+	// whoever happens to already be looking at the right tab. Skips the
+	// very first render (ref starts at the initial value) so mounting with
+	// signal=0 doesn't force it open for no reason.
+	const previousSignal = useRef(autoOpenScreensSignal);
+	useEffect(() => {
+		if (autoOpenScreensSignal !== previousSignal.current) {
+			previousSignal.current = autoOpenScreensSignal;
+			setActivePanel("screens");
+		}
+	}, [autoOpenScreensSignal]);
 
 	return (
 		<div className="flex min-h-0 flex-1 flex-col text-left">
@@ -59,7 +78,11 @@ export function QuickstartConversationLayout({
 			<div className="flex min-h-0 w-full flex-1 flex-col gap-4 px-4 pb-4 pt-4 md:px-6 lg:flex-row lg:gap-0">
 				{activePanel ? (
 					<aside className="order-2 h-64 min-h-0 w-full shrink-0 lg:order-1 lg:h-full lg:w-[26rem]">
-						{activePanel === "transcript" ? transcriptPanel : chatPanel}
+						{activePanel === "transcript"
+							? transcriptPanel
+							: activePanel === "chat"
+								? chatPanel
+								: screensPanel}
 					</aside>
 				) : null}
 
@@ -105,6 +128,21 @@ export function QuickstartConversationLayout({
 								}`}
 							>
 								<MessageSquare className="h-[18px] w-[18px]" />
+							</button>
+
+							<button
+								type="button"
+								onClick={() => togglePanel("screens")}
+								aria-pressed={activePanel === "screens"}
+								aria-label={activePanel === "screens" ? "Hide shared screens" : "Show shared screens"}
+								title={activePanel === "screens" ? "Hide shared screens" : "Show shared screens"}
+								className={`flex h-10 w-10 items-center justify-center rounded-full transition-colors ${
+									activePanel === "screens"
+										? "bg-primary/15 text-primary"
+										: "text-muted-foreground hover:bg-muted hover:text-foreground"
+								}`}
+							>
+								<GitCommitHorizontal className="h-[18px] w-[18px]" />
 							</button>
 
 							<div className="mx-1 h-6 w-px bg-border" aria-hidden="true" />
