@@ -25,6 +25,17 @@ from .iTriage_schema import TriageVerdict
 PRIMARY_MODEL = "gemini-3.5-flash-lite"
 FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
+# Neither Gemini call below had a timeout before this -- found live, not
+# hypothetically: a plain "say OK" call to this same model hung past 20s
+# with zero response while diagnosing incidents stuck at "triage" status.
+# Without a ceiling, that hang holds the per-(source_id, service, region)
+# key lock in run_triage_for_log open indefinitely, blocking any further
+# ingest for that same key too, not just the one incident. Matches the
+# fix already applied to iCall's four Gemini call sites for the identical
+# underlying issue (Gemini's own "high demand" instability, not a bug
+# here) -- same 25s margin.
+GEMINI_CALL_TIMEOUT_S = 25
+
 # Caps concurrent Gemini calls so a burst of correlated log events can't fire
 # off unbounded parallel API calls (cost + rate-limit protection).
 _gemini_semaphore = asyncio.Semaphore(4)
@@ -79,18 +90,25 @@ async def call_gemini_for_verdict(prompt: str) -> TriageVerdict:
 
     async with _gemini_semaphore:
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=PRIMARY_MODEL,
-                contents=prompt,
-                config=config,
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=PRIMARY_MODEL,
+                    contents=prompt,
+                    config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
             )
-        except Exception:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=FALLBACK_MODEL,
-                contents=prompt,
-                config=config,
+        except Exception as exc:
+            print(f"[iTriage] Verdict primary call failed/timed out, trying fallback: {exc}")
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=FALLBACK_MODEL,
+                    contents=prompt,
+                    config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
             )
 
     return TriageVerdict.model_validate_json(response.text)
