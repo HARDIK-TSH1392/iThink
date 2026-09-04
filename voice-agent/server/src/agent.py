@@ -198,7 +198,13 @@ class Agent:
             # been figured out -- rather than always repeating the same
             # canned line. See SILENCE_TRIGGER_MARKER above.
             "silence_config": {
-                "timeout_ms": 15000,
+                # 15s was firing mid-investigation, while someone was still
+                # reading logs/dashboards rather than actually done talking
+                # -- bumped to 30s so the check-in matches a room that's
+                # genuinely gone quiet, not just mid-pause. Safe to lengthen
+                # now that get_live_participant_count already suppresses
+                # this entirely for a lone participant.
+                "timeout_ms": 30000,
                 "action": "think",
                 "content": SILENCE_TRIGGER_MARKER,
             },
@@ -225,7 +231,13 @@ class Agent:
                     "end_of_speech": {
                         "mode": "vad",
                         "vad_config": {
-                            "silence_duration_ms": 480,
+                            # 480ms was cutting real speech into fragments on
+                            # ordinary mid-sentence pauses, producing choppy
+                            # STT output and premature turn-ends. Bumped
+                            # toward the middle of Agora's suggested range to
+                            # give a speaker room to pause without ending
+                            # their turn early.
+                            "silence_duration_ms": 800,
                         },
                     },
                 },
