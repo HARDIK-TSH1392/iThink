@@ -8,15 +8,20 @@ from typing import Optional
 from app.config import get_settings
 
 
-def format_call_summary(structured_state: dict) -> str:
+def format_call_summary(structured_state: dict, participant_roles: Optional[dict] = None) -> str:
     """
     Deterministic formatting of a call's structured_state into a readable
     brief -- no extra LLM call here. The data (facts/hypotheses/decisions/
     action_items/conflicts) was already extracted live during the call by
     iCall; this just renders it, same "don't let formatting re-invent
     facts" discipline as everything upstream of it.
+
+    participant_roles is IncidentCall.participant_roles, a separate column
+    from structured_state -- passed in explicitly rather than expected
+    inside structured_state, to key action-item owners' names/roles.
     """
     state = structured_state or {}
+    participant_roles = participant_roles or {}
     lines = []
 
     def _section(title: str, items: list, empty: str = "None recorded"):
@@ -35,14 +40,29 @@ def format_call_summary(structured_state: dict) -> str:
     lines.append("*Action Items:*")
     if action_items:
         for item in action_items:
-            owner = item.get("owner") or "unassigned"
+            owner_uid = item.get("owner_uid")
+            if owner_uid:
+                owner_entry = participant_roles.get(owner_uid, {})
+                owner_name = owner_entry.get("name") or item.get("owner") or "unassigned"
+                owner_role = item.get("owner_role")
+                owner = f"{owner_name} — {owner_role}" if owner_role else owner_name
+                if item.get("owner_source") == "role_match":
+                    owner += " (matched by role, not named)"
+            else:
+                owner = item.get("owner") or "unassigned"
             lines.append(f"  • {item.get('text', '')} (owner: {owner})")
     else:
         lines.append("  None recorded")
 
+    _section("Missing information", state.get("missing_info", []), empty="None")
+
     conflicts = state.get("conflicts", [])
     if conflicts:
         _section("Unresolved conflicts/questions", conflicts)
+
+    risks = state.get("unresolved_risks", [])
+    if risks:
+        _section("Unresolved risks", risks)
 
     return "\n".join(lines)
 
@@ -54,7 +74,7 @@ async def post_call_summary_notification(incident, call) -> bool:
     resolved approver (see notify_jira_approval_needed), same "approval
     goes to the team lead, not the channel" rule as incident approval.
     """
-    summary = format_call_summary(call.structured_state)
+    summary = format_call_summary(call.structured_state, call.participant_roles)
     text = (
         f"*Post-call summary: Incident #{incident.id}* :memo:\n"
         f"*{incident.title}*  |  `{incident.service}` in `{incident.region}`\n\n"
@@ -101,7 +121,7 @@ async def notify_jira_approval_needed(db, incident, call) -> bool:
     from app.iDirectory.iDirectory_crudl import resolve_approver
 
     approver = await resolve_approver(db, incident.service)
-    summary = format_call_summary(call.structured_state)
+    summary = format_call_summary(call.structured_state, call.participant_roles)
     text = (
         f"*Jira ticket approval needed: Incident #{incident.id}* :memo:\n"
         f"*{incident.title}*  |  `{incident.service}` in `{incident.region}`\n\n"

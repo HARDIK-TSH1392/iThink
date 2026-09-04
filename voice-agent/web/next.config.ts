@@ -21,32 +21,38 @@ const nextConfig: NextConfig = {
 
   async rewrites() {
     const backendUrl = process.env.AGENT_BACKEND_URL?.replace(/\/$/, '')
-    if (!backendUrl) {
-      return []
+    const ithinkUrl = process.env.ITHINK_BACKEND_URL?.replace(/\/$/, '')
+
+    const rewrites = []
+
+    if (backendUrl) {
+      rewrites.push(
+        { source: '/api/get_config', destination: `${backendUrl}/get_config` },
+        { source: '/api/startAgent', destination: `${backendUrl}/startAgent` },
+        { source: '/api/stopAgent', destination: `${backendUrl}/stopAgent` },
+        { source: '/api/setName', destination: `${backendUrl}/setName` },
+        { source: '/api/getNames', destination: `${backendUrl}/getNames` },
+      )
     }
 
-    return [
-      {
-        source: '/api/get_config',
-        destination: `${backendUrl}/get_config`,
-      },
-      {
-        source: '/api/startAgent',
-        destination: `${backendUrl}/startAgent`,
-      },
-      {
-        source: '/api/stopAgent',
-        destination: `${backendUrl}/stopAgent`,
-      },
-      {
-        source: '/api/setName',
-        destination: `${backendUrl}/setName`,
-      },
-      {
-        source: '/api/getNames',
-        destination: `${backendUrl}/getNames`,
-      },
-    ]
+    if (ithinkUrl) {
+      rewrites.push(
+        {
+          source: '/api/recordUtterance/:channel',
+          destination: `${ithinkUrl}/icall/channel/:channel/utterances`,
+        },
+        {
+          source: '/api/callStatus/:channel',
+          destination: `${ithinkUrl}/icall/channel/:channel/status`,
+        },
+        {
+          source: '/api/chatNotes/:channel',
+          destination: `${ithinkUrl}/icall/channel/:channel/chat-notes`,
+        },
+      )
+    }
+
+    return rewrites
   },
 }
 

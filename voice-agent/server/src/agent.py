@@ -17,16 +17,33 @@ logger = logging.getLogger("uvicorn.error")
 
 ADA_PROMPT = """You are iThink, an AI incident commander joining a live incident
 call. Your job is to keep the room's shared understanding straight: track
-facts, hypotheses, decisions, and action items as they're said. You do not
-investigate, diagnose, or recommend fixes -- that judgment belongs to the
-humans on the call.
+facts, hypotheses, decisions, missing information, and action items as
+they're said. Facts are stated with confidence; hypotheses are guesses or
+theories being floated -- keep them distinct, never treat a guess as a
+confirmed fact. You do not investigate, diagnose, or recommend fixes --
+that judgment belongs to the humans on the call.
 
 Keep replies brief -- most turns need only a short acknowledgment. Speak up
-only when something needs it: a contradiction with what's already been said,
-or a targeted clarifying question.
+only when something needs it: a contradiction with what's already been
+said, a gap the room itself needs answered to move forward, or a targeted
+clarifying question. When the conversation sounds like it's genuinely
+wrapping up, say so plainly and note that a full summary will follow on
+Slack (and a Jira ticket, with approval) -- don't just trail off.
+
+Not everything worth flagging needs to interrupt the room out loud. When
+you have a secondary observation -- something useful but not urgent, like
+a connection between two things said minutes apart -- you can write it as
+a note instead of saying it, so the room isn't interrupted mid-conversation.
+Reserve speaking for anything that's actually urgent: a contradiction, a
+safety-relevant gap, or a direct question to you.
 """
 
 DEFAULT_GREETING = "Hi, this is iThink. I'll listen in and keep track of what's discussed -- let me know if you'd like a recap."
+
+# Spoken by parameters.silence_config below when the room's gone quiet for a
+# while -- a fixed line, not a live LLM call, so a quiet room can't produce
+# something odd when there's no new conversation to reason about.
+SILENCE_PROMPT = "Does anyone else have any more points to contribute?"
 
 
 class Agent:
@@ -166,6 +183,17 @@ class Agent:
             "data_channel": "rtm",
             "enable_error_message": True,
             "enable_metrics": True,
+            # After a long stretch with no one speaking, prompt the room
+            # rather than staying silent -- "Spoken status summaries at
+            # appropriate moments" from the brief. Fixed content, not a
+            # live LLM call ("speak" not "think"): a genuinely empty room
+            # has nothing for the model to reason about, so a canned
+            # prompt is more predictable than risking an odd ad-lib.
+            "silence_config": {
+                "timeout_ms": 15000,
+                "action": "speak",
+                "content": SILENCE_PROMPT,
+            },
         }
         if isinstance(output_audio_codec, str) and output_audio_codec.strip():
             parameters["output_audio_codec"] = output_audio_codec.strip()
@@ -191,6 +219,34 @@ class Agent:
                         "vad_config": {
                             "silence_duration_ms": 480,
                         },
+                    },
+                },
+            },
+            # Humans on an incident call mostly talk to *each other*, not
+            # the agent -- without this, any cross-talk while the agent is
+            # replying cuts it off mid-sentence. Only these keywords
+            # actually interrupt; everything else said while it's talking
+            # is queued ("append") and handled after, not dropped.
+            # NOT YET LIVE-VERIFIED alongside turn_detection above -- best
+            # understanding from the SDK schema is that turn_detection
+            # governs speech *detection* and this governs whether detected
+            # speech actually interrupts playback, but that interaction
+            # hasn't been watched fire on a real call yet.
+            interruption={
+                "mode": "keywords",
+                "keywords_config": {"trigger_keywords": ["ithink", "stop", "hold on", "wait"]},
+                "disabled_config": {"strategy": "append"},
+            },
+            # Fills dead air while Gemini is generating a structuring
+            # response -- a plain wait can be a second or more.
+            filler_words={
+                "enable": True,
+                "trigger": {"mode": "fixed_time", "fixed_time_config": {"response_wait_ms": 1200}},
+                "content": {
+                    "mode": "static",
+                    "static_config": {
+                        "phrases": ["Let me note that.", "One sec.", "Got it, noting that down."],
+                        "selection_rule": "shuffle",
                     },
                 },
             },

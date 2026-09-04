@@ -1,5 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 from typing import List, Optional, Sequence
 
@@ -93,6 +93,22 @@ class DuplicateEmailError(Exception):
 
 async def get_employee_by_email(db: AsyncSession, email: str) -> Optional[Employee]:
     result = await db.execute(select(Employee).where(Employee.email == email))
+    return result.scalar_one_or_none()
+
+
+async def find_employee_by_name(db: AsyncSession, name: str) -> Optional[Employee]:
+    """
+    Case-insensitive exact match on display name -- used by iCall's
+    post-call role reconciliation to check whether a call participant
+    (identified only by the name they typed on the join screen) is a known
+    employee. Deliberately exact, not fuzzy: a wrong fuzzy match here would
+    silently misattribute a directory role to the wrong person, which is
+    worse than just falling back to "no directory match, use the
+    conversation-inferred role instead."
+    """
+    result = await db.execute(
+        select(Employee).where(func.lower(Employee.name) == name.strip().lower())
+    )
     return result.scalar_one_or_none()
 
 

@@ -1,13 +1,22 @@
 import asyncio
+from collections import defaultdict
+from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import Dict, List, Optional
 
 from app.iNcidents.iNcidents_crudl import get_incident
+from app.iDirectory.iDirectory_crudl import find_employee_by_name
 
 from .iCall_model import IncidentCall, CallUtterance
 from .iCall_schema import CallUtteranceCreate, StructuringUpdate
-from .iCall_utils import generate_channel_name, CALL_STATUS_SCHEDULED
+from .iCall_utils import (
+    generate_channel_name,
+    classify_participant_roles,
+    assign_action_item_owners,
+    summarize_unresolved_risks,
+    CALL_STATUS_SCHEDULED,
+)
 
 # Serializes "check for an existing call, else create one" per incident_id,
 # the same class of fix as iTriage's per-key lock: without it, concurrent
@@ -105,6 +114,13 @@ async def apply_structuring_update(
     mutates the "old" value SQLAlchemy compares against, which makes it
     see old == new and silently skip the UPDATE on second and later calls.
     Caught this via the two-turn accumulation test, not by inspection.
+
+    timeline is deliberately not an LLM-extracted field: it's a
+    deterministic merge-and-sort of what's already being extracted (facts,
+    decisions, action items, conflicts, missing info), each stamped with
+    when it was recorded. The LLM decides *what* was said; this function
+    decides *when it goes in the timeline* -- same "don't let the model
+    freely construct derived state" discipline as everything else here.
     """
     old = call.structured_state or {}
     state = {
@@ -112,19 +128,49 @@ async def apply_structuring_update(
         "hypotheses": list(old.get("hypotheses", [])),
         "decisions": list(old.get("decisions", [])),
         "action_items": list(old.get("action_items", [])),
+        "missing_info": list(old.get("missing_info", [])),
         "conflicts": list(old.get("conflicts", [])),
         "identified_speakers": list(old.get("identified_speakers", [])),
+        "timeline": list(old.get("timeline", [])),
+        "chat_notes": list(old.get("chat_notes", [])),
     }
 
+    now = datetime.now(timezone.utc).isoformat()
+
+    def _add_timeline_entry(entry_type: str, text: str) -> None:
+        state["timeline"].append({"type": entry_type, "text": text, "timestamp": now})
+
     state["facts"].extend(update.facts)
+    for fact in update.facts:
+        _add_timeline_entry("fact", fact)
+
     state["hypotheses"].extend(update.hypotheses)
+    for hypothesis in update.hypotheses:
+        _add_timeline_entry("hypothesis", hypothesis)
+
     state["decisions"].extend(update.decisions)
+    for decision in update.decisions:
+        _add_timeline_entry("decision", decision)
+
     state["action_items"].extend(item.model_dump() for item in update.action_items)
+    for item in update.action_items:
+        _add_timeline_entry("action_item", item.text)
+
+    state["missing_info"].extend(update.missing_info)
+    for gap in update.missing_info:
+        _add_timeline_entry("missing_info", gap)
+
     if update.conflict:
         state["conflicts"].append(update.conflict)
+        _add_timeline_entry("conflict", update.conflict)
+
     for speaker in update.identified_speakers:
         if speaker not in state["identified_speakers"]:
             state["identified_speakers"].append(speaker)
+
+    if update.agent_chat_note:
+        state["chat_notes"].append({"text": update.agent_chat_note, "timestamp": now})
+        _add_timeline_entry("chat_note", update.agent_chat_note)
 
     call.structured_state = state
     await db.commit()
@@ -156,3 +202,175 @@ async def list_utterances(db: AsyncSession, call_id: int) -> List[CallUtterance]
         .order_by(CallUtterance.turn_index.asc())
     )
     return list(result.scalars().all())
+
+
+async def infer_and_store_participant_roles(db: AsyncSession, call: IncidentCall) -> IncidentCall:
+    """
+    Runs once, when a call completes. Hybrid role resolution: a known
+    employee's iDirectory title is authoritative -- a real, deterministic
+    fact beats a conversation-derived guess every time -- and only
+    participants iDirectory has no answer for fall back to the LLM's
+    best-effort read of everything they said across the whole call.
+    """
+    utterances = await list_utterances(db, call.id)
+    if not utterances:
+        return call
+
+    speaker_texts: Dict[str, List[str]] = defaultdict(list)
+    speaker_names: Dict[str, str] = {}
+    for u in utterances:
+        speaker_texts[u.speaker_uid].append(u.text)
+        if u.speaker_name:
+            speaker_names[u.speaker_uid] = u.speaker_name  # last known name wins
+
+    classification = await classify_participant_roles(dict(speaker_texts), speaker_names)
+    inferred_by_uid = {s.speaker_uid: s for s in classification.speakers}
+
+    participant_roles: Dict[str, dict] = {}
+    for uid in speaker_texts:
+        name = speaker_names.get(uid)
+        inferred = inferred_by_uid.get(uid)
+        employee = await find_employee_by_name(db, name) if name else None
+        directory_title = employee.title if employee else None
+
+        entry = {
+            "name": name,
+            "directory_matched": employee is not None,
+            "directory_title": directory_title,
+            "directory_org_role": employee.role if employee else None,
+            "directory_team_id": employee.team_id if employee else None,
+            "inferred_role": inferred.best_role if inferred else None,
+            "inferred_scores": [s.model_dump() for s in inferred.scores] if inferred else [],
+            "inferred_rationale": inferred.rationale if inferred else None,
+        }
+        if directory_title:
+            entry["final_role"] = directory_title
+            entry["source"] = "directory"
+        elif inferred:
+            entry["final_role"] = inferred.best_role
+            entry["source"] = "inferred"
+        else:
+            entry["final_role"] = None
+            entry["source"] = "unknown"
+
+        participant_roles[uid] = entry
+
+    call.participant_roles = participant_roles
+    await db.commit()
+    await db.refresh(call)
+
+    await _reconcile_action_item_owners(db, call, participant_roles)
+    await _add_unresolved_risks_summary(db, call)
+    return call
+
+
+async def _add_unresolved_risks_summary(db: AsyncSession, call: IncidentCall) -> None:
+    """
+    One-shot, end-of-call: "A final incident summary with unresolved
+    risks" from the brief. Runs after role inference and owner
+    reconciliation so it's synthesizing over the most complete state
+    available, not an earlier snapshot.
+    """
+    state = call.structured_state or {}
+    if not state:
+        return
+
+    summary = await summarize_unresolved_risks(state)
+    if not summary.risks:
+        return
+
+    new_state = dict(state)
+    new_state["unresolved_risks"] = summary.risks
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+
+
+async def _reconcile_action_item_owners(
+    db: AsyncSession, call: IncidentCall, participant_roles: Dict[str, dict]
+) -> None:
+    """
+    Two-pass, best-effort ownership resolution -- this is the actual point
+    of role inference, not just a side note: knowing who's on the call in
+    what capacity only matters if it decides who owns each follow-up.
+
+    Pass 1 (name match): if the live extraction already named an owner
+    (e.g. "David will check the pool"), resolve that name against the
+    roster of people actually confirmed on this call.
+
+    Pass 2 (role match): for whatever's left -- most items, typically,
+    since a live call rarely has someone named as owner for every item --
+    one more Gemini call matches each item's actual content against the
+    roster's roles. Never invents a person outside the roster (validated
+    against participant_roles below, not just trusted from the model);
+    leaves an item unassigned rather than forcing a guess when no role
+    fits.
+
+    Rebuilds fresh dict/list objects throughout (never mutates the
+    existing structured_state nested objects in place) -- an in-place
+    mutation here would leave call.structured_state pointing at the same
+    object it started with, and SQLAlchemy would see old == new and
+    silently skip the UPDATE, the exact pitfall apply_structuring_update
+    already documents.
+    """
+    state = call.structured_state or {}
+    action_items = state.get("action_items") or []
+    if not action_items:
+        return
+
+    roster_by_lower_name = {
+        entry["name"].strip().lower(): (uid, entry)
+        for uid, entry in participant_roles.items()
+        if entry.get("name")
+    }
+
+    new_items = [dict(item) for item in action_items]
+    changed = False
+
+    # Pass 1: explicit name match
+    for new_item in new_items:
+        owner_text = (new_item.get("owner") or "").strip()
+        if owner_text and not new_item.get("owner_uid"):
+            match = roster_by_lower_name.get(owner_text.lower())
+            if match:
+                uid, entry = match
+                new_item["owner_uid"] = uid
+                new_item["owner_role"] = entry.get("final_role")
+                new_item["owner_source"] = "name_match"
+                changed = True
+
+    # Pass 2: role match for whatever's still unassigned
+    unresolved_indices = [i for i, item in enumerate(new_items) if not item.get("owner_uid")]
+    roster_with_roles = [
+        {"uid": uid, "name": entry["name"], "role": entry["final_role"]}
+        for uid, entry in participant_roles.items()
+        if entry.get("name") and entry.get("final_role")
+    ]
+
+    if unresolved_indices and roster_with_roles:
+        assignments = await assign_action_item_owners(
+            [new_items[i].get("text", "") for i in unresolved_indices],
+            roster_with_roles,
+        )
+        assignment_by_local_index = {a.item_index: a for a in assignments.assignments}
+        for local_index, global_index in enumerate(unresolved_indices):
+            assignment = assignment_by_local_index.get(local_index)
+            if not assignment or not assignment.owner_uid:
+                continue
+            # Never trust the model's uid blindly -- only apply it if it's
+            # actually someone on this call's confirmed roster.
+            roster_entry = participant_roles.get(assignment.owner_uid)
+            if not roster_entry:
+                continue
+            new_items[global_index]["owner_uid"] = assignment.owner_uid
+            new_items[global_index]["owner_role"] = roster_entry.get("final_role")
+            new_items[global_index]["owner_source"] = "role_match"
+            new_items[global_index]["owner_rationale"] = assignment.rationale
+            changed = True
+
+    if changed:
+        new_state = dict(state)
+        new_state["action_items"] = new_items
+        call.structured_state = new_state
+        await db.commit()
+        await db.refresh(call)

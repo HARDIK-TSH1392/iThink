@@ -33,6 +33,14 @@ class IncidentCall(Base):
 
     structured_state: Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
 
+    # uid -> {name, directory_matched, directory_title, directory_team,
+    # directory_org_role, inferred_role, inferred_scores, rationale,
+    # final_role, source}. Populated once, after the call ends (see
+    # iCall_service.infer_and_store_participant_roles) -- role inference
+    # needs everything a person said across the whole call, not a
+    # turn-by-turn guess, so this is deliberately not live state.
+    participant_roles: Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
+
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
@@ -61,6 +69,13 @@ class CallUtterance(Base):
     # this to a human name/role is Orchestration's directory lookup, not
     # this module's job — kept as the raw UID here.
     speaker_uid: Mapped[str] = mapped_column(String, index=True)
+
+    # Best-known display name at the time the client posted this utterance
+    # (from the join-screen name registry, a separate service -- see
+    # voice-agent/server's setName/getNames). Denormalized onto each row
+    # rather than looked up cross-service, since this backend has no other
+    # way to resolve a uid to a name.
+    speaker_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     text: Mapped[str] = mapped_column(String)
     turn_index: Mapped[int] = mapped_column(Integer, index=True)

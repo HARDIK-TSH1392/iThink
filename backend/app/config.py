@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     # a stable tunnel/deployment exists) without touching any calling code.
     voice_agent_web_base_url: str = "http://localhost:3000"
 
+    # The isolated github_mcp_service (see backend/github_mcp_service/) --
+    # kept out of process from this backend because the official mcp SDK's
+    # SSE support needs a starlette version that conflicts with FastAPI's
+    # pin here. Called over plain HTTP, same as Slack/Jira.
+    github_mcp_service_url: str = "http://localhost:8003"
+
     class Config:
         env_file = ".env"
 
