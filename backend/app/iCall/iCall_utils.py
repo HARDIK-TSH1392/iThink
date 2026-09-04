@@ -56,10 +56,16 @@ def generate_channel_name(incident_id: int) -> str:
 # -----------------------------------------------------------------------------
 
 
-# See iTriage_utils.py's identical constants for why both are the same
-# verified model rather than a primary + a guessed fallback name.
-PRIMARY_MODEL = "gemini-3.5-flash-lite"
-FALLBACK_MODEL = "gemini-3.5-flash-lite"
+# See iTriage_utils.py's constants for the fuller history -- these two
+# used to be the same verified model on purpose (avoiding a guessed
+# fallback name after a retired-model outage), but that gave zero real
+# redundancy: when gemini-3.5-flash-lite itself hit Gemini's "high demand"
+# instability live, retrying the identical model failed identically both
+# times. Re-verified on 2026-09-04 during that same instability that
+# these two are genuinely distinct models with independent capacity, not
+# just different names for the same thing.
+PRIMARY_MODEL = "gemini-flash-latest"
+FALLBACK_MODEL = "gemini-3.5-flash"
 
 # None of the four Gemini call sites below had a timeout before this --
 # found via a dry run that hit a genuine hang (90+s, zero output, not even
@@ -68,9 +74,10 @@ FALLBACK_MODEL = "gemini-3.5-flash-lite"
 # indefinitely: for the per-turn structuring call, that's the live
 # conversation itself (Agora's Custom LLM hook has nothing to send back to
 # the room); for the end-of-call passes, that's the client's "End
-# Conversation" request just hanging. 25s matches the margin already used
-# for the GitHub deploy-check call elsewhere in this file.
-GEMINI_CALL_TIMEOUT_S = 25
+# Conversation" request just hanging. Bumped from 25s to 30s after
+# observing the verified fallback model itself take ~24s under load --
+# 25s was cutting that too close.
+GEMINI_CALL_TIMEOUT_S = 30
 
 _gemini_semaphore = asyncio.Semaphore(4)
 
@@ -87,6 +94,18 @@ def _get_client() -> genai.Client:
 FALLBACK_REPLY = (
     "I can hear you, but I'm not wired to a real model yet — "
     "set GEMINI_API_KEY to get an actual response."
+)
+
+# Distinct from FALLBACK_REPLY on purpose: that one means no API key is
+# configured at all. This means the key IS configured and both the
+# primary and fallback model calls still failed (Gemini-side instability,
+# not a setup problem) -- telling someone to "set GEMINI_API_KEY" when
+# they already have one working most of the time is actively misleading,
+# found while verifying the new model pairing above hit a moment where
+# both attempts got a 503 back to back.
+MODEL_UNAVAILABLE_REPLY = (
+    "I'm having trouble reaching my language model right now — "
+    "bear with me, I'll catch up once it's back."
 )
 
 # Used when the model's own output doesn't validate against the schema --
@@ -262,8 +281,8 @@ update per the response schema.
 """
 
 
-def _fallback_structuring_update() -> StructuringUpdate:
-    return StructuringUpdate(spoken_reply=FALLBACK_REPLY)
+def _fallback_structuring_update(reply: str = FALLBACK_REPLY) -> StructuringUpdate:
+    return StructuringUpdate(spoken_reply=reply)
 
 
 async def generate_structuring_update(
@@ -324,7 +343,7 @@ async def generate_structuring_update(
                 # conversation (Agora's Custom LLM hook has nothing to send
                 # back to the room until this returns).
                 print(f"[iCall] Structuring failed on both attempts, falling back: {exc2}")
-                return _fallback_structuring_update()
+                return _fallback_structuring_update(MODEL_UNAVAILABLE_REPLY)
 
     try:
         return StructuringUpdate.model_validate_json(response.text)
