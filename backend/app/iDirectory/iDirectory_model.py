@@ -49,6 +49,13 @@ class Employee(Base):
     )
     role: Mapped[str] = mapped_column(String, index=True)  # member / lead / manager
 
+    # Functional role (backend_engineer, devops, business_analyst, ...) --
+    # deliberately separate from `role` above, which is approval-hierarchy
+    # (member/lead/manager), not function. Nullable: existing employees
+    # predate this field, and iCall's role-inference treats a null title as
+    # "no directory answer, fall back to conversation-inferred role".
+    title: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+
     region: Mapped[str] = mapped_column(String, index=True)
     timezone: Mapped[str] = mapped_column(String)
 

@@ -4,6 +4,21 @@ from typing import List, Literal, Optional
 
 EmployeeRole = Literal["member", "lead", "manager"]
 
+# Functional role categories iCall's role-inference classifies participants
+# into (see iCall_utils.ROLE_CATEGORIES) -- kept here too since it's the
+# same vocabulary an Employee.title is expected to use for a directory
+# match to line up with an inferred role.
+EmployeeTitle = Literal[
+    "backend_engineer",
+    "frontend_engineer",
+    "devops",
+    "team_lead",
+    "manager",
+    "business_analyst",
+    "qa_engineer",
+    "other",
+]
+
 
 class TeamCreate(BaseModel):
     """Schema for creating a team, optionally with the services it owns."""
@@ -32,6 +47,7 @@ class EmployeeCreate(BaseModel):
     slack_user_id: Optional[str] = None
     team_id: int
     role: EmployeeRole
+    title: Optional[EmployeeTitle] = None
     region: str
     timezone: str
 
@@ -45,6 +61,7 @@ class EmployeeRead(BaseModel):
     slack_user_id: Optional[str] = None
     team_id: int
     role: str
+    title: Optional[str] = None
     region: str
     timezone: str
     on_leave: bool
