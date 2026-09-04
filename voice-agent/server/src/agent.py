@@ -258,10 +258,18 @@ class Agent:
                 "disabled_config": {"strategy": "append"},
             },
             # Fills dead air while Gemini is generating a structuring
-            # response -- a plain wait can be a second or more.
+            # response -- a plain wait can be a second or more. 1200ms was
+            # firing on essentially every turn, not just genuinely slow
+            # ones, since a fast/healthy call still often takes close to a
+            # second -- heard live as the agent constantly cutting in with
+            # a filler phrase regardless of what was actually said. Bumped
+            # above the common case so it only fires when a call is
+            # actually running slow (Gemini backpressure, not a fixed
+            # cost), while still masking dead air well under
+            # GEMINI_CALL_TIMEOUT_S's 25-30s ceiling.
             filler_words={
                 "enable": True,
-                "trigger": {"mode": "fixed_time", "fixed_time_config": {"response_wait_ms": 1200}},
+                "trigger": {"mode": "fixed_time", "fixed_time_config": {"response_wait_ms": 2500}},
                 "content": {
                     "mode": "static",
                     "static_config": {
