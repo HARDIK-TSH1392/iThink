@@ -34,8 +34,11 @@ from .iCall_utils import (
     generate_structuring_update,
     describe_event_type,
     verify_agora_signature,
+    should_speak_aloud,
     CALL_STATUS_COMPLETED,
     CLOSING_LINE,
+    FALLBACK_REPLY,
+    MALFORMED_RESPONSE_FALLBACK,
 )
 from app.iNcidents.iNcidents_crudl import get_incident
 from app.iOrchestrate.iOrchestrate_utils import post_call_summary_notification, notify_jira_approval_needed
@@ -247,6 +250,13 @@ async def chat_completions_endpoint(
     streams back what the agent should say — in standard OpenAI
     chat.completion.chunk SSE format, the wire format Agora's engine
     expects here.
+
+    Whether the reply actually reaches the room's speakers is a separate,
+    deterministic decision from generating it -- see should_speak_aloud.
+    Everything that gets *recorded* (facts, hypotheses, decisions, action
+    items, missing_info, conflicts, chat_notes) happens in
+    apply_structuring_update regardless of that decision; only the audio
+    output is gated.
     """
     call = await get_call_by_channel_name(db, channel_name)
     if call is None:
@@ -258,10 +268,28 @@ async def chat_completions_endpoint(
     update = await generate_structuring_update(payload.messages, call.structured_state or {}, service)
     await apply_structuring_update(db, call, update)
 
+    latest_user_message = next(
+        (m.content for m in reversed(payload.messages) if m.role == "user"), None
+    )
+
     # The LLM only detects *that* the room sounds like it's wrapping up;
     # the actual words are ours, not a paraphrase, so what's promised about
-    # Slack/Jira is always accurate.
-    spoken_reply = CLOSING_LINE if update.is_wrapping_up else update.spoken_reply
+    # Slack/Jira is always accurate. Diagnostic fallbacks (no API key
+    # configured, or a malformed model response) always speak too -- they're
+    # meta-signals about the system itself, not ordinary conversational
+    # content the gate is meant to quiet down.
+    if update.is_wrapping_up:
+        spoken_reply = CLOSING_LINE
+    elif update.spoken_reply in (FALLBACK_REPLY, MALFORMED_RESPONSE_FALLBACK):
+        spoken_reply = update.spoken_reply
+    elif should_speak_aloud(update, latest_user_message):
+        spoken_reply = update.spoken_reply
+    else:
+        # Ordinary turn, nothing urgent -- stay silent. The prompt already
+        # asks the model to keep these to "a brief acknowledgment," but that
+        # was never enforced; this makes it deterministic. Nothing recorded
+        # is affected (spoken_reply was never persisted -- see docstring).
+        spoken_reply = ""
 
     async def event_stream():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"

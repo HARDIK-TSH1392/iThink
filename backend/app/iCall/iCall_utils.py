@@ -77,6 +77,18 @@ FALLBACK_REPLY = (
     "set GEMINI_API_KEY to get an actual response."
 )
 
+# Used when the model's own output doesn't validate against the schema --
+# a diagnostic signal, not conversational content. Named so the speak-gate
+# below can recognize and always pass it through, the same as FALLBACK_REPLY.
+MALFORMED_RESPONSE_FALLBACK = "Sorry, could you say that again?"
+
+# Matches the "ithink" entry in voice-agent's own interruption.keywords_config
+# (agent.py) -- same literal, so a listener addressing the agent by name
+# both interrupts its TTS *and* counts as a direct address for the speak
+# gate below. Kept as one source of truth in spirit even though it can't
+# literally be shared across the two services.
+WAKE_WORD = "ithink"
+
 # Spoken when StructuringUpdate.is_wrapping_up is true. Deliberately a fixed
 # string, not LLM-generated -- see StructuringUpdate.is_wrapping_up's
 # docstring: the model only detects the moment, this is the guaranteed-
@@ -296,7 +308,52 @@ async def generate_structuring_update(
         # Model returned something that didn't match the schema — don't crash
         # the live call over a malformed extraction, just say something safe
         # and record nothing rather than guessing at a partial parse.
-        return StructuringUpdate(spoken_reply="Sorry, could you say that again?")
+        return StructuringUpdate(spoken_reply=MALFORMED_RESPONSE_FALLBACK)
+
+
+# -----------------------------------------------------------------------------
+# Speak gate: StructuringUpdate.spoken_reply is a required field, so the
+# model always produces *something* -- the STRUCTURING_SYSTEM_INSTRUCTION
+# asks it to keep ordinary turns to "a brief, natural acknowledgment" rather
+# than route them to agent_chat_note, but a prompt is a preference, not a
+# guarantee. This makes "should this turn actually interrupt the room out
+# loud" a deterministic check instead of trusting the model to self-regulate
+# on every single turn -- same reasoning as everywhere else in this codebase
+# that a fact is computed in code rather than asserted by the LLM.
+#
+# Deliberately narrow and reusing fields that already exist (conflict,
+# missing_info, is_wrapping_up) rather than inventing new signals under time
+# pressure. Two known non-goals, on purpose: no periodic "recap" timer here
+# (voice-agent's own silence_config already prompts the room after 15s of
+# true dead air -- a different, complementary mechanism, not duplicated),
+# and no dedup on repeated missing_info gaps (the system prompt already
+# scopes missing_info to "the room itself is missing" on THIS turn, not a
+# running checklist, so treating a fresh one as speak-worthy is consistent
+# with how narrowly the model is already asked to set it).
+# -----------------------------------------------------------------------------
+
+
+def should_speak_aloud(update: StructuringUpdate, latest_user_message: Optional[str]) -> bool:
+    """
+    True if this turn's spoken_reply should actually reach the room's
+    speakers. False means the caller sends empty content to Agora's TTS
+    instead -- spoken_reply is never persisted anywhere (see
+    apply_structuring_update), so suppressing it loses nothing recorded,
+    only the audible acknowledgment itself. Anything actually worth
+    keeping on a quiet turn belongs in agent_chat_note, which the model
+    sets independently of this gate.
+
+    is_wrapping_up is NOT checked here -- that path always speaks (the
+    caller substitutes CLOSING_LINE, unconditionally, unchanged from
+    before this gate existed).
+    """
+    if update.conflict:
+        return True
+    if update.missing_info:
+        return True
+    if latest_user_message and WAKE_WORD in latest_user_message.lower():
+        return True
+    return False
 
 
 # -----------------------------------------------------------------------------
