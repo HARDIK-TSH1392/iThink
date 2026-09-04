@@ -16,8 +16,15 @@ import {
 	QuickstartPipelineMetrics,
 } from "@/components/QuickstartPipelineMetrics";
 import { QuickstartTranscriptPanel } from "@/components/QuickstartTranscriptPanel";
+import { SharedScreenPanel } from "@/components/SharedScreenPanel";
 import { DEFAULT_AGENT_UID } from "@/lib/agora";
-import { type ChatNote, getChatNotes, getNames, recordUtterance } from "@/services/api";
+import {
+	type ChatNote,
+	type SharedScreen,
+	getChatNotes,
+	getNames,
+	recordUtterance,
+} from "@/services/api";
 import {
 	getCurrentInProgressMessage,
 	getInitial,
@@ -84,11 +91,32 @@ function isRtmSalStatusPayload(value: unknown): value is RtmSalStatusPayload {
 	);
 }
 
+// Pushed server-side via Agora's Signaling REST API (see
+// broadcast_shared_screen in the backend) when someone asks iThink to show
+// GitHub commits or server logs -- every participant's RTM client is
+// already subscribed to the channel, so this arrives live with no
+// polling. Distinct `type` discriminant keeps it from ever being confused
+// with Agora's own message.error/message.sal_status payloads above.
+type SharedScreenBroadcast = {
+	type: "ithink_shared_screen";
+	screen: SharedScreen;
+};
+
+function isSharedScreenBroadcast(value: unknown): value is SharedScreenBroadcast {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		(value as { type?: unknown }).type === "ithink_shared_screen" &&
+		!!(value as { screen?: unknown }).screen
+	);
+}
+
 export default function ConversationComponent({
 	agoraData,
 	rtmClient,
 	localName,
 	lateJoinRecap,
+	initialSharedScreens,
 	onTokenWillExpire,
 	onEndConversation,
 }: ConversationComponentProps) {
@@ -193,6 +221,41 @@ export default function ConversationComponent({
 			clearInterval(interval);
 		};
 	}, [agoraData.channel]);
+
+	// GitHub commits / server logs pushed to everyone on the call. Seeded
+	// once from what a late joiner's setName response already caught them
+	// up on, then appended to live via the RTM broadcast listener below --
+	// never re-fetched by polling, since the whole point of the RTM push is
+	// to avoid that round trip.
+	const [sharedScreens, setSharedScreens] = useState<SharedScreen[]>(initialSharedScreens);
+	// Increments on every new live broadcast so the layout can force its
+	// panel open even if the viewer currently has a different one selected
+	// -- a plain boolean wouldn't re-trigger on a second screen in a row.
+	const [screenBroadcastSignal, setScreenBroadcastSignal] = useState(0);
+
+	useEffect(() => {
+		const handleSharedScreenMessage = (event: { message: string | Uint8Array }) => {
+			const payloadText =
+				typeof event.message === "string" ? event.message : new TextDecoder().decode(event.message);
+
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(payloadText);
+			} catch {
+				return;
+			}
+
+			if (!isSharedScreenBroadcast(parsed)) return;
+
+			setSharedScreens((prev) => [...prev, parsed.screen]);
+			setScreenBroadcastSignal((count) => count + 1);
+		};
+
+		rtmClient.addEventListener("message", handleSharedScreenMessage);
+		return () => {
+			rtmClient.removeEventListener("message", handleSharedScreenMessage);
+		};
+	}, [rtmClient]);
 
 	const [isReady, setIsReady] = useState(false);
 	useEffect(() => {
@@ -669,6 +732,8 @@ export default function ConversationComponent({
 					lateJoinRecap={lateJoinRecap}
 				/>
 			}
+			screensPanel={<SharedScreenPanel screens={sharedScreens} />}
+			autoOpenScreensSignal={screenBroadcastSignal}
 			onEndConversation={handleEndConversation}
 		/>
 	);

@@ -243,6 +243,28 @@ async def record_pattern_nudge(db: AsyncSession, call: IncidentCall, pattern: st
     return call
 
 
+async def record_shared_screen(db: AsyncSession, call: IncidentCall, screen: dict) -> IncidentCall:
+    """
+    Appends one shared-screen event (GitHub commits or server logs, see
+    iCall_utils.broadcast_shared_screen) to a running list -- kept here
+    independent of the live RTM broadcast succeeding or failing, so a late
+    joiner (or anyone whose broadcast message got lost) can still catch up
+    via GET /icall/channel/{channel_name}/recap, same append-only,
+    never-mutate-in-place discipline as record_health_score/
+    record_pattern_nudge.
+    """
+    old = call.structured_state or {}
+    screens = list(old.get("shared_screens", []))
+    screens.append(screen)
+
+    new_state = dict(old)
+    new_state["shared_screens"] = screens
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
 async def update_call_status(db: AsyncSession, call: IncidentCall, status: str) -> IncidentCall:
     call.status = status
     await db.commit()

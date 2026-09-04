@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import hmac
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
 from google import genai
@@ -253,6 +253,15 @@ Hard constraints:
   don't need one. Never put something here that's genuinely urgent (a
   contradiction, a safety-relevant gap) -- those still belong in
   spoken_reply, said out loud, because a note is easy to miss mid-call.
+- wants_log_screen: true only when this turn is someone asking to see or
+  pull up the actual server logs for this incident -- "show me the logs",
+  "what's in the logs since this started," "can you pull up the server
+  logs," any phrasing with that intent. False for merely talking about
+  symptoms or errors in prose (e.g. "the logs are full of 500s" is a fact,
+  not a request to see the log lines themselves). When true, spoken_reply
+  should acknowledge you're pulling them up, not describe log contents
+  yourself -- you don't have the actual log data, the caller queries it
+  separately and shows it visually to everyone on the call.
 - Output must strictly match the provided response schema.
 """
 
@@ -285,11 +294,15 @@ def _mentions_deploy_question(text: str) -> bool:
     return any(keyword in lowered for keyword in DEPLOY_QUESTION_KEYWORDS)
 
 
-async def _check_recent_deploys(repo: str) -> Optional[str]:
+async def _check_recent_deploys(repo: str) -> Optional[dict]:
     """
     Calls the isolated GitHub MCP bridge service. Returns None (not an
     error) on any failure -- a missing/unreachable deploy-check service
-    should never break the live call's own response.
+    should never break the live call's own response. Returns the full
+    {"summary", "commits"} dict rather than just the summary text so a
+    caller building the GitHub shared-screen (see broadcast_shared_screen)
+    has the raw per-commit data too, not just the prose version fed to the
+    LLM prompt.
     """
     url = f"{get_settings().github_mcp_service_url.rstrip('/')}/check-recent-deploys"
     try:
@@ -307,10 +320,10 @@ async def _check_recent_deploys(repo: str) -> Optional[str]:
 
     if not data.get("configured"):
         return None
-    return data.get("summary")
+    return data
 
 
-async def _maybe_check_recent_deploys(messages: List[ChatMessage], service: Optional[str]) -> Optional[str]:
+async def _maybe_check_recent_deploys(messages: List[ChatMessage], service: Optional[str]) -> Optional[dict]:
     if not messages or not service:
         return None
     repo = SERVICE_TO_GITHUB_REPO.get(service)
@@ -323,16 +336,83 @@ async def _maybe_check_recent_deploys(messages: List[ChatMessage], service: Opti
     if not latest_user_message or not _mentions_deploy_question(latest_user_message):
         return None
 
-    return await _check_recent_deploys(repo)
+    result = await _check_recent_deploys(repo)
+    if result is None:
+        return None
+    result["repo"] = repo
+    return result
+
+
+# -----------------------------------------------------------------------------
+# Shared screens: when someone asks to see GitHub commits or server logs,
+# push the actual data to everyone on the call at once via Agora's
+# Signaling (RTM 2.x) REST API, which can message a channel from the
+# server without joining it. Every participant's browser is already
+# subscribed to this RTM channel (see LandingPage's RTM login/subscribe),
+# so this reaches all of them live with no polling. Best-effort throughout
+# -- an unconfigured or unreachable Signaling API should never break the
+# turn that triggered it; the data is still recorded (see
+# iCall_service.record_shared_screen) so a late joiner can catch up via
+# the /recap endpoint even if the live broadcast failed or they weren't
+# there for it.
+# -----------------------------------------------------------------------------
+
+SHARED_SCREEN_MESSAGE_TYPE = "ithink_shared_screen"
+
+
+async def broadcast_shared_screen(channel_name: str, screen: dict) -> bool:
+    """
+    POSTs one channel message to Agora's Signaling REST API. Returns
+    whether it actually sent -- callers should still record the screen in
+    structured_state regardless of this result (see caller in iCall_api),
+    since the DB copy is what late joiners and any client that missed the
+    live message fall back on.
+    """
+    settings = get_settings()
+    if not (settings.agora_app_id and settings.agora_customer_key and settings.agora_customer_secret):
+        return False
+
+    import base64
+    import json as _json
+
+    url = (
+        f"https://api.agora.io/dev/v2/project/{settings.agora_app_id}"
+        f"/rtm/users/ithink-backend/channel_messages"
+    )
+    credentials = base64.b64encode(
+        f"{settings.agora_customer_key}:{settings.agora_customer_secret}".encode()
+    ).decode()
+    payload = _json.dumps({"type": SHARED_SCREEN_MESSAGE_TYPE, "screen": screen})
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Basic {credentials}",
+                    "Content-Type": "application/json;charset=utf-8",
+                },
+                json={
+                    "channel_name": channel_name,
+                    "payload": payload,
+                    "enable_historical_messaging": False,
+                },
+            )
+            response.raise_for_status()
+        return True
+    except Exception as exc:
+        print(f"[iCall] Failed to broadcast shared screen to channel={channel_name}: {exc}")
+        return False
 
 
 def _build_structuring_prompt(
-    messages: List[ChatMessage], existing_state: dict, deploy_check_result: Optional[str] = None
+    messages: List[ChatMessage], existing_state: dict, deploy_check_result: Optional[dict] = None
 ) -> str:
     conversation = "\n".join(f"{m.role}: {m.content}" for m in messages)
+    deploy_summary = deploy_check_result.get("summary") if deploy_check_result else None
     deploy_section = (
-        f"\nGitHub lookup result (only mention this if it's actually relevant to what was just asked):\n{deploy_check_result}\n"
-        if deploy_check_result
+        f"\nGitHub lookup result (only mention this if it's actually relevant to what was just asked):\n{deploy_summary}\n"
+        if deploy_summary
         else ""
     )
     return f"""Incident state recorded so far (facts/hypotheses/decisions already
@@ -353,7 +433,7 @@ def _fallback_structuring_update() -> StructuringUpdate:
 
 async def generate_structuring_update(
     messages: List[ChatMessage], existing_state: dict, service: Optional[str] = None
-) -> StructuringUpdate:
+) -> Tuple[StructuringUpdate, Optional[dict]]:
     """
     One turn of live structuring: given the conversation and what's already
     recorded for this call, extract new facts/hypotheses/decisions/action
@@ -366,9 +446,14 @@ async def generate_structuring_update(
     not guessed from conversation) used to check GitHub for recent deploys
     when this turn sounds like it's asking about one. See
     _maybe_check_recent_deploys.
+
+    Returns (update, deploy_check_result) -- the second element is the raw
+    {"summary", "commits", "repo"} dict when a deploy lookup actually ran
+    this turn (None otherwise), so the caller can push a GitHub shared
+    screen with real per-commit data instead of re-running the same lookup.
     """
     if not get_settings().gemini_api_key:
-        return _fallback_structuring_update()
+        return _fallback_structuring_update(), None
 
     deploy_check_result = await _maybe_check_recent_deploys(messages, service)
 
@@ -409,15 +494,15 @@ async def generate_structuring_update(
                 # conversation (Agora's Custom LLM hook has nothing to send
                 # back to the room until this returns).
                 print(f"[iCall] Structuring failed on both attempts, falling back: {exc2}")
-                return _fallback_structuring_update()
+                return _fallback_structuring_update(), None
 
     try:
-        return StructuringUpdate.model_validate_json(response.text)
+        return StructuringUpdate.model_validate_json(response.text), deploy_check_result
     except Exception:
         # Model returned something that didn't match the schema — don't crash
         # the live call over a malformed extraction, just say something safe
         # and record nothing rather than guessing at a partial parse.
-        return StructuringUpdate(spoken_reply=MALFORMED_RESPONSE_FALLBACK)
+        return StructuringUpdate(spoken_reply=MALFORMED_RESPONSE_FALLBACK), None
 
 
 # -----------------------------------------------------------------------------

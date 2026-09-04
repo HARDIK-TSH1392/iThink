@@ -82,11 +82,33 @@ export async function stopAgent(agentId: string): Promise<void> {
   }
 }
 
+export type GithubCommit = {
+  sha: string
+  message: string
+  author: string
+  date: string
+}
+
+export type LogEntry = {
+  id: number
+  severity: string
+  message: string
+  timestamp: string
+  source_id: string
+}
+
+// Pushed to everyone on the call (see broadcast_shared_screen in the
+// backend) when someone asks to see GitHub commits or server logs -- the
+// discriminant `type` field picks which of the two item arrays is present.
+export type SharedScreen =
+  | { type: 'github_commits'; title: string; commits: GithubCommit[]; timestamp: string }
+  | { type: 'logs'; title: string; logs: LogEntry[]; timestamp: string }
+
 export async function setName(
   channelName: string,
   uid: string,
   name: string,
-): Promise<{ recap: string | null }> {
+): Promise<{ recap: string | null; sharedScreens: SharedScreen[] }> {
   const response = await fetch(`${API_BASE_URL}/setName`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -98,10 +120,14 @@ export async function setName(
     throw new Error(error.detail || `HTTP ${response.status}`)
   }
 
-  // Present only for a genuine late join -- a private catch-up recap for
-  // this caller alone, never broadcast to the shared meet chat.
+  // Present only for a genuine late join -- a private catch-up (recap text
+  // + past shared screens) for this caller alone, never broadcast to the
+  // shared meet chat.
   const result = await response.json()
-  return { recap: result.data?.recap ?? null }
+  return {
+    recap: result.data?.recap ?? null,
+    sharedScreens: result.data?.sharedScreens ?? [],
+  }
 }
 
 export async function removeName(channelName: string, uid: string): Promise<void> {

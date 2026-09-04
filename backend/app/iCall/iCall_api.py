@@ -1,12 +1,13 @@
 import json
 import time
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import AsyncGenerator, List
+from typing import AsyncGenerator, List, Optional
 
 from app.config import get_settings
 from app.database import async_session
@@ -29,6 +30,7 @@ from .iCall_service import (
     apply_structuring_update,
     record_health_score,
     record_pattern_nudge,
+    record_shared_screen,
     infer_and_store_participant_roles,
     IncidentNotFoundError,
 )
@@ -39,6 +41,7 @@ from .iCall_utils import (
     format_live_recap,
     build_silence_prompt,
     get_live_participant_count,
+    broadcast_shared_screen,
     _is_silence_trigger,
     should_speak_aloud,
     evaluate_call_patterns,
@@ -51,6 +54,7 @@ from .iCall_utils import (
     MALFORMED_RESPONSE_FALLBACK,
 )
 from app.iNcidents.iNcidents_crudl import get_incident
+from app.iLogs.iLogs_crudl import list_logs
 from app.iOrchestrate.iOrchestrate_utils import post_call_summary_notification, notify_jira_approval_needed
 
 router = APIRouter(prefix="/icall", tags=["iCall"])
@@ -226,13 +230,20 @@ async def get_live_recap_endpoint(
     (not the browser) right after a late joiner registers their name --
     see voice-agent/server/src/server.py's set_name. Channel-keyed for the
     same reason as chat-notes: the caller only knows the channel name.
+
+    Also returns shared_screens (GitHub commits / server logs already
+    shown to the room, see record_shared_screen) so a late joiner's client
+    can render the same screens the room already saw, even if the live RTM
+    broadcast happened before they were subscribed to the channel.
     """
     call = await get_call_by_channel_name(db, channel_name)
     if not call:
         raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
 
-    recap = format_live_recap(call.structured_state or {})
-    return {"code": 0, "data": {"recap": recap}, "msg": "success"}
+    state = call.structured_state or {}
+    recap = format_live_recap(state)
+    shared_screens = state.get("shared_screens", [])
+    return {"code": 0, "data": {"recap": recap, "shared_screens": shared_screens}, "msg": "success"}
 
 
 @router.get("/{call_id}/utterances", response_model=List[CallUtteranceRead])
@@ -249,6 +260,70 @@ async def list_utterances_endpoint(
 
     utterances = await list_utterances(db, call_id)
     return [CallUtteranceRead.model_validate(u) for u in utterances]
+
+
+async def _push_shared_screen(db: AsyncSession, call: IncidentCall, channel_name: str, screen: dict) -> IncidentCall:
+    """Records + broadcasts one shared-screen event; returns the (possibly updated) call."""
+    call = await record_shared_screen(db, call, screen)
+    await broadcast_shared_screen(channel_name, screen)
+    return call
+
+
+async def _maybe_push_shared_screens(
+    db: AsyncSession,
+    call: IncidentCall,
+    channel_name: str,
+    incident,
+    update,
+    deploy_check_result: Optional[dict],
+) -> IncidentCall:
+    """
+    Reacts to this turn's two "show me something" signals -- a GitHub
+    deploy-question that actually got real commit data back (deterministic,
+    already computed as part of generate_structuring_update), and
+    update.wants_log_screen (LLM-judged intent, deliberately broader/more
+    flexible phrasing than the deploy-keyword check since natural ways to
+    ask to see logs vary a lot more than "did we deploy/ship/commit...").
+    Both push a shared screen to everyone on the call; see
+    iCall_utils.broadcast_shared_screen.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    if deploy_check_result and deploy_check_result.get("commits"):
+        screen = {
+            "type": "github_commits",
+            "title": f"Recent commits: {deploy_check_result.get('repo', '')}",
+            "commits": deploy_check_result["commits"],
+            "timestamp": now,
+        }
+        call = await _push_shared_screen(db, call, channel_name, screen)
+
+    if update.wants_log_screen and incident is not None:
+        logs = await list_logs(
+            db,
+            service=incident.service,
+            region=incident.region,
+            since=incident.created_at,
+            limit=50,
+        )
+        screen = {
+            "type": "logs",
+            "title": f"Server logs for {incident.service} since the incident started",
+            "logs": [
+                {
+                    "id": log.id,
+                    "severity": log.severity,
+                    "message": log.message,
+                    "timestamp": log.timestamp.isoformat(),
+                    "source_id": log.source_id,
+                }
+                for log in logs
+            ],
+            "timestamp": now,
+        }
+        call = await _push_shared_screen(db, call, channel_name, screen)
+
+    return call
 
 
 def _sse_chunk(completion_id: str, created: int, model: str, delta: dict, finish_reason) -> str:
@@ -313,8 +388,11 @@ async def chat_completions_endpoint(
         incident = await get_incident(db, call.incident_id)
         service = incident.service if incident else None
 
-        update = await generate_structuring_update(payload.messages, call.structured_state or {}, service)
+        update, deploy_check_result = await generate_structuring_update(
+            payload.messages, call.structured_state or {}, service
+        )
         call = await apply_structuring_update(db, call, update)
+        call = await _maybe_push_shared_screens(db, call, channel_name, incident, update, deploy_check_result)
 
         # Coordination-health score: a rough, code-computed aggregate over the
         # call's own state (open conflicts, missing info, unowned items, time

@@ -144,6 +144,13 @@ class StructuringUpdate(BaseModel):
     # spoken aloud. spoken_reply still always happens; this is a second,
     # non-disruptive channel, not a replacement for it.
     agent_chat_note: Optional[str] = None
+    # True when this turn is someone asking to see/pull up the server logs
+    # for this incident (any phrasing -- "show me the logs", "what's in the
+    # logs since this started", "pull up server logs"), as opposed to just
+    # talking about symptoms in prose. iCall_api reacts to this by querying
+    # iLogs directly (deterministic DB query, not LLM-guessed data) and
+    # broadcasting a shared screen -- this field is only the intent signal.
+    wants_log_screen: bool = False
 
 
 class RoleScore(BaseModel):

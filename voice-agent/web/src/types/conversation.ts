@@ -1,4 +1,5 @@
 import type { RTMClient } from 'agora-rtm';
+import type { SharedScreen } from '@/services/api';
 
 /** Session bootstrap from GET /api/get_config (channel + tokens + agent identity). */
 export interface AgoraTokenData {
@@ -21,6 +22,8 @@ export interface ConversationComponentProps {
   localName: string;
   /** Private "what did I miss" recap for this viewer alone, when they joined an in-progress call. */
   lateJoinRecap: string | null;
+  /** Shared screens (GitHub commits / server logs) already shown before this viewer joined. */
+  initialSharedScreens: SharedScreen[];
   onTokenWillExpire: (uid: string) => Promise<AgoraRenewalTokens>;
   onEndConversation: () => void;
 }
