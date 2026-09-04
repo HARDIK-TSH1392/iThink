@@ -31,6 +31,17 @@ export function normalizeTimestampMs(timestamp: number): number {
   return timestamp > 1e12 ? timestamp : timestamp * 1000
 }
 
+// Matches SILENCE_TRIGGER_MARKER in voice-agent/server/src/agent.py and
+// backend/app/iCall/iCall_utils.py -- an inert control string Agora
+// appends to the conversation (action="think" in silence_config) to route
+// the room-silence check through the custom LLM proxy instead of speaking
+// a fixed line. It arrives on the same transcript stream as real speech,
+// attributed to a real participant uid, so without filtering it out here
+// it would show up in the visible transcript panel and get persisted to
+// iCall by the recordUtterance effect as if someone actually said it --
+// both observed live (see incident-13's call_utterances).
+const SILENCE_TRIGGER_MARKER = '[[ithink-silence-check]]'
+
 export function mapAgentVisualizerState(
   agentState: AgentState | null,
   isAgentConnected: boolean,
@@ -81,7 +92,9 @@ export function normalizeTranscript(
   transcript: TranscriptHelperItem<Partial<UserTranscription | AgentTranscription>>[],
   localUid: string,
 ) {
-  return transcript.map((item) => {
+  return transcript
+    .filter((item) => typeof item.text !== 'string' || item.text.trim() !== SILENCE_TRIGGER_MARKER)
+    .map((item) => {
     // agora-agent-client-toolkit hardcodes uid to "0" for every human
     // speaker (it assumes a single-remote-user call), but the underlying
     // STT payload still carries the real Agora RTC uid in metadata.user_id
