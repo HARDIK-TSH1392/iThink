@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ConnectionStatusPanel } from "@/components/ConnectionStatusPanel";
 import {
@@ -15,7 +15,7 @@ import {
 } from "@/components/QuickstartPipelineMetrics";
 import { QuickstartTranscriptPanel } from "@/components/QuickstartTranscriptPanel";
 import { DEFAULT_AGENT_UID } from "@/lib/agora";
-import { getNames } from "@/services/api";
+import { type ChatNote, getChatNotes, getNames, recordUtterance } from "@/services/api";
 import {
 	getCurrentInProgressMessage,
 	getMessageList,
@@ -152,6 +152,33 @@ export default function ConversationComponent({
 				})
 				.catch((error) => {
 					console.error("Failed to fetch participant names:", error);
+				});
+		};
+
+		refresh();
+		const interval = setInterval(refresh, 3000);
+		return () => {
+			cancelled = true;
+			clearInterval(interval);
+		};
+	}, [agoraData.channel]);
+
+	// Written notes the agent chose not to interrupt the call to say out
+	// loud (StructuringUpdate.agent_chat_note) -- same polling pattern as
+	// participantNames above, for the same reasons.
+	const [chatNotes, setChatNotes] = useState<ChatNote[]>([]);
+
+	useEffect(() => {
+		let cancelled = false;
+
+		const refresh = () => {
+			getChatNotes(agoraData.channel)
+				.then((notes) => {
+					if (cancelled) return;
+					setChatNotes((prev) => (notes.length !== prev.length ? notes : prev));
+				})
+				.catch((error) => {
+					console.error("Failed to fetch chat notes:", error);
 				});
 		};
 
@@ -365,6 +392,35 @@ export default function ConversationComponent({
 
 	const messageList = useMemo(() => getMessageList(transcript), [transcript]);
 
+	// Persists each finalized human line to the main backend (iCall), keyed
+	// by the corrected per-speaker uid from normalizeTranscript -- this is
+	// what post-call role inference reads (see iCall_service.
+	// infer_and_store_participant_roles). Posted once per turn_id (a Set
+	// ref, not state, since this is a side effect with nothing to render).
+	// Agent lines are skipped -- role inference is about the humans on the
+	// call, not the agent itself.
+	const postedTurnIds = useRef<Set<string | number>>(new Set());
+	useEffect(() => {
+		for (const message of messageList) {
+			const key = message.turn_id ?? `${message.uid}-${message.createdAt}`;
+			if (postedTurnIds.current.has(key)) continue;
+			if (String(message.uid) === agentUID) continue;
+			if (!message.text?.trim()) continue;
+
+			postedTurnIds.current.add(key);
+			recordUtterance(
+				agoraData.channel,
+				String(message.uid),
+				participantNames[String(message.uid)],
+				message.text,
+				typeof message.turn_id === "number" ? message.turn_id : postedTurnIds.current.size,
+				message.createdAt ?? Date.now(),
+			).catch((error) => {
+				console.error("Failed to record utterance:", error);
+			});
+		}
+	}, [messageList, agentUID, agoraData.channel, participantNames]);
+
 	const currentInProgressMessage = useMemo(() => {
 		return getCurrentInProgressMessage(transcript);
 	}, [transcript]);
@@ -506,6 +562,7 @@ export default function ConversationComponent({
 					agentUID={agentUID}
 					localUid={agoraData.uid}
 					participantNames={participantNames}
+					chatNotes={chatNotes}
 				/>
 			}
 			visualizer={

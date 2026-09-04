@@ -108,3 +108,63 @@ export async function getNames(channelName: string): Promise<Record<string, stri
   const result = await response.json()
   return result.data ?? {}
 }
+
+// Below: the main iThink backend (iCall), not the Agora agent server --
+// routed through /api/recordUtterance and /api/callStatus (see
+// next.config.ts's ITHINK_BACKEND_URL rewrites), a separate service from
+// everything above this line.
+
+export async function recordUtterance(
+  channelName: string,
+  speakerUid: string,
+  speakerName: string | undefined,
+  text: string,
+  turnIndex: number,
+  timestamp: number,
+): Promise<void> {
+  const response = await fetch(`/api/recordUtterance/${encodeURIComponent(channelName)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      speaker_uid: speakerUid,
+      speaker_name: speakerName,
+      text,
+      turn_index: turnIndex,
+      timestamp: new Date(timestamp).toISOString(),
+    }),
+  })
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(error.detail || `HTTP ${response.status}`)
+  }
+}
+
+export async function markCallCompleted(channelName: string): Promise<void> {
+  const response = await fetch(`/api/callStatus/${encodeURIComponent(channelName)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'completed' }),
+  })
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(error.detail || `HTTP ${response.status}`)
+  }
+}
+
+export interface ChatNote {
+  text: string
+  timestamp: string
+}
+
+export async function getChatNotes(channelName: string): Promise<ChatNote[]> {
+  const response = await fetch(`/api/chatNotes/${encodeURIComponent(channelName)}`)
+
+  if (!response.ok) {
+    return []
+  }
+
+  const result = await response.json()
+  return result.data ?? []
+}

@@ -9,12 +9,18 @@ type TranscriptMessage = {
 	createdAt?: number;
 };
 
+type ChatNote = {
+	text: string;
+	timestamp: string;
+};
+
 type QuickstartTranscriptPanelProps = {
 	messageList: TranscriptMessage[];
 	currentInProgressMessage: TranscriptMessage | null;
 	agentUID: string;
 	localUid: string;
 	participantNames: Record<string, string>;
+	chatNotes: ChatNote[];
 };
 
 function formatMessageTime(createdAt?: number) {
@@ -31,6 +37,7 @@ export function QuickstartTranscriptPanel({
 	agentUID,
 	localUid,
 	participantNames,
+	chatNotes,
 }: QuickstartTranscriptPanelProps) {
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const messages = useMemo(
@@ -58,6 +65,19 @@ export function QuickstartTranscriptPanel({
 					<p className="text-xs text-muted-foreground">Live voice turns</p>
 				</div>
 			</div>
+
+			{chatNotes.length > 0 ? (
+				<div
+					className="flex max-h-32 shrink-0 flex-col gap-1.5 overflow-y-auto border-b border-border bg-amber-500/10 px-4 py-3"
+					aria-label="Agent notes (not spoken aloud)"
+				>
+					{chatNotes.map((note, index) => (
+						<div key={index} className="text-xs leading-5 text-foreground/90">
+							<span aria-hidden="true">📝</span> {note.text}
+						</div>
+					))}
+				</div>
+			) : null}
 
 			<div
 				ref={scrollRef}

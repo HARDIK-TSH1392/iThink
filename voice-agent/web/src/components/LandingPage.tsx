@@ -10,7 +10,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { LoadingSkeleton } from "@/components/LoadingSkeleton";
 import { QuickstartPreCallCard } from "@/components/QuickstartPreCallCard";
 import { ShareButton } from "@/components/share-button";
-import { getConfig, setName, startAgent } from "@/services/api";
+import { getConfig, markCallCompleted, setName, startAgent } from "@/services/api";
 import type { AgoraRenewalTokens, AgoraTokenData } from "@/types/conversation";
 
 const ConversationComponent = dynamic(
@@ -200,6 +200,17 @@ export default function LandingPage() {
 		// only leave the channel for *this* participant, not kill the agent
 		// for whoever's still on the call. The agent's own idle_timeout (see
 		// agent.py) stops it a few seconds after the last human leaves.
+
+		// Marks the call completed and triggers post-call role inference
+		// (backend/app/iCall/iCall_service.infer_and_store_participant_roles).
+		// Safe to call once per person leaving -- the backend only fires
+		// Slack/Jira notifications on the first transition into "completed"
+		// and just refreshes role inference on any repeat call.
+		if (agoraData?.channel) {
+			markCallCompleted(agoraData.channel).catch((err) =>
+				console.error("Failed to mark call completed:", err),
+			);
+		}
 
 		rtmClient?.logout().catch((err) => console.error("RTM logout error:", err));
 		setRtmClient(null);
