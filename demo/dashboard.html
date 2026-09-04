@@ -34,12 +34,17 @@
   .tl-entry.missing_info { border-color: #d97706; }
   .tl-entry.conflict { border-color: #d64545; font-weight: 600; }
   .tl-entry.chat_note { border-color: #999; font-style: italic; color: #666; }
+  .tl-entry.pattern_nudge { border-color: #0b7285; background: #e3f3f5; font-weight: 600; }
   .tl-type { display: inline-block; font-size: 10px; text-transform: uppercase; font-weight: 700; letter-spacing: 0.03em; color: #666; margin-right: 6px; }
   .roster { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
   .roster .person { background: #f4f4f8; border-radius: 6px; padding: 6px 10px; font-size: 12px; }
   .roster .person .role { color: #666; }
   .roster .person .src { font-size: 10px; color: #999; }
   .risk-list li { color: #a13048; }
+  .health-badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 11px; font-weight: 700; margin-left: 8px; }
+  .health-badge.good { background: #d4edda; color: #155724; }
+  .health-badge.ok { background: #fff3cd; color: #856404; }
+  .health-badge.low { background: #f8d7da; color: #721c24; }
 </style>
 </head>
 <body>
@@ -72,7 +77,7 @@
 
 <div class="step">
   <h2>4. Live incident timeline</h2>
-  <p>Renders <code>IncidentCall.structured_state</code> as it actually accumulates — facts, hypotheses, decisions, action items (with resolved owners once the call ends), missing info, conflicts, and chat notes, in the order they were recorded. Auto-refreshes every 3s while a call id is set.</p>
+  <p>Renders <code>IncidentCall.structured_state</code> as it actually accumulates — facts, hypotheses, decisions, action items (with resolved owners once the call ends), missing info, conflicts, and chat notes, in the order they were recorded. The <strong>coordination health</strong> badge and any teal <strong>pattern nudge</strong> entries are the AI noticing a pattern across everything recorded so far (conflicts piling up, a stale unowned action item, competing theories, or a sharp drop in health) and speaking up on its own — not a reaction to any single thing just said. Auto-refreshes every 3s while a call id is set.</p>
   <input id="timeline-call-id" type="number" placeholder="call id (auto-filled from step 3)" style="padding:8px;border:1px solid #ccc;border-radius:6px;width:220px;">
   <button onclick="startTimelinePolling()">▶ Watch this call</button>
   <button class="secondary" onclick="stopTimelinePolling()">⏸ Stop</button>
@@ -218,10 +223,19 @@ async function fetchAndRenderTimeline(callId) {
     return;
   }
   const call = await res.json();
-  statusEl.innerHTML = `call #${call.id} · channel <code>${call.channel_name}</code> · <span class="badge ${call.status}">${call.status}</span> · last refreshed ${new Date().toLocaleTimeString()}`;
+  const history = (call.structured_state || {}).health_score_history || [];
+  const latestScore = history.length ? history[history.length - 1].score : null;
+  const healthHtml = latestScore === null ? "" : `<span class="health-badge ${_healthTier(latestScore)}">coordination health: ${latestScore}</span>`;
+  statusEl.innerHTML = `call #${call.id} · channel <code>${call.channel_name}</code> · <span class="badge ${call.status}">${call.status}</span>${healthHtml} · last refreshed ${new Date().toLocaleTimeString()}`;
   renderRoster(call.participant_roles || {});
   renderRisks((call.structured_state || {}).unresolved_risks || []);
   renderTimelineEntries((call.structured_state || {}).timeline || []);
+}
+
+function _healthTier(score) {
+  if (score >= 75) return "good";
+  if (score >= 45) return "ok";
+  return "low";
 }
 
 function renderRoster(participantRoles) {

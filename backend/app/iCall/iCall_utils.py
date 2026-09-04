@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Set
 
 import httpx
@@ -377,6 +378,186 @@ def should_speak_aloud(update: StructuringUpdate, latest_user_message: Optional[
     if latest_user_message and WAKE_WORD in latest_user_message.lower():
         return True
     return False
+
+
+# -----------------------------------------------------------------------------
+# Pattern watching over the accumulated call state -- the difference between
+# a passive log L3 polls and a memory that notices patterns in itself. Every
+# check here is deterministic, computed from structured_state alone, no LLM
+# call: it's watching for patterns ACROSS already-recorded events (how many
+# conflicts, how stale an item is, how many competing theories), not judging
+# any single new statement, which is a genuinely different question from
+# what should_speak_aloud answers above. Cheap enough to run every turn.
+#
+# Deliberately scoped to what the current schema actually supports rather
+# than the full design: a "previously-confirmed fact gets recontradicted"
+# pattern needs tentative/confirmed promotion tracking this schema doesn't
+# have yet (facts are a flat list, no confidence state), so it's left out
+# here rather than faked with a fragile text-matching heuristic.
+# -----------------------------------------------------------------------------
+
+CONFLICT_PILEUP_THRESHOLD = 2
+CONFLICT_PILEUP_WINDOW_MINUTES = 5
+
+HYPOTHESIS_CLUSTER_THRESHOLD = 3
+HYPOTHESIS_CLUSTER_WINDOW_MINUTES = 5
+
+STALE_ACTION_ITEM_MINUTES = 5
+
+HEALTH_SCORE_DROP_THRESHOLD = 20
+HEALTH_SCORE_HISTORY_LOOKBACK = 5
+HEALTH_SCORE_HISTORY_MAX_LEN = 20
+
+
+def _recent_timeline_entries(timeline: List[dict], entry_type: str, window_minutes: int) -> List[dict]:
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    recent = []
+    for entry in timeline:
+        if entry.get("type") != entry_type:
+            continue
+        try:
+            ts = datetime.fromisoformat(entry["timestamp"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if ts >= cutoff:
+            recent.append(entry)
+    return recent
+
+
+def _stale_unowned_action_item(structured_state: dict) -> Optional[dict]:
+    """
+    Matches an action item back to its timeline entry by text to find when
+    it was recorded -- action_items themselves aren't individually
+    timestamped, only their timeline entry is. Fragile if two items share
+    identical text; acceptable at this scope, not worth a schema change to
+    fully solve tonight.
+    """
+    timeline_ts_by_text = {
+        e["text"]: e.get("timestamp")
+        for e in structured_state.get("timeline", [])
+        if e.get("type") == "action_item"
+    }
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_ACTION_ITEM_MINUTES)
+    for item in structured_state.get("action_items", []):
+        if item.get("owner") or item.get("owner_uid"):
+            continue
+        ts_str = timeline_ts_by_text.get(item.get("text"))
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        if ts <= cutoff:
+            return item
+    return None
+
+
+def evaluate_call_patterns(structured_state: dict) -> Optional[dict]:
+    """
+    Checked in priority order, first match wins -- returns None if nothing
+    fired. Only called when should_speak_aloud's turn-level checks (an
+    explicit conflict/missing-info/wake-word this turn) already decided
+    not to speak, so a pattern nudge never competes with something more
+    directly relevant to what was just said.
+    """
+    timeline = structured_state.get("timeline", [])
+
+    if len(_recent_timeline_entries(timeline, "conflict", CONFLICT_PILEUP_WINDOW_MINUTES)) >= CONFLICT_PILEUP_THRESHOLD:
+        return {
+            "pattern": "conflict_pileup",
+            "message": "We've got a few open questions piling up -- want to pause and reconcile before moving on?",
+        }
+
+    stale_item = _stale_unowned_action_item(structured_state)
+    if stale_item:
+        return {
+            "pattern": "stale_action_item",
+            "message": f"Just checking in -- \"{stale_item['text']}\" still doesn't have an owner. Can someone take that?",
+        }
+
+    if len(_recent_timeline_entries(timeline, "hypothesis", HYPOTHESIS_CLUSTER_WINDOW_MINUTES)) >= HYPOTHESIS_CLUSTER_THRESHOLD:
+        return {
+            "pattern": "confusion_cluster",
+            "message": "A few different theories have come up in the last few minutes -- want to narrow down to one to test first?",
+        }
+
+    return None
+
+
+def compute_coordination_health_score(structured_state: dict) -> int:
+    """
+    0-100, higher is healthier -- a rough aggregate over open conflicts,
+    missing-info gaps, unowned action items, and time since the last
+    decision. The same idea data-observability tools use to reduce many
+    raw signals into one number worth acting on, pointed at the room's own
+    coordination instead of the payment system it's discussing. Weights
+    are a judgment call, not derived from anything measured; deliberately
+    simple and code-computed rather than model-judged, so it's at least
+    consistent and explainable.
+    """
+    score = 100
+    score -= 15 * len(structured_state.get("conflicts", []))
+    score -= 10 * len(structured_state.get("missing_info", []))
+
+    timeline = structured_state.get("timeline", [])
+    decision_timestamps = []
+    for e in timeline:
+        if e.get("type") != "decision":
+            continue
+        try:
+            decision_timestamps.append(datetime.fromisoformat(e["timestamp"]))
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    if decision_timestamps:
+        minutes_since = (datetime.now(timezone.utc) - max(decision_timestamps)).total_seconds() / 60
+        if minutes_since > 10:
+            score -= 15
+    elif timeline:
+        # No decision at all yet -- mild penalty, not severe, since that's
+        # completely normal early in a call.
+        score -= 5
+
+    unowned_items = sum(
+        1 for item in structured_state.get("action_items", [])
+        if not (item.get("owner") or item.get("owner_uid"))
+    )
+    score -= 5 * unowned_items
+
+    return max(0, min(100, score))
+
+
+def detect_health_score_drop(structured_state: dict) -> bool:
+    """
+    A SHARP DROP, not a static low value -- a call that's held steady at
+    60 all along isn't an emergency; one that just fell from 90 to 55 in a
+    few turns is. Needs history (see iCall_service.record_health_score),
+    since a single snapshot can't tell a drop from a call that started low.
+    """
+    history = structured_state.get("health_score_history", [])
+    if len(history) < 2:
+        return False
+    recent = history[-HEALTH_SCORE_HISTORY_LOOKBACK:]
+    peak = max(h["score"] for h in recent[:-1])
+    current = recent[-1]["score"]
+    return (peak - current) >= HEALTH_SCORE_DROP_THRESHOLD
+
+
+def build_health_recap(structured_state: dict) -> str:
+    """
+    Deterministic, not model-generated -- a status recap triggered by a
+    code-computed pattern shouldn't itself depend on another LLM call to
+    say something coherent about that same state.
+    """
+    facts_n = len(structured_state.get("facts", []))
+    hyp_n = len(structured_state.get("hypotheses", []))
+    items_n = len(structured_state.get("action_items", []))
+    conflicts_n = len(structured_state.get("conflicts", []))
+    return (
+        f"Quick status check -- {facts_n} facts confirmed, {hyp_n} open "
+        f"theories, {items_n} action items tracked, {conflicts_n} still unresolved."
+    )
 
 
 # -----------------------------------------------------------------------------

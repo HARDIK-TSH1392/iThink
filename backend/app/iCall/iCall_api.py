@@ -27,6 +27,8 @@ from .iCall_service import (
     record_utterance,
     list_utterances,
     apply_structuring_update,
+    record_health_score,
+    record_pattern_nudge,
     infer_and_store_participant_roles,
     IncidentNotFoundError,
 )
@@ -35,6 +37,10 @@ from .iCall_utils import (
     describe_event_type,
     verify_agora_signature,
     should_speak_aloud,
+    evaluate_call_patterns,
+    compute_coordination_health_score,
+    detect_health_score_drop,
+    build_health_recap,
     CALL_STATUS_COMPLETED,
     CLOSING_LINE,
     FALLBACK_REPLY,
@@ -252,11 +258,13 @@ async def chat_completions_endpoint(
     expects here.
 
     Whether the reply actually reaches the room's speakers is a separate,
-    deterministic decision from generating it -- see should_speak_aloud.
-    Everything that gets *recorded* (facts, hypotheses, decisions, action
-    items, missing_info, conflicts, chat_notes) happens in
-    apply_structuring_update regardless of that decision; only the audio
-    output is gated.
+    deterministic decision from generating it -- see should_speak_aloud
+    for turn-level triggers (a conflict, missing info, direct address) and
+    evaluate_call_patterns/detect_health_score_drop for patterns noticed
+    across everything recorded so far, not just this turn. Everything that
+    gets *recorded* (facts, hypotheses, decisions, action items,
+    missing_info, conflicts, chat_notes) happens in apply_structuring_update
+    regardless of any of these decisions; only the audio output is gated.
     """
     call = await get_call_by_channel_name(db, channel_name)
     if call is None:
@@ -266,7 +274,14 @@ async def chat_completions_endpoint(
     service = incident.service if incident else None
 
     update = await generate_structuring_update(payload.messages, call.structured_state or {}, service)
-    await apply_structuring_update(db, call, update)
+    call = await apply_structuring_update(db, call, update)
+
+    # Coordination-health score: a rough, code-computed aggregate over the
+    # call's own state (open conflicts, missing info, unowned items, time
+    # since the last decision) -- recorded every turn, cheaply, regardless
+    # of whether anything below actually speaks. See detect_health_score_drop.
+    health_score = compute_coordination_health_score(call.structured_state)
+    call = await record_health_score(db, call, health_score)
 
     latest_user_message = next(
         (m.content for m in reversed(payload.messages) if m.role == "user"), None
@@ -285,11 +300,25 @@ async def chat_completions_endpoint(
     elif should_speak_aloud(update, latest_user_message):
         spoken_reply = update.spoken_reply
     else:
-        # Ordinary turn, nothing urgent -- stay silent. The prompt already
-        # asks the model to keep these to "a brief acknowledgment," but that
-        # was never enforced; this makes it deterministic. Nothing recorded
-        # is affected (spoken_reply was never persisted -- see docstring).
-        spoken_reply = ""
+        # Nothing about THIS turn was urgent -- but the accumulated state
+        # might still be worth flagging (a pattern across recorded events,
+        # or a sharp drop in coordination health). Checked only here, below
+        # the turn-level gate, so a pattern nudge never competes with
+        # something more directly relevant to what was just said.
+        pattern = evaluate_call_patterns(call.structured_state)
+        if pattern:
+            spoken_reply = pattern["message"]
+            call = await record_pattern_nudge(db, call, pattern["pattern"], pattern["message"])
+        elif detect_health_score_drop(call.structured_state):
+            spoken_reply = build_health_recap(call.structured_state)
+            call = await record_pattern_nudge(db, call, "health_score_drop", spoken_reply)
+        else:
+            # Ordinary turn, nothing urgent -- stay silent. The prompt
+            # already asks the model to keep these to "a brief
+            # acknowledgment," but that was never enforced; this makes it
+            # deterministic. Nothing recorded is affected (spoken_reply was
+            # never persisted -- see docstring).
+            spoken_reply = ""
 
     async def event_stream():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
