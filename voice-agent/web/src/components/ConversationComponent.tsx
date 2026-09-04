@@ -29,6 +29,7 @@ import {
 	getCurrentInProgressMessage,
 	getInitial,
 	getMessageList,
+	isFinishedTurn,
 	mapAgentVisualizerState,
 	normalizeTimestampMs,
 	normalizeTranscript,
@@ -473,6 +474,10 @@ export default function ConversationComponent({
 			if (postedTurnIds.current.has(key)) continue;
 			if (String(message.uid) === agentUID) continue;
 			if (!message.text?.trim()) continue;
+			// Skip turns the VAD cut off before the speaker actually finished --
+			// see isFinishedTurn. Posting these too double-records the sentence
+			// once the continuation lands in its own END turn.
+			if (!isFinishedTurn(message)) continue;
 
 			postedTurnIds.current.add(key);
 			recordUtterance(
