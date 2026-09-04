@@ -505,6 +505,10 @@ Rules:
 - A risk is something that could still cause harm or uncertainty: a
   hypothesis never confirmed as a fact, a missing_info gap never answered,
   an action item with no owner, or a conflict never resolved.
+- An action item counts as having an owner if EITHER its "owner" field OR
+  its "owner_uid" field is set (owner_uid means it was matched to someone
+  on the call by role, not by name -- that still counts as assigned). Only
+  flag an action item as a risk if both are empty/null.
 - Do not assert a root cause or suggest a fix -- only state plainly what
   remains open or uncertain.
 - Each risk is one short, concrete sentence someone could act on or watch
