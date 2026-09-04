@@ -82,7 +82,11 @@ export async function stopAgent(agentId: string): Promise<void> {
   }
 }
 
-export async function setName(channelName: string, uid: string, name: string): Promise<void> {
+export async function setName(
+  channelName: string,
+  uid: string,
+  name: string,
+): Promise<{ recap: string | null }> {
   const response = await fetch(`${API_BASE_URL}/setName`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -93,6 +97,62 @@ export async function setName(channelName: string, uid: string, name: string): P
     const error = await response.json()
     throw new Error(error.detail || `HTTP ${response.status}`)
   }
+
+  // Present only for a genuine late join -- a private catch-up recap for
+  // this caller alone, never broadcast to the shared meet chat.
+  const result = await response.json()
+  return { recap: result.data?.recap ?? null }
+}
+
+export async function removeName(channelName: string, uid: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/removeName`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channelName, uid }),
+  })
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(error.detail || `HTTP ${response.status}`)
+  }
+}
+
+export interface MeetChatMessage {
+  uid: string
+  name: string
+  text: string
+  timestamp: number
+}
+
+export async function sendMeetChatMessage(
+  channelName: string,
+  uid: string,
+  name: string,
+  text: string,
+): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/sendChatMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channelName, uid, name, text }),
+  })
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(error.detail || `HTTP ${response.status}`)
+  }
+}
+
+export async function getMeetChatMessages(channelName: string): Promise<MeetChatMessage[]> {
+  const response = await fetch(
+    `${API_BASE_URL}/chatMessages?channel=${encodeURIComponent(channelName)}`,
+  )
+
+  if (!response.ok) {
+    return []
+  }
+
+  const result = await response.json()
+  return result.data ?? []
 }
 
 export async function getNames(channelName: string): Promise<Record<string, string>> {

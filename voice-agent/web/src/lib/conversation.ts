@@ -10,6 +10,14 @@ import {
   type IMessageListItem,
 } from 'agora-agent-uikit'
 
+// First letter of a person's display name, uppercased -- shared avatar
+// content across the participant grid, transcript, and chat panel. Falls
+// back to "?" for an empty/unnamed string rather than rendering nothing.
+export function getInitial(name: string): string {
+  const trimmed = name.trim()
+  return trimmed ? trimmed[0].toUpperCase() : '?'
+}
+
 export function normalizeTranscriptSpacing(text: string): string {
   return text
     .replace(/([.!?])([A-Za-z])/g, '$1 $2')

@@ -11,7 +11,8 @@ import logging
 import os
 import random
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+import httpx
 from dotenv import load_dotenv
 
 # The Agora CLI writes the Python quickstart environment to server/.env.
@@ -96,11 +97,33 @@ class SetNameRequest(BaseModel):
     name: str
 
 
+class RemoveNameRequest(BaseModel):
+    """Request body for POST /removeName"""
+    channelName: str
+    uid: str
+
+
 # channel_name -> {uid: name}. In-memory and best-effort: lets every
 # participant on a call see everyone else's display name without needing
 # RTM presence or any coordination ahead of time. Cleared implicitly when
 # the process restarts -- fine for a live call, not meant to persist.
 _channel_names: Dict[str, Dict[str, str]] = {}
+
+
+class ChatMessageSend(BaseModel):
+    """Request body for POST /sendChatMessage"""
+    channelName: str
+    uid: str
+    name: str
+    text: str
+
+
+# channel_name -> [{uid, name, text, timestamp}, ...]. In-call text chat
+# between humans (separate from the voice transcript and from the agent's
+# own written notes) -- same in-memory, best-effort, polling-based
+# discipline as _channel_names, for the same reasons (no RTM plumbing,
+# easy to verify, fine to lose on a process restart).
+_channel_chat_messages: Dict[str, List[Dict[str, Any]]] = {}
 
 
 # API endpoints
@@ -207,20 +230,92 @@ async def stop_agent(request: StopAgentRequest):
         raise _to_http_error(e)
 
 
+async def _fetch_late_joiner_recap(channel_name: str) -> Optional[str]:
+    """
+    A participant just joined a channel where others were already present
+    -- fetch iThink's live catch-up recap for this call so set_name can
+    hand it straight back to that one joiner (never broadcast through
+    _channel_chat_messages, which every participant polls -- a late-join
+    recap is meant for the joiner alone, not a message "sent" to the room).
+    Best-effort throughout: a slow/unreachable iThink backend should never
+    block someone from joining the call.
+    """
+    ithink_base = os.getenv("ITHINK_BACKEND_BASE_URL", "http://127.0.0.1:8123/api/v1")
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.get(f"{ithink_base}/icall/channel/{channel_name}/recap")
+            response.raise_for_status()
+            return response.json().get("data", {}).get("recap")
+    except Exception:
+        logger.warning("Failed to fetch late-joiner recap for channel=%s", channel_name, exc_info=True)
+        return None
+
+
 @router.post("/setName")
 async def set_name(request: SetNameRequest):
-    """Record a participant's display name for a channel."""
+    """
+    Record a participant's display name for a channel. When this is a
+    genuine late join, the response also carries a private catch-up recap
+    for this caller only -- see _fetch_late_joiner_recap.
+    """
     name = request.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="name is required and cannot be empty")
-    _channel_names.setdefault(request.channelName, {})[request.uid] = name
-    return {"code": 0, "msg": "success"}
+
+    existing_names = _channel_names.setdefault(request.channelName, {})
+    # A late join: this uid is new to the channel AND someone else was
+    # already on the call -- i.e. there's a real chance discussion already
+    # happened. A single first joiner naturally has an empty structured_state
+    # anyway (format_live_recap returns None), but checking here avoids the
+    # round-trip entirely for the common case.
+    is_late_join = request.uid not in existing_names and len(existing_names) > 0
+    existing_names[request.uid] = name
+
+    recap = await _fetch_late_joiner_recap(request.channelName) if is_late_join else None
+
+    return {"code": 0, "msg": "success", "data": {"recap": recap}}
 
 
 @router.get("/getNames")
 async def get_names(channel: str = Query(...)):
     """Return the uid -> name map recorded so far for a channel."""
     return {"code": 0, "data": _channel_names.get(channel, {}), "msg": "success"}
+
+
+@router.post("/removeName")
+async def remove_name(request: RemoveNameRequest):
+    """
+    Drops a participant from a channel's name registry -- called when
+    someone actually leaves, so getNames (and the pre-call "N already on
+    the call" count) reflects who's still there instead of accumulating
+    everyone who's ever joined. Best-effort, same as setName: silently a
+    no-op if the channel or uid was never recorded.
+    """
+    _channel_names.get(request.channelName, {}).pop(request.uid, None)
+    return {"code": 0, "msg": "success"}
+
+
+@router.post("/sendChatMessage")
+async def send_chat_message(request: ChatMessageSend):
+    """Append one in-call chat message for a channel."""
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required and cannot be empty")
+    _channel_chat_messages.setdefault(request.channelName, []).append(
+        {
+            "uid": request.uid,
+            "name": request.name,
+            "text": text,
+            "timestamp": time.time() * 1000,
+        }
+    )
+    return {"code": 0, "msg": "success"}
+
+
+@router.get("/chatMessages")
+async def get_chat_messages(channel: str = Query(...)):
+    """Return this channel's in-call chat history so far, oldest first."""
+    return {"code": 0, "data": _channel_chat_messages.get(channel, []), "msg": "success"}
 
 
 app.include_router(router)

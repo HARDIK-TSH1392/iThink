@@ -40,10 +40,15 @@ safety-relevant gap, or a direct question to you.
 
 DEFAULT_GREETING = "Hi, this is iThink. I'll listen in and keep track of what's discussed -- let me know if you'd like a recap."
 
-# Spoken by parameters.silence_config below when the room's gone quiet for a
-# while -- a fixed line, not a live LLM call, so a quiet room can't produce
-# something odd when there's no new conversation to reason about.
-SILENCE_PROMPT = "Does anyone else have any more points to contribute?"
+# Appended to the conversation and handed to the LLM by parameters.
+# silence_config below (action="think") when the room's gone quiet for a
+# while. Deliberately an inert control string, never something a real
+# participant would say -- iCall_api.chat_completions_endpoint (backend/
+# app/iCall/iCall_api.py) recognizes it as the last message and swaps in
+# its own deterministic, transcript-aware nudge (or stays silent if only
+# one person is on the call) instead of treating it as real speech to
+# extract facts from. Keep this in sync with SILENCE_TRIGGER_MARKER there.
+SILENCE_TRIGGER_MARKER = "[[ithink-silence-check]]"
 
 
 class Agent:
@@ -185,14 +190,17 @@ class Agent:
             "enable_metrics": True,
             # After a long stretch with no one speaking, prompt the room
             # rather than staying silent -- "Spoken status summaries at
-            # appropriate moments" from the brief. Fixed content, not a
-            # live LLM call ("speak" not "think"): a genuinely empty room
-            # has nothing for the model to reason about, so a canned
-            # prompt is more predictable than risking an odd ad-lib.
+            # appropriate moments" from the brief. action="think" appends
+            # `content` to the conversation and routes it through the LLM
+            # (our custom LLM proxy) instead of speaking it verbatim, so
+            # what actually gets said can depend on the call so far --
+            # whether only one person is present, and how much has already
+            # been figured out -- rather than always repeating the same
+            # canned line. See SILENCE_TRIGGER_MARKER above.
             "silence_config": {
                 "timeout_ms": 15000,
-                "action": "speak",
-                "content": SILENCE_PROMPT,
+                "action": "think",
+                "content": SILENCE_TRIGGER_MARKER,
             },
         }
         if isinstance(output_audio_codec, str) and output_audio_codec.strip():
