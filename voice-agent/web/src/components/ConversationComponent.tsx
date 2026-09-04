@@ -1,5 +1,6 @@
 "use client";
 
+import { Sparkles } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ConnectionStatusPanel } from "@/components/ConnectionStatusPanel";
@@ -7,6 +8,7 @@ import {
 	type ConnectionIssue,
 	getConversationIssueSeverity,
 } from "@/components/ConversationErrorCard";
+import { MeetChatPanel } from "@/components/MeetChatPanel";
 import { MicrophoneSelector } from "@/components/MicrophoneSelector";
 import { QuickstartConversationLayout } from "@/components/QuickstartConversationLayout";
 import {
@@ -18,6 +20,7 @@ import { DEFAULT_AGENT_UID } from "@/lib/agora";
 import { type ChatNote, getChatNotes, getNames, recordUtterance } from "@/services/api";
 import {
 	getCurrentInProgressMessage,
+	getInitial,
 	getMessageList,
 	mapAgentVisualizerState,
 	normalizeTimestampMs,
@@ -85,6 +88,7 @@ export default function ConversationComponent({
 	agoraData,
 	rtmClient,
 	localName,
+	lateJoinRecap,
 	onTokenWillExpire,
 	onEndConversation,
 }: ConversationComponentProps) {
@@ -592,17 +596,20 @@ export default function ConversationComponent({
 								{
 									uid: localUid,
 									label: "You",
+									avatarName: localName || "You",
 									isAgent: false,
 									speaking: speakingUids.has(String(localUid)) && isEnabled,
 								},
 								...remoteUsers.map((user) => {
 									const isAgent = String(user.uid) === String(agentUID);
+									const remoteLabel = isAgent
+										? "iThink Agent"
+										: (participantNames[String(user.uid)] ??
+											`Participant ${user.uid}`);
 									return {
 										uid: user.uid,
-										label: isAgent
-											? "iThink Agent"
-											: (participantNames[String(user.uid)] ??
-												`Participant ${user.uid}`),
+										label: remoteLabel,
+										avatarName: remoteLabel,
 										isAgent,
 										speaking: isAgent
 											? visualizerState === "talking"
@@ -617,12 +624,16 @@ export default function ConversationComponent({
 									className="flex flex-col items-center gap-3 rounded-2xl border border-border bg-card/60 px-5 py-8"
 								>
 									<div
-										className={`flex h-24 w-24 items-center justify-center rounded-full text-4xl transition-shadow ${
+										className={`flex h-24 w-24 items-center justify-center rounded-full font-medium transition-shadow ${
 											tile.isAgent ? "bg-primary/15 text-primary" : "bg-muted text-foreground"
 										} ${tile.speaking ? "ring-4 ring-primary/70 animate-pulse" : ""}`}
 										aria-hidden="true"
 									>
-										{tile.isAgent ? "\u{1F916}" : "\u{1F464}"}
+										{tile.isAgent ? (
+											<Sparkles className="h-9 w-9" strokeWidth={1.75} />
+										) : (
+											<span className="text-3xl">{getInitial(tile.avatarName)}</span>
+										)}
 									</div>
 									<span className="max-w-full truncate text-sm font-medium text-foreground">
 										{tile.label}
@@ -634,10 +645,7 @@ export default function ConversationComponent({
 				</section>
 			}
 			controls={
-				<fieldset
-					className="mx-auto flex w-fit items-center gap-3 rounded-full border border-border bg-card/80 px-4 py-2 backdrop-blur-md"
-					aria-label="Audio controls"
-				>
+				<fieldset className="flex items-center gap-3" aria-label="Audio controls">
 					<div className="conversation-mic-host flex items-center justify-center">
 						<MicButtonWithVisualizer
 							isEnabled={isEnabled}
@@ -652,6 +660,14 @@ export default function ConversationComponent({
 					</div>
 					<MicrophoneSelector localMicrophoneTrack={localMicrophoneTrack} />
 				</fieldset>
+			}
+			chatPanel={
+				<MeetChatPanel
+					channel={agoraData.channel}
+					localUid={agoraData.uid}
+					localName={localName}
+					lateJoinRecap={lateJoinRecap}
+				/>
 			}
 			onEndConversation={handleEndConversation}
 		/>

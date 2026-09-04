@@ -8,9 +8,10 @@ import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { LoadingSkeleton } from "@/components/LoadingSkeleton";
+import { PreCallBackdrop } from "@/components/PreCallBackdrop";
 import { QuickstartPreCallCard } from "@/components/QuickstartPreCallCard";
 import { ShareButton } from "@/components/share-button";
-import { getConfig, markCallCompleted, setName, startAgent } from "@/services/api";
+import { getConfig, markCallCompleted, removeName, setName, startAgent } from "@/services/api";
 import type { AgoraRenewalTokens, AgoraTokenData } from "@/types/conversation";
 
 const ConversationComponent = dynamic(
@@ -105,11 +106,34 @@ export default function LandingPage() {
 	const [error, setError] = useState<string | null>(null);
 	const [agentJoinError, setAgentJoinError] = useState(false);
 	const [localName, setLocalName] = useState("");
+	const [lateJoinRecap, setLateJoinRecap] = useState<string | null>(null);
 
 	useEffect(() => {
 		import("agora-rtc-react").catch(() => {});
 		import("agora-rtm").catch(() => {});
 	}, []);
+
+	// Covers closing the tab / navigating away without clicking "End
+	// Conversation" -- handleEndConversation's removeName call never runs
+	// in that case, so the registry would otherwise keep this uid listed
+	// as "still on the call" indefinitely. sendBeacon (not fetch) is what
+	// actually survives a page already being torn down.
+	useEffect(() => {
+		if (!agoraData?.channel) return;
+		const { channel, uid } = agoraData;
+
+		const handlePageHide = () => {
+			navigator.sendBeacon?.(
+				"/api/removeName",
+				new Blob([JSON.stringify({ channelName: channel, uid })], {
+					type: "application/json",
+				}),
+			);
+		};
+
+		window.addEventListener("pagehide", handlePageHide);
+		return () => window.removeEventListener("pagehide", handlePageHide);
+	}, [agoraData]);
 
 	const handleStartConversation = async (name: string) => {
 		setIsLoading(true);
@@ -121,7 +145,7 @@ export default function LandingPage() {
 			const config = await getConfig({ channel: channelFromUrl, uid: uidFromUrl });
 			const appId = config.app_id;
 
-			const [agentIdResult, rtm] = await Promise.all([
+			const [agentIdResult, rtm, setNameResult] = await Promise.all([
 				startAgent(
 					config.channel_name,
 					Number(config.agent_uid),
@@ -141,12 +165,16 @@ export default function LandingPage() {
 				})(),
 				// Best-effort: publish our display name so other participants can
 				// label us properly. Shouldn't block joining the call if it fails.
+				// When we're a late joiner, the response also carries a private
+				// catch-up recap meant for us alone -- see setLateJoinRecap below.
 				setName(config.channel_name, config.uid, name).catch((err) => {
 					console.error("Failed to publish display name:", err);
+					return { recap: null };
 				}),
 			]);
 
 			setRtmClient(rtm);
+			setLateJoinRecap(setNameResult.recap);
 			setAgoraData({
 				token: config.token,
 				uid: config.uid,
@@ -210,6 +238,12 @@ export default function LandingPage() {
 			markCallCompleted(agoraData.channel).catch((err) =>
 				console.error("Failed to mark call completed:", err),
 			);
+			// Drops this uid from the name registry so the pre-call "N
+			// already on the call" count (and getNames generally) reflects
+			// who's actually still there, not everyone who's ever joined.
+			removeName(agoraData.channel, agoraData.uid).catch((err) =>
+				console.error("Failed to remove name on leave:", err),
+			);
 		}
 
 		rtmClient?.logout().catch((err) => console.error("RTM logout error:", err));
@@ -220,6 +254,7 @@ export default function LandingPage() {
 
 	return (
 		<div className="relative flex h-dvh min-h-screen flex-col overflow-hidden bg-background text-foreground">
+			{!showConversation ? <PreCallBackdrop /> : null}
 			<div
 				className={`flex min-h-0 flex-1 flex-col ${
 					showConversation
@@ -256,6 +291,7 @@ export default function LandingPage() {
 											agoraData={agoraData}
 											rtmClient={rtmClient}
 											localName={localName}
+											lateJoinRecap={lateJoinRecap}
 											onTokenWillExpire={handleTokenWillExpire}
 											onEndConversation={handleEndConversation}
 										/>

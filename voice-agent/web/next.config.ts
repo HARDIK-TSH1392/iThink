@@ -32,6 +32,9 @@ const nextConfig: NextConfig = {
         { source: '/api/stopAgent', destination: `${backendUrl}/stopAgent` },
         { source: '/api/setName', destination: `${backendUrl}/setName` },
         { source: '/api/getNames', destination: `${backendUrl}/getNames` },
+        { source: '/api/removeName', destination: `${backendUrl}/removeName` },
+        { source: '/api/sendChatMessage', destination: `${backendUrl}/sendChatMessage` },
+        { source: '/api/chatMessages', destination: `${backendUrl}/chatMessages` },
       )
     }
 
