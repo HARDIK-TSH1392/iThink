@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Set
 
 import httpx
@@ -60,6 +61,17 @@ def generate_channel_name(incident_id: int) -> str:
 PRIMARY_MODEL = "gemini-3.5-flash-lite"
 FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
+# None of the four Gemini call sites below had a timeout before this --
+# found via a dry run that hit a genuine hang (90+s, zero output, not even
+# the fast ~1-3s failure a real 503 returns) on one of the end-of-call
+# passes. Without this, a stuck request blocks whatever awaits it
+# indefinitely: for the per-turn structuring call, that's the live
+# conversation itself (Agora's Custom LLM hook has nothing to send back to
+# the room); for the end-of-call passes, that's the client's "End
+# Conversation" request just hanging. 25s matches the margin already used
+# for the GitHub deploy-check call elsewhere in this file.
+GEMINI_CALL_TIMEOUT_S = 25
+
 _gemini_semaphore = asyncio.Semaphore(4)
 
 _client: "genai.Client | None" = None
@@ -76,6 +88,18 @@ FALLBACK_REPLY = (
     "I can hear you, but I'm not wired to a real model yet — "
     "set GEMINI_API_KEY to get an actual response."
 )
+
+# Used when the model's own output doesn't validate against the schema --
+# a diagnostic signal, not conversational content. Named so the speak-gate
+# below can recognize and always pass it through, the same as FALLBACK_REPLY.
+MALFORMED_RESPONSE_FALLBACK = "Sorry, could you say that again?"
+
+# Matches the "ithink" entry in voice-agent's own interruption.keywords_config
+# (agent.py) -- same literal, so a listener addressing the agent by name
+# both interrupts its TTS *and* counts as a direct address for the speak
+# gate below. Kept as one source of truth in spirit even though it can't
+# literally be shared across the two services.
+WAKE_WORD = "ithink"
 
 # Spoken when StructuringUpdate.is_wrapping_up is true. Deliberately a fixed
 # string, not LLM-generated -- see StructuringUpdate.is_wrapping_up's
@@ -335,21 +359,33 @@ async def generate_structuring_update(
 
     async with _gemini_semaphore:
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=PRIMARY_MODEL,
-                contents=prompt,
-                config=config,
-            )
-        except Exception:
-            try:
-                response = await asyncio.to_thread(
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
                     client.models.generate_content,
-                    model=FALLBACK_MODEL,
+                    model=PRIMARY_MODEL,
                     contents=prompt,
                     config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            print(f"[iCall] Structuring primary call failed/timed out, trying fallback: {exc}")
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=FALLBACK_MODEL,
+                        contents=prompt,
+                        config=config,
+                    ),
+                    timeout=GEMINI_CALL_TIMEOUT_S,
                 )
-            except Exception:
+            except Exception as exc2:
+                # This is the live per-turn call -- a hang here previously
+                # had no ceiling at all and would have frozen the actual
+                # conversation (Agora's Custom LLM hook has nothing to send
+                # back to the room until this returns).
+                print(f"[iCall] Structuring failed on both attempts, falling back: {exc2}")
                 return _fallback_structuring_update()
 
     try:
@@ -358,7 +394,232 @@ async def generate_structuring_update(
         # Model returned something that didn't match the schema — don't crash
         # the live call over a malformed extraction, just say something safe
         # and record nothing rather than guessing at a partial parse.
-        return StructuringUpdate(spoken_reply="Sorry, could you say that again?")
+        return StructuringUpdate(spoken_reply=MALFORMED_RESPONSE_FALLBACK)
+
+
+# -----------------------------------------------------------------------------
+# Speak gate: StructuringUpdate.spoken_reply is a required field, so the
+# model always produces *something* -- the STRUCTURING_SYSTEM_INSTRUCTION
+# asks it to keep ordinary turns to "a brief, natural acknowledgment" rather
+# than route them to agent_chat_note, but a prompt is a preference, not a
+# guarantee. This makes "should this turn actually interrupt the room out
+# loud" a deterministic check instead of trusting the model to self-regulate
+# on every single turn -- same reasoning as everywhere else in this codebase
+# that a fact is computed in code rather than asserted by the LLM.
+#
+# Deliberately narrow and reusing fields that already exist (conflict,
+# missing_info, is_wrapping_up) rather than inventing new signals under time
+# pressure. Two known non-goals, on purpose: no periodic "recap" timer here
+# (voice-agent's own silence_config already prompts the room after 15s of
+# true dead air -- a different, complementary mechanism, not duplicated),
+# and no dedup on repeated missing_info gaps (the system prompt already
+# scopes missing_info to "the room itself is missing" on THIS turn, not a
+# running checklist, so treating a fresh one as speak-worthy is consistent
+# with how narrowly the model is already asked to set it).
+# -----------------------------------------------------------------------------
+
+
+def should_speak_aloud(update: StructuringUpdate, latest_user_message: Optional[str]) -> bool:
+    """
+    True if this turn's spoken_reply should actually reach the room's
+    speakers. False means the caller sends empty content to Agora's TTS
+    instead -- spoken_reply is never persisted anywhere (see
+    apply_structuring_update), so suppressing it loses nothing recorded,
+    only the audible acknowledgment itself. Anything actually worth
+    keeping on a quiet turn belongs in agent_chat_note, which the model
+    sets independently of this gate.
+
+    is_wrapping_up is NOT checked here -- that path always speaks (the
+    caller substitutes CLOSING_LINE, unconditionally, unchanged from
+    before this gate existed).
+    """
+    if update.conflict:
+        return True
+    if update.missing_info:
+        return True
+    if latest_user_message and WAKE_WORD in latest_user_message.lower():
+        return True
+    return False
+
+
+# -----------------------------------------------------------------------------
+# Pattern watching over the accumulated call state -- the difference between
+# a passive log L3 polls and a memory that notices patterns in itself. Every
+# check here is deterministic, computed from structured_state alone, no LLM
+# call: it's watching for patterns ACROSS already-recorded events (how many
+# conflicts, how stale an item is, how many competing theories), not judging
+# any single new statement, which is a genuinely different question from
+# what should_speak_aloud answers above. Cheap enough to run every turn.
+#
+# Deliberately scoped to what the current schema actually supports rather
+# than the full design: a "previously-confirmed fact gets recontradicted"
+# pattern needs tentative/confirmed promotion tracking this schema doesn't
+# have yet (facts are a flat list, no confidence state), so it's left out
+# here rather than faked with a fragile text-matching heuristic.
+# -----------------------------------------------------------------------------
+
+CONFLICT_PILEUP_THRESHOLD = 2
+CONFLICT_PILEUP_WINDOW_MINUTES = 5
+
+HYPOTHESIS_CLUSTER_THRESHOLD = 3
+HYPOTHESIS_CLUSTER_WINDOW_MINUTES = 5
+
+STALE_ACTION_ITEM_MINUTES = 5
+
+HEALTH_SCORE_DROP_THRESHOLD = 20
+HEALTH_SCORE_HISTORY_LOOKBACK = 5
+HEALTH_SCORE_HISTORY_MAX_LEN = 20
+
+
+def _recent_timeline_entries(timeline: List[dict], entry_type: str, window_minutes: int) -> List[dict]:
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    recent = []
+    for entry in timeline:
+        if entry.get("type") != entry_type:
+            continue
+        try:
+            ts = datetime.fromisoformat(entry["timestamp"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if ts >= cutoff:
+            recent.append(entry)
+    return recent
+
+
+def _stale_unowned_action_item(structured_state: dict) -> Optional[dict]:
+    """
+    Matches an action item back to its timeline entry by text to find when
+    it was recorded -- action_items themselves aren't individually
+    timestamped, only their timeline entry is. Fragile if two items share
+    identical text; acceptable at this scope, not worth a schema change to
+    fully solve tonight.
+    """
+    timeline_ts_by_text = {
+        e["text"]: e.get("timestamp")
+        for e in structured_state.get("timeline", [])
+        if e.get("type") == "action_item"
+    }
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_ACTION_ITEM_MINUTES)
+    for item in structured_state.get("action_items", []):
+        if item.get("owner") or item.get("owner_uid"):
+            continue
+        ts_str = timeline_ts_by_text.get(item.get("text"))
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        if ts <= cutoff:
+            return item
+    return None
+
+
+def evaluate_call_patterns(structured_state: dict) -> Optional[dict]:
+    """
+    Checked in priority order, first match wins -- returns None if nothing
+    fired. Only called when should_speak_aloud's turn-level checks (an
+    explicit conflict/missing-info/wake-word this turn) already decided
+    not to speak, so a pattern nudge never competes with something more
+    directly relevant to what was just said.
+    """
+    timeline = structured_state.get("timeline", [])
+
+    if len(_recent_timeline_entries(timeline, "conflict", CONFLICT_PILEUP_WINDOW_MINUTES)) >= CONFLICT_PILEUP_THRESHOLD:
+        return {
+            "pattern": "conflict_pileup",
+            "message": "We've got a few open questions piling up -- want to pause and reconcile before moving on?",
+        }
+
+    stale_item = _stale_unowned_action_item(structured_state)
+    if stale_item:
+        return {
+            "pattern": "stale_action_item",
+            "message": f"Just checking in -- \"{stale_item['text']}\" still doesn't have an owner. Can someone take that?",
+        }
+
+    if len(_recent_timeline_entries(timeline, "hypothesis", HYPOTHESIS_CLUSTER_WINDOW_MINUTES)) >= HYPOTHESIS_CLUSTER_THRESHOLD:
+        return {
+            "pattern": "confusion_cluster",
+            "message": "A few different theories have come up in the last few minutes -- want to narrow down to one to test first?",
+        }
+
+    return None
+
+
+def compute_coordination_health_score(structured_state: dict) -> int:
+    """
+    0-100, higher is healthier -- a rough aggregate over open conflicts,
+    missing-info gaps, unowned action items, and time since the last
+    decision. The same idea data-observability tools use to reduce many
+    raw signals into one number worth acting on, pointed at the room's own
+    coordination instead of the payment system it's discussing. Weights
+    are a judgment call, not derived from anything measured; deliberately
+    simple and code-computed rather than model-judged, so it's at least
+    consistent and explainable.
+    """
+    score = 100
+    score -= 15 * len(structured_state.get("conflicts", []))
+    score -= 10 * len(structured_state.get("missing_info", []))
+
+    timeline = structured_state.get("timeline", [])
+    decision_timestamps = []
+    for e in timeline:
+        if e.get("type") != "decision":
+            continue
+        try:
+            decision_timestamps.append(datetime.fromisoformat(e["timestamp"]))
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    if decision_timestamps:
+        minutes_since = (datetime.now(timezone.utc) - max(decision_timestamps)).total_seconds() / 60
+        if minutes_since > 10:
+            score -= 15
+    elif timeline:
+        # No decision at all yet -- mild penalty, not severe, since that's
+        # completely normal early in a call.
+        score -= 5
+
+    unowned_items = sum(
+        1 for item in structured_state.get("action_items", [])
+        if not (item.get("owner") or item.get("owner_uid"))
+    )
+    score -= 5 * unowned_items
+
+    return max(0, min(100, score))
+
+
+def detect_health_score_drop(structured_state: dict) -> bool:
+    """
+    A SHARP DROP, not a static low value -- a call that's held steady at
+    60 all along isn't an emergency; one that just fell from 90 to 55 in a
+    few turns is. Needs history (see iCall_service.record_health_score),
+    since a single snapshot can't tell a drop from a call that started low.
+    """
+    history = structured_state.get("health_score_history", [])
+    if len(history) < 2:
+        return False
+    recent = history[-HEALTH_SCORE_HISTORY_LOOKBACK:]
+    peak = max(h["score"] for h in recent[:-1])
+    current = recent[-1]["score"]
+    return (peak - current) >= HEALTH_SCORE_DROP_THRESHOLD
+
+
+def build_health_recap(structured_state: dict) -> str:
+    """
+    Deterministic, not model-generated -- a status recap triggered by a
+    code-computed pattern shouldn't itself depend on another LLM call to
+    say something coherent about that same state.
+    """
+    facts_n = len(structured_state.get("facts", []))
+    hyp_n = len(structured_state.get("hypotheses", []))
+    items_n = len(structured_state.get("action_items", []))
+    conflicts_n = len(structured_state.get("conflicts", []))
+    return (
+        f"Quick status check -- {facts_n} facts confirmed, {hyp_n} open "
+        f"theories, {items_n} action items tracked, {conflicts_n} still unresolved."
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -440,26 +701,40 @@ async def classify_participant_roles(
 
     async with _gemini_semaphore:
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=PRIMARY_MODEL,
-                contents=prompt,
-                config=config,
-            )
-        except Exception:
-            try:
-                response = await asyncio.to_thread(
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
                     client.models.generate_content,
-                    model=FALLBACK_MODEL,
+                    model=PRIMARY_MODEL,
                     contents=prompt,
                     config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            print(f"[iCall] Role classification primary call failed/timed out, trying fallback: {exc}")
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=FALLBACK_MODEL,
+                        contents=prompt,
+                        config=config,
+                    ),
+                    timeout=GEMINI_CALL_TIMEOUT_S,
                 )
-            except Exception:
+            except Exception as exc2:
+                # Runs once, at call end, with no retry beyond this -- a
+                # silent failure here means role recognition for this call
+                # is permanently empty with nothing in the logs to explain
+                # why. Caught by a dry run that happened to hit a transient
+                # failure with no visible cause until this was added.
+                print(f"[iCall] Role classification failed on both attempts, leaving roles unresolved: {exc2}")
                 return CallRoleClassification()
 
     try:
         return CallRoleClassification.model_validate_json(response.text)
-    except Exception:
+    except Exception as exc:
+        print(f"[iCall] Role classification response didn't match schema, leaving roles unresolved: {exc}")
         return CallRoleClassification()
 
 
@@ -529,26 +804,35 @@ async def assign_action_item_owners(
 
     async with _gemini_semaphore:
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=PRIMARY_MODEL,
-                contents=prompt,
-                config=config,
-            )
-        except Exception:
-            try:
-                response = await asyncio.to_thread(
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
                     client.models.generate_content,
-                    model=FALLBACK_MODEL,
+                    model=PRIMARY_MODEL,
                     contents=prompt,
                     config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            print(f"[iCall] Owner assignment primary call failed/timed out, trying fallback: {exc}")
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=FALLBACK_MODEL,
+                        contents=prompt,
+                        config=config,
+                    ),
+                    timeout=GEMINI_CALL_TIMEOUT_S,
                 )
-            except Exception:
+            except Exception as exc2:
+                print(f"[iCall] Owner assignment failed on both attempts, leaving items unassigned: {exc2}")
                 return ActionItemOwnerAssignments()
 
     try:
         return ActionItemOwnerAssignments.model_validate_json(response.text)
-    except Exception:
+    except Exception as exc:
+        print(f"[iCall] Owner assignment response didn't match schema, leaving items unassigned: {exc}")
         return ActionItemOwnerAssignments()
 
 
@@ -608,26 +892,35 @@ async def summarize_unresolved_risks(structured_state: dict) -> UnresolvedRisksS
 
     async with _gemini_semaphore:
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=PRIMARY_MODEL,
-                contents=prompt,
-                config=config,
-            )
-        except Exception:
-            try:
-                response = await asyncio.to_thread(
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
                     client.models.generate_content,
-                    model=FALLBACK_MODEL,
+                    model=PRIMARY_MODEL,
                     contents=prompt,
                     config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            print(f"[iCall] Unresolved-risks primary call failed/timed out, trying fallback: {exc}")
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=FALLBACK_MODEL,
+                        contents=prompt,
+                        config=config,
+                    ),
+                    timeout=GEMINI_CALL_TIMEOUT_S,
                 )
-            except Exception:
+            except Exception as exc2:
+                print(f"[iCall] Unresolved-risks summary failed on both attempts, leaving risks empty: {exc2}")
                 return UnresolvedRisksSummary()
 
     try:
         return UnresolvedRisksSummary.model_validate_json(response.text)
-    except Exception:
+    except Exception as exc:
+        print(f"[iCall] Unresolved-risks response didn't match schema, leaving risks empty: {exc}")
         return UnresolvedRisksSummary()
 
 
