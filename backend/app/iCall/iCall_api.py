@@ -34,6 +34,10 @@ from .iCall_utils import (
     generate_structuring_update,
     describe_event_type,
     verify_agora_signature,
+    format_live_recap,
+    build_silence_prompt,
+    get_live_participant_count,
+    _is_silence_trigger,
     CALL_STATUS_COMPLETED,
     CLOSING_LINE,
 )
@@ -202,6 +206,26 @@ async def list_chat_notes_endpoint(
     return {"code": 0, "data": notes, "msg": "success"}
 
 
+@router.get("/channel/{channel_name}/recap")
+async def get_live_recap_endpoint(
+    channel_name: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Plain-text catch-up of the call's structured_state so far, for a
+    participant joining mid-discussion. Called by the voice-agent service
+    (not the browser) right after a late joiner registers their name --
+    see voice-agent/server/src/server.py's set_name. Channel-keyed for the
+    same reason as chat-notes: the caller only knows the channel name.
+    """
+    call = await get_call_by_channel_name(db, channel_name)
+    if not call:
+        raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
+
+    recap = format_live_recap(call.structured_state or {})
+    return {"code": 0, "data": {"recap": recap}, "msg": "success"}
+
+
 @router.get("/{call_id}/utterances", response_model=List[CallUtteranceRead])
 async def list_utterances_endpoint(
     call_id: int,
@@ -252,16 +276,27 @@ async def chat_completions_endpoint(
     if call is None:
         raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
 
-    incident = await get_incident(db, call.incident_id)
-    service = incident.service if incident else None
+    if _is_silence_trigger(payload.messages):
+        # The room's gone quiet -- this isn't real speech to extract facts
+        # from, so skip generate_structuring_update entirely. Stay silent
+        # when there's nobody to nudge (a lone participant), otherwise say
+        # something shaped by how far the call has actually gotten.
+        participant_count = await get_live_participant_count(channel_name)
+        if participant_count is not None and participant_count <= 1:
+            spoken_reply = ""
+        else:
+            spoken_reply = build_silence_prompt(call.structured_state or {})
+    else:
+        incident = await get_incident(db, call.incident_id)
+        service = incident.service if incident else None
 
-    update = await generate_structuring_update(payload.messages, call.structured_state or {}, service)
-    await apply_structuring_update(db, call, update)
+        update = await generate_structuring_update(payload.messages, call.structured_state or {}, service)
+        await apply_structuring_update(db, call, update)
 
-    # The LLM only detects *that* the room sounds like it's wrapping up;
-    # the actual words are ours, not a paraphrase, so what's promised about
-    # Slack/Jira is always accurate.
-    spoken_reply = CLOSING_LINE if update.is_wrapping_up else update.spoken_reply
+        # The LLM only detects *that* the room sounds like it's wrapping up;
+        # the actual words are ours, not a paraphrase, so what's promised
+        # about Slack/Jira is always accurate.
+        spoken_reply = CLOSING_LINE if update.is_wrapping_up else update.spoken_reply
 
     async def event_stream():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"

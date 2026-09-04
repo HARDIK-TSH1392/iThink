@@ -88,6 +88,68 @@ CLOSING_LINE = (
     "tracking tickets on Jira."
 )
 
+# Matches SILENCE_TRIGGER_MARKER in voice-agent/server/src/agent.py, set as
+# parameters.silence_config.content there with action="think" -- Agora
+# appends it as the last message and routes the whole conversation through
+# our custom LLM (this proxy) instead of speaking it directly. An inert
+# control string, never something a real participant would say, so an exact
+# match on the last message is a reliable, zero-cost way to tell "the room
+# went quiet" apart from a real turn.
+SILENCE_TRIGGER_MARKER = "[[ithink-silence-check]]"
+
+
+def _is_silence_trigger(messages: List[ChatMessage]) -> bool:
+    return bool(messages) and messages[-1].content.strip() == SILENCE_TRIGGER_MARKER
+
+
+def build_silence_prompt(structured_state: dict) -> str:
+    """
+    Deterministic, transcript-aware line for when the room's gone quiet --
+    same "don't let an LLM call reinvent this" discipline as CLOSING_LINE
+    and format_call_summary/format_live_recap: the facts/hypotheses/
+    decisions were already extracted live by generate_structuring_update,
+    so what to say about "how far we've gotten" doesn't need a fresh model
+    call, just a read of what's already recorded.
+
+    Nothing recorded yet (no facts, hypotheses, or decisions) means the
+    room hasn't actually made progress -- say so plainly and ask for
+    something to work with, rather than the generic "anyone have more to
+    add" that only makes sense once there's something to add *to*.
+    """
+    state = structured_state or {}
+    has_progress = bool(
+        state.get("facts") or state.get("hypotheses") or state.get("decisions")
+    )
+    if not has_progress:
+        return (
+            "So far we haven't figured out the root cause or gathered any facts yet -- "
+            "can someone walk through what's actually happening?"
+        )
+    return "Does anyone else have any more points to contribute?"
+
+
+async def get_live_participant_count(channel_name: str) -> Optional[int]:
+    """
+    Queries voice-agent/server's own join registry (_channel_names) for how
+    many people are actually on the call right now. Used only to suppress
+    the silence nudge when there's nobody to nudge (a lone participant
+    talking to themselves gets no "does anyone have more to add?").
+
+    Returns None on any failure -- callers should treat that as "unknown"
+    and fail open (still nudge) rather than let a slow/unreachable
+    voice-agent service silently stop the agent from ever speaking up.
+    """
+    base = get_settings().voice_agent_server_url.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(f"{base}/getNames", params={"channel": channel_name})
+            response.raise_for_status()
+            names = response.json().get("data", {})
+    except Exception:
+        return None
+    return len(names) if isinstance(names, dict) else None
+
+
 STRUCTURING_SYSTEM_INSTRUCTION = """You are iThink, a voice participant in a live
 incident call. Your job is narrow, the same way it is for a human note-taker
 who also happens to be allowed to ask one question: keep the room's shared
@@ -595,6 +657,50 @@ EVENT_TYPE_NAMES = {
 
 def describe_event_type(event_type: int) -> str:
     return EVENT_TYPE_NAMES.get(event_type, f"unknown({event_type})")
+
+
+def format_live_recap(structured_state: dict) -> Optional[str]:
+    """
+    Plain-text catch-up message for someone joining a call already in
+    progress. Deterministic, no LLM call -- the data was already extracted
+    live by generate_structuring_update, this just renders it. Unlike
+    iOrchestrate's format_call_summary (Slack-flavored *bold* markup, meant
+    for the post-call channel post), this is meant to be dropped straight
+    into the in-call text chat, so it stays plain and short.
+
+    Returns None when nothing's been recorded yet (call just started, or
+    everyone present so far has only just joined) so callers can skip
+    sending a pointless "nothing to report" message to a joiner.
+    """
+    state = structured_state or {}
+    facts = state.get("facts", [])
+    hypotheses = state.get("hypotheses", [])
+    decisions = state.get("decisions", [])
+    action_items = state.get("action_items", [])
+
+    if not (facts or hypotheses or decisions or action_items):
+        return None
+
+    lines = ["Quick catch-up on what's been discussed so far:"]
+
+    def _section(title: str, items: List[str]) -> None:
+        if not items:
+            return
+        lines.append(f"\n{title}:")
+        for item in items:
+            lines.append(f"- {item}")
+
+    _section("Facts", facts)
+    _section("Working theories", hypotheses)
+    _section("Decisions", decisions)
+
+    if action_items:
+        lines.append("\nAction items:")
+        for item in action_items:
+            owner = item.get("owner") or "unassigned"
+            lines.append(f"- {item.get('text', '')} (owner: {owner})")
+
+    return "\n".join(lines)
 
 
 def verify_agora_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:

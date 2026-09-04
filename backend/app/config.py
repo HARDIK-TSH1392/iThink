@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     # pin here. Called over plain HTTP, same as Slack/Jira.
     github_mcp_service_url: str = "http://localhost:8003"
 
+    # voice-agent/server's own FastAPI service (agent lifecycle + the
+    # _channel_names join registry) -- called from the silence-trigger path
+    # in iCall_api.chat_completions_endpoint to check live participant count
+    # before nudging an empty room. Reverse direction of the usual call
+    # (voice-agent calls this backend, not the other way around), but same
+    # "separate local service, plain HTTP" pattern.
+    voice_agent_server_url: str = "http://localhost:8002"
+
     class Config:
         env_file = ".env"
 
