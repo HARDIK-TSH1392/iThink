@@ -430,7 +430,9 @@ async def chat_completions_endpoint(
                 call = await record_pattern_nudge(db, call, pattern["pattern"], pattern["message"])
             elif detect_health_score_drop(call.structured_state):
                 spoken_reply = build_health_recap(call.structured_state)
-                call = await record_pattern_nudge(db, call, "health_score_drop", spoken_reply)
+                call = await record_pattern_nudge(
+                    db, call, "health_score_drop", spoken_reply, score=health_score
+                )
             else:
                 # Ordinary turn, nothing urgent -- stay silent. The prompt
                 # already asks the model to keep these to "a brief

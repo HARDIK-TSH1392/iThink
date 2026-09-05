@@ -236,6 +236,22 @@ Hard constraints:
   or hypothesis already recorded in the state you were given below. Phrase
   it as one short, targeted clarifying question you would ask out loud —
   not a statement, not an accusation.
+- corrects_fact (optional): set this to the EXACT text of an existing fact
+  from the state given below, only when something said in THIS turn
+  directly resolves a contradiction as the room's now-confirmed answer
+  (e.g. an earlier "the outage is in the AC region" turns out to be wrong
+  once "confirmed, it's only Africa" is said). Must match the existing
+  fact's text exactly, character for character, or it's ignored — don't
+  paraphrase it. Leave null on ordinary turns. This is different from
+  "conflict": conflict is for flagging a contradiction as still an open
+  question; corrects_fact is for the later turn where the room has
+  actually settled it and the old fact is now simply wrong, not just
+  disputed.
+- action_items: when a specific person is named as responsible for a task
+  in this turn ("Rahul, can you check the logs", "I'll get Priya to look
+  at it"), set that item's owner to that name. Leave owner null when no
+  specific person was named — don't guess an owner from role, context, or
+  who seems most likely responsible.
 - identified_speakers: only include a name/role if someone actually
   introduced themselves in this turn (e.g. "this is Priya, on-call SRE").
   Do not guess who is speaking from tone or content alone.
@@ -257,12 +273,21 @@ Hard constraints:
   concluding (explicit goodbyes, "I think that covers it," "let's
   reconvene later") -- not merely because the conversation has been calm
   for a while.
-- spoken_reply is what you will say out loud right now. If there's a
-  conflict, spoken_reply should be that clarifying question. Otherwise keep
-  it to a brief, natural acknowledgment — you are a participant, not a
-  narrator repeating back everything you heard. If is_wrapping_up is true,
-  spoken_reply is ignored (the caller substitutes a fixed closing line) --
-  don't spend effort crafting one.
+- spoken_reply is what you will say out loud right now, shaped by whichever
+  specific reason this turn will actually be spoken — never default to a
+  generic acknowledgment ("okay, noted") when one of these applies instead:
+  - If there's a conflict, spoken_reply should be that clarifying question.
+  - If missing_info is set, spoken_reply should directly ask for that
+    missing piece, not just acknowledge something's unclear.
+  - If this turn recorded a new action item with an owner, spoken_reply
+    should briefly confirm the assignment (e.g. "Got it, Rahul's on that.").
+  - If this turn was a direct question addressed to you, answer it.
+  - Otherwise, this turn likely won't be spoken at all (a deterministic
+    gate decides that, not you) — keep spoken_reply minimal rather than
+    spending effort on a generic acknowledgment for content that's about
+    to be discarded anyway.
+  If is_wrapping_up is true, spoken_reply is ignored regardless of the
+  above (the caller substitutes a fixed closing line).
 - A turn that's just a greeting or social opener ("hello", "hi", "hey",
   "anyone there?") with no actual content yet has nothing to extract --
   leave facts/hypotheses/decisions/action_items/missing_info empty and
@@ -541,9 +566,13 @@ async def generate_structuring_update(
 # that a fact is computed in code rather than asserted by the LLM.
 #
 # Deliberately narrow and reusing fields that already exist (conflict,
-# missing_info, is_wrapping_up) rather than inventing new signals under time
-# pressure. Two known non-goals, on purpose: no periodic "recap" timer here
-# (voice-agent's own silence_config already prompts the room after 15s of
+# missing_info, action_items, is_wrapping_up) rather than inventing new
+# signals under time pressure. The action_items check exists specifically
+# because the problem statement names it: "Proposes owners in speech" --
+# an item with a newly-set owner is speak-worthy on its own, independent
+# of whether this turn also happens to have a conflict or missing_info.
+# Two known non-goals, on purpose: no periodic "recap" timer here
+# (voice-agent's own silence_config already prompts the room after 30s of
 # true dead air -- a different, complementary mechanism, not duplicated),
 # and no dedup on repeated missing_info gaps (the system prompt already
 # scopes missing_info to "the room itself is missing" on THIS turn, not a
@@ -569,6 +598,8 @@ def should_speak_aloud(update: StructuringUpdate, latest_user_message: Optional[
     if update.conflict:
         return True
     if update.missing_info:
+        return True
+    if any(item.owner for item in update.action_items):
         return True
     if latest_user_message and _is_direct_address(latest_user_message):
         return True
@@ -729,6 +760,14 @@ def detect_health_score_drop(structured_state: dict) -> bool:
     60 all along isn't an emergency; one that just fell from 90 to 55 in a
     few turns is. Needs history (see iCall_service.record_health_score),
     since a single snapshot can't tell a drop from a call that started low.
+
+    Re-nudges only if things have gotten WORSE since the last nudge, not
+    on every turn the score merely stays below some historical peak.
+    Confirmed live (incident-26): with no such check, this fired on 2-3
+    consecutive qualifying turns with nothing new to report, repeating
+    the identical recap -- the opposite of "at appropriate moments" from
+    the brief. last_health_score_drop_nudge_score is set by
+    iCall_service.record_pattern_nudge each time this actually speaks.
     """
     history = structured_state.get("health_score_history", [])
     if len(history) < 2:
@@ -736,7 +775,12 @@ def detect_health_score_drop(structured_state: dict) -> bool:
     recent = history[-HEALTH_SCORE_HISTORY_LOOKBACK:]
     peak = max(h["score"] for h in recent[:-1])
     current = recent[-1]["score"]
-    return (peak - current) >= HEALTH_SCORE_DROP_THRESHOLD
+    if (peak - current) < HEALTH_SCORE_DROP_THRESHOLD:
+        return False
+    last_nudge_score = structured_state.get("last_health_score_drop_nudge_score")
+    if last_nudge_score is not None and current >= last_nudge_score:
+        return False
+    return True
 
 
 def build_health_recap(structured_state: dict) -> str:

@@ -242,20 +242,23 @@ class Agent:
                     },
                 },
             },
-            # Humans on an incident call mostly talk to *each other*, not
-            # the agent -- without this, any cross-talk while the agent is
-            # replying cuts it off mid-sentence. Only these keywords
-            # actually interrupt; everything else said while it's talking
-            # is queued ("append") and handled after, not dropped.
-            # NOT YET LIVE-VERIFIED alongside turn_detection above -- best
-            # understanding from the SDK schema is that turn_detection
-            # governs speech *detection* and this governs whether detected
-            # speech actually interrupts playback, but that interaction
-            # hasn't been watched fire on a real call yet.
+            # Real, live-observed bug in the previous config: `enable` was
+            # never set, and `disabled_config` (per the SDK's own schema)
+            # only applies when `enable` is false -- it does NOT govern
+            # "what happens for non-keyword speech" under keywords mode,
+            # which is what this was written to assume. With `enable`
+            # unset, interruption plausibly never activated at all,
+            # matching what was actually observed live: the agent kept
+            # talking through cross-talk regardless of what was said.
+            # start_of_speech is also just a better fit than keywords for
+            # an incident call -- people interject by talking, not by
+            # saying "stop"/"wait"/"ithink" first. keywords_config and
+            # disabled_config are dropped since neither applies once
+            # enable=true and mode=start_of_speech (the schema scopes both
+            # to modes/states this config no longer uses).
             interruption={
-                "mode": "keywords",
-                "keywords_config": {"trigger_keywords": ["ithink", "stop", "hold on", "wait"]},
-                "disabled_config": {"strategy": "append"},
+                "enable": True,
+                "mode": "start_of_speech",
             },
             # Fills dead air while Gemini is generating a structuring
             # response -- a plain wait can be a second or more. 1200ms was

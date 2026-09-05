@@ -134,6 +134,14 @@ class StructuringUpdate(BaseModel):
     # floated) and from a conflict (two things said that contradict).
     missing_info: List[str] = Field(default_factory=list)
     conflict: Optional[str] = None
+    # Exact text of an existing fact this turn's new information supersedes
+    # (e.g. the room confirms an earlier "outage is in the AC region" was
+    # wrong). Distinct from conflict: conflict flags a contradiction as
+    # still an open question; this is for the later turn that actually
+    # resolves it. iCall_service.apply_structuring_update only acts on
+    # this when it matches an existing fact's text exactly -- otherwise
+    # it's ignored, never used to guess which fact was meant.
+    corrects_fact: Optional[str] = None
     identified_speakers: List[str] = Field(default_factory=list)
     is_wrapping_up: bool = False
     spoken_reply: str
