@@ -136,6 +136,23 @@ export default function ConversationComponent({
 	const [rawTranscript, setRawTranscript] = useState<
 		TranscriptHelperItem<Partial<UserTranscription | AgentTranscription>>[]
 	>([]);
+	// Own accumulator, keyed by (uid, turn_id), independent of the toolkit's
+	// internal chatHistory -- confirmed live (incident-38) that unsubscribe()
+	// (called by resubscribeTranscript below, itself added to recover from a
+	// stalled transcript feed) hard-resets that internal history to []
+	// (SubRenderQueue.reset() in the installed toolkit's source, called from
+	// CovSubRenderController.cleanup()). Every resubscribe -- including a
+	// perfectly healthy one firing on ordinary silence, which the time-based
+	// watchdog can't tell apart from a genuine stall -- was therefore wiping
+	// everything already on screen, even though the backend had the full
+	// transcript intact the whole time (call_utterances never lost anything,
+	// only the live display did). Merging every TRANSCRIPT_UPDATED payload
+	// into this ref instead of replacing rawTranscript wholesale means a
+	// reset toolkit history only ever adds to what's already shown, never
+	// erases it.
+	const transcriptByKeyRef = useRef<
+		Map<string, TranscriptHelperItem<Partial<UserTranscription | AgentTranscription>>>
+	>(new Map());
 	const [agentState, setAgentState] = useState<AgentState | null>(null);
 	const [agentMetrics, setAgentMetrics] = useState<QuickstartAgentMetric[]>([]);
 	const [connectionIssues, setConnectionIssues] = useState<ConnectionIssue[]>(
@@ -346,7 +363,12 @@ export default function ConversationComponent({
 				}
 
 				ai.on(AgoraVoiceAIEvents.TRANSCRIPT_UPDATED, (t) => {
-					setRawTranscript([...t]);
+					for (const item of t) {
+						transcriptByKeyRef.current.set(`${item.uid}-${item.turn_id}`, item);
+					}
+					setRawTranscript(
+						Array.from(transcriptByKeyRef.current.values()).sort((a, b) => a._time - b._time),
+					);
 				});
 				ai.on(AgoraVoiceAIEvents.AGENT_STATE_CHANGED, (_, event) =>
 					setAgentState(event.state),
