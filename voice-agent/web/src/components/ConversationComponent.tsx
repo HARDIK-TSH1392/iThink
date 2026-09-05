@@ -631,15 +631,8 @@ export default function ConversationComponent({
 	// above (destroy() would remove those instead) and doesn't touch the
 	// live RTC/RTM connection, so this is much lower-risk than forcing an
 	// actual leave+rejoin of the call.
-	const prevConnectionStateRef = useRef(connectionState);
 	const lastResubscribeAtRef = useRef(0);
-	useEffect(() => {
-		const prevState = prevConnectionStateRef.current;
-		prevConnectionStateRef.current = connectionState;
-
-		const wasInterrupted = prevState === "RECONNECTING" || prevState === "DISCONNECTED";
-		if (connectionState !== "CONNECTED" || !wasInterrupted) return;
-
+	const resubscribeTranscript = useCallback(() => {
 		// Guards against re-triggering on rapid reconnect/connect flapping --
 		// one resubscribe per interruption is enough, and doing it too often
 		// risks racing a message that arrives in the brief unsubscribed gap.
@@ -653,9 +646,55 @@ export default function ConversationComponent({
 			ai.unsubscribe();
 			ai.subscribeMessage(agoraData.channel);
 		} catch (error) {
-			console.error("[AgoraVoiceAI] Failed to resubscribe after reconnect:", error);
+			console.error("[AgoraVoiceAI] Failed to resubscribe transcript delivery:", error);
 		}
-	}, [connectionState, agoraData.channel]);
+	}, [agoraData.channel]);
+
+	const prevConnectionStateRef = useRef(connectionState);
+	useEffect(() => {
+		const prevState = prevConnectionStateRef.current;
+		prevConnectionStateRef.current = connectionState;
+
+		const wasInterrupted = prevState === "RECONNECTING" || prevState === "DISCONNECTED";
+		if (connectionState !== "CONNECTED" || !wasInterrupted) return;
+		resubscribeTranscript();
+	}, [connectionState, resubscribeTranscript]);
+
+	// Watchdog for the same stall by a different trigger -- confirmed live
+	// (incident-33): a "ws open error" on the RTM/transcript channel left
+	// transcript delivery dead for an entire call while the RTC client's own
+	// connectionState sat at CONNECTED throughout (never cycled through
+	// RECONNECTING/DISCONNECTED), so the effect above never fired. Real
+	// speech WAS happening -- the backend logged 8 real structuring turns
+	// for that call -- only the browser-side transcript feed was dead.
+	//
+	// agora-agent-client-toolkit already detects this exact condition (zero
+	// TRANSCRIPT_UPDATED events) and logs it, but only once, 15s after
+	// joining, as a console.warn with no consumer-facing event to hook into
+	// (checked the installed package directly). This reimplements the same
+	// idea ourselves, running for the whole call rather than once at join,
+	// since the observed stall started mid-call, not at the start.
+	const lastTranscriptAtRef = useRef(Date.now());
+	useEffect(() => {
+		lastTranscriptAtRef.current = Date.now();
+	}, [messageList.length]);
+
+	useEffect(() => {
+		const TRANSCRIPT_STALL_MS = 25_000;
+		const CHECK_INTERVAL_MS = 5_000;
+		const interval = setInterval(() => {
+			if (!isAgentConnected) return;
+			if (Date.now() - lastTranscriptAtRef.current < TRANSCRIPT_STALL_MS) return;
+			console.warn(
+				`[AgoraVoiceAI] No transcript activity for ${TRANSCRIPT_STALL_MS}ms while the agent is connected -- forcing a resubscribe`,
+			);
+			resubscribeTranscript();
+			// Give the resubscribe a full window to take effect before
+			// considering it stalled again, rather than retrying every tick.
+			lastTranscriptAtRef.current = Date.now();
+		}, CHECK_INTERVAL_MS);
+		return () => clearInterval(interval);
+	}, [isAgentConnected, resubscribeTranscript]);
 
 	// Agora's own uplink/downlink quality signal (0=unknown, 1=excellent,
 	// ..., 6=disconnected), fired ~every 2s once joined. Surfaced so a poor
