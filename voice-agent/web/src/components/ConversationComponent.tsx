@@ -1,6 +1,6 @@
 "use client";
 
-import { MicOff, Sparkles } from "lucide-react";
+import { Hand, MicOff, Sparkles } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ConnectionStatusPanel } from "@/components/ConnectionStatusPanel";
@@ -110,6 +110,28 @@ function isSharedScreenBroadcast(value: unknown): value is SharedScreenBroadcast
 		typeof value === "object" &&
 		(value as { type?: unknown }).type === "ithink_shared_screen" &&
 		!!(value as { screen?: unknown }).screen
+	);
+}
+
+// Peer-to-peer, not backend-mediated -- unlike the shared-screen broadcast
+// above (pushed server-side via the Signaling REST API), a raised hand is
+// purely ephemeral client UI state with nothing worth persisting, so each
+// client publishes this directly to the RTM channel itself (see
+// toggleHandRaise) and every other subscribed client's own "message"
+// listener picks it up the same way it already does for shared screens.
+type HandRaiseBroadcast = {
+	type: "ithink_hand_raise";
+	uid: string;
+	raised: boolean;
+};
+
+function isHandRaiseBroadcast(value: unknown): value is HandRaiseBroadcast {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		(value as { type?: unknown }).type === "ithink_hand_raise" &&
+		typeof (value as { uid?: unknown }).uid === "string" &&
+		typeof (value as { raised?: unknown }).raised === "boolean"
 	);
 }
 
@@ -270,6 +292,63 @@ export default function ConversationComponent({
 			rtmClient.removeEventListener("message", handleSharedScreenMessage);
 		};
 	}, [rtmClient]);
+
+	// Raised hands, keyed by uid string -- includes the local participant's
+	// own uid so tiles.map below can treat every tile the same way rather
+	// than special-casing "am I the local tile." toggleHandRaise updates
+	// this optimistically for the local uid (no round trip needed to know
+	// your own state) and separately publishes it for everyone else.
+	const [raisedHandUids, setRaisedHandUids] = useState<Set<string>>(new Set());
+
+	useEffect(() => {
+		const handleHandRaiseMessage = (event: { message: string | Uint8Array }) => {
+			const payloadText =
+				typeof event.message === "string" ? event.message : new TextDecoder().decode(event.message);
+
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(payloadText);
+			} catch {
+				return;
+			}
+
+			if (!isHandRaiseBroadcast(parsed)) return;
+
+			setRaisedHandUids((prev) => {
+				const next = new Set(prev);
+				if (parsed.raised) next.add(parsed.uid);
+				else next.delete(parsed.uid);
+				return next;
+			});
+		};
+
+		rtmClient.addEventListener("message", handleHandRaiseMessage);
+		return () => {
+			rtmClient.removeEventListener("message", handleHandRaiseMessage);
+		};
+	}, [rtmClient]);
+
+	const toggleHandRaise = useCallback(async () => {
+		const uidStr = String(agoraData.uid);
+		const next = !raisedHandUids.has(uidStr);
+
+		setRaisedHandUids((prev) => {
+			const updated = new Set(prev);
+			if (next) updated.add(uidStr);
+			else updated.delete(uidStr);
+			return updated;
+		});
+
+		try {
+			await rtmClient.publish(
+				agoraData.channel,
+				JSON.stringify({ type: "ithink_hand_raise", uid: uidStr, raised: next }),
+				{ channelType: "MESSAGE" },
+			);
+		} catch (error) {
+			console.error("Failed to broadcast hand-raise state:", error);
+		}
+	}, [agoraData.channel, agoraData.uid, raisedHandUids, rtmClient]);
 
 	const [isReady, setIsReady] = useState(false);
 	useEffect(() => {
@@ -978,6 +1057,7 @@ export default function ConversationComponent({
 										isAgent: false,
 										speaking: speakingUids.has(String(localUid)) && isEnabled,
 										muted: !isEnabled,
+										handRaised: raisedHandUids.has(String(localUid)),
 									},
 									...remoteUsers.map((user) => {
 										const isAgent = String(user.uid) === String(agentUID);
@@ -997,6 +1077,7 @@ export default function ConversationComponent({
 											// perspective -- the indicator only means something for
 											// actual meeting members.
 											muted: isAgent ? false : remoteMutedUids.has(String(user.uid)),
+											handRaised: isAgent ? false : raisedHandUids.has(String(user.uid)),
 										};
 									}),
 								];
@@ -1028,6 +1109,15 @@ export default function ConversationComponent({
 												<span className="sr-only">{tile.label} is muted</span>
 											</span>
 										) : null}
+										{tile.handRaised ? (
+											<span
+												className="absolute -top-1 -right-1 flex h-7 w-7 items-center justify-center rounded-full bg-amber-500 text-white ring-2 ring-card"
+												title={`${tile.label} raised their hand`}
+											>
+												<Hand className="h-3.5 w-3.5" aria-hidden="true" />
+												<span className="sr-only">{tile.label} raised their hand</span>
+											</span>
+										) : null}
 									</div>
 									<span className="max-w-full truncate text-sm font-medium text-foreground">
 										{tile.label}
@@ -1057,6 +1147,20 @@ export default function ConversationComponent({
 							/>
 						</div>
 						<MicrophoneSelector localMicrophoneTrack={localMicrophoneTrack} />
+						<button
+							type="button"
+							onClick={toggleHandRaise}
+							aria-pressed={raisedHandUids.has(String(agoraData.uid))}
+							aria-label={raisedHandUids.has(String(agoraData.uid)) ? "Lower hand" : "Raise hand"}
+							title={raisedHandUids.has(String(agoraData.uid)) ? "Lower hand" : "Raise hand"}
+							className={`flex h-11 w-11 items-center justify-center rounded-full border transition-colors ${
+								raisedHandUids.has(String(agoraData.uid))
+									? "border-amber-500 bg-amber-500/15 text-amber-500"
+									: "border-border bg-card text-foreground hover:bg-muted"
+							}`}
+						>
+							<Hand className="h-5 w-5" strokeWidth={1.75} aria-hidden="true" />
+						</button>
 					</fieldset>
 				}
 				chatPanel={
