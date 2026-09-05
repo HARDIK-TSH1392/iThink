@@ -57,6 +57,7 @@ from .iCall_utils import (
     build_correction_callout,
     build_keyterms,
     CALL_STATUS_COMPLETED,
+    EVENT_AGENT_LEFT,
     CLOSING_LINE,
     FALLBACK_REPLY,
     MODEL_UNAVAILABLE_REPLY,
@@ -718,7 +719,7 @@ async def chat_completions_endpoint(
 
 
 @router.post("/webhooks/agora")
-async def agora_webhook_endpoint(request: Request):
+async def agora_webhook_endpoint(request: Request, db: AsyncSession = Depends(get_db)):
     """
     Registered in Agora Console -> Project -> notification config (needs a
     public HTTPS URL, so this can't be exercised against a real event until
@@ -727,9 +728,20 @@ async def agora_webhook_endpoint(request: Request):
     loud warning when it isn't, so local dev isn't blocked on a secret that
     can't exist yet without a registered webhook.
 
-    No structuring logic wired to events yet — this just proves receipt and
-    logs what arrived, the same "prove the wire, not the logic yet" shape as
-    the chat-completions endpoint above.
+    EVENT_AGENT_LEFT is the only event wired to real behavior: it's Agora's
+    own authoritative "the agent actually stopped" signal, a second, more
+    reliable path to _apply_status_transition than the client PATCHing call
+    status on /channel/{channel_name}/status. That client path misses a
+    crashed tab or a dropped connection entirely -- the agent leaves the
+    channel, but nothing ever tells this backend the call ended, so role
+    inference, ownership assignment, the Slack summary, and the Jira-
+    approval gate all silently never run. This closes that gap without
+    touching the existing client path (still fires first in the common
+    case; _apply_status_transition's was_already_completed guard makes
+    the webhook's later call a no-op rather than a duplicate notification).
+
+    Other event types (dialogue history, agent error, etc.) are only logged
+    for now -- same "prove the wire, not the logic yet" shape as before.
     """
     raw_body = await request.body()
     settings = get_settings()
@@ -750,6 +762,17 @@ async def agora_webhook_endpoint(request: Request):
         f"[iCall webhook] {describe_event_type(event.eventType)} "
         f"noticeId={event.noticeId} payload={event.payload}"
     )
+
+    if event.eventType == EVENT_AGENT_LEFT:
+        channel_name = event.payload.get("channel")
+        if channel_name:
+            call = await get_call_by_channel_name(db, channel_name)
+            if call:
+                await _apply_status_transition(db, call, CALL_STATUS_COMPLETED)
+            else:
+                print(f"[iCall webhook] agent_left for unknown channel={channel_name!r} -- no matching call")
+        else:
+            print(f"[iCall webhook] agent_left payload missing 'channel': {event.payload}")
 
     # Agora expects 200 OK; an un-acked webhook gets retried.
     return {"status": "received"}
