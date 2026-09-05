@@ -19,7 +19,7 @@ import {
 import { QuickstartTranscriptPanel } from "@/components/QuickstartTranscriptPanel";
 import { McpResponseTile } from "@/components/McpResponseTile";
 import { DEFAULT_AGENT_UID } from "@/lib/agora";
-import { playJoinChime } from "@/lib/joinChime";
+import { playHandRaiseChime, playJoinChime } from "@/lib/chimes";
 import {
 	type ChatNote,
 	type SharedScreen,
@@ -313,6 +313,10 @@ export default function ConversationComponent({
 			}
 
 			if (!isHandRaiseBroadcast(parsed)) return;
+
+			// Only chime on a hand going UP -- lowering one is a quiet
+			// action, nothing worth a sound for.
+			if (parsed.raised) playHandRaiseChime();
 
 			setRaisedHandUids((prev) => {
 				const next = new Set(prev);
