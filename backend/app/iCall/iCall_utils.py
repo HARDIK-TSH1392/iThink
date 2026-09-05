@@ -1163,6 +1163,7 @@ def build_health_recap(structured_state: dict) -> str:
 ROLE_CATEGORIES = [
     "backend_engineer",
     "frontend_engineer",
+    "ai_engineer",
     "devops",
     "team_lead",
     "manager",
