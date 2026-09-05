@@ -28,7 +28,7 @@ stop_one() {
 }
 
 echo "Stopping tracked services..."
-for svc in tunnel-backend tunnel-frontend backend voiceagent dashboard; do
+for svc in tunnel-backend tunnel-frontend backend voiceagent voiceagent-backend voiceagent-frontend dashboard; do
   stop_one "$svc"
 done
 
@@ -42,6 +42,7 @@ pkill -f "uvicorn app.main:app.*--port 8123" 2>/dev/null || true
 pkill -f "concurrently -n backend,frontend" 2>/dev/null || true
 pkill -f "python src/server.py" 2>/dev/null || true
 pkill -f "next dev --webpack" 2>/dev/null || true
+pkill -f "next start" 2>/dev/null || true
 pkill -f "next-server" 2>/dev/null || true
 pkill -f "http.server 8080" 2>/dev/null || true
 pkill -f "cloudflared tunnel --url http://localhost:8123" 2>/dev/null || true

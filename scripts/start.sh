@@ -6,9 +6,20 @@
 # every place that needs them (backend/.env, voice-agent/server/.env,
 # demo/dashboard.html, voice-agent/web/next.config.ts).
 #
+# Pass --prod to run the frontend as a production build (`next build` +
+# `next start`) instead of `next dev`. Dev mode's HMR/Fast Refresh/file
+# watching is a real, constant CPU cost -- confirmed live as a likely
+# contributor to SEND_AUDIO_BITRATE_TOO_LOW when the call is joined from
+# the same machine running the dev servers (the browser's real-time audio
+# encoder loses CPU time to it). --prod has none of that, and is closer
+# to what a judge would actually see. Trade-off: no hot reload, so a code
+# change needs `scripts/stop.sh` + a fresh `--prod` start to take effect.
+#
 # Usage:
-#   scripts/start.sh              # local only
-#   scripts/start.sh --tunnels    # also expose backend+frontend publicly
+#   scripts/start.sh                # local only, dev mode
+#   scripts/start.sh --tunnels      # also expose backend+frontend publicly
+#   scripts/start.sh --prod         # frontend as a production build
+#   scripts/start.sh --tunnels --prod
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,9 +27,11 @@ STATE_DIR="$ROOT_DIR/.dev"
 mkdir -p "$STATE_DIR"
 
 USE_TUNNELS=false
+USE_PROD=false
 for arg in "$@"; do
   case "$arg" in
     --tunnels) USE_TUNNELS=true ;;
+    --prod) USE_PROD=true ;;
   esac
 done
 
@@ -82,8 +95,22 @@ fi
 echo "Starting iThink backend (port 8123)..."
 (cd "$ROOT_DIR/backend" && start_bg backend .venv/bin/python -m uvicorn app.main:app --reload --port 8123)
 
-echo "Starting voice-agent (backend :8000 + frontend :3000)..."
-(cd "$ROOT_DIR/voice-agent" && start_bg voiceagent bun run dev)
+if [ "$USE_PROD" = true ]; then
+  echo "Building voice-agent frontend for production..."
+  if ! (cd "$ROOT_DIR/voice-agent/web" && bun run build); then
+    echo "Production build failed -- see output above. Not starting the frontend." >&2
+    exit 1
+  fi
+
+  echo "Starting voice-agent (backend :8000 + frontend :3000, production build)..."
+  (cd "$ROOT_DIR/voice-agent/server" && start_bg voiceagent-backend bash -c \
+    "(venv/bin/python -m pip --version >/dev/null 2>&1 || (rm -rf venv && python3 -m venv venv)) && source venv/bin/activate && python -m pip install -q -r requirements.txt && python src/server.py")
+  (cd "$ROOT_DIR/voice-agent/web" && AGENT_BACKEND_URL=http://localhost:8000 ITHINK_BACKEND_URL=http://127.0.0.1:8123/api/v1 \
+    start_bg voiceagent-frontend bun run start)
+else
+  echo "Starting voice-agent (backend :8000 + frontend :3000)..."
+  (cd "$ROOT_DIR/voice-agent" && start_bg voiceagent bun run dev)
+fi
 
 echo "Starting demo dashboard (port 8080)..."
 (cd "$ROOT_DIR/demo" && start_bg dashboard python3 -m http.server 8080)
