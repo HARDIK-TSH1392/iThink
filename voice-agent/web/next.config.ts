@@ -12,7 +12,12 @@ const nextConfig: NextConfig = {
   // is machine- and network-specific (DHCP can reassign it) -- update it
   // locally to whatever `ipconfig`/`hostname -I` reports for your own
   // machine's LAN adapter rather than relying on this committed value.
-  allowedDevOrigins: ['172.25.231.35', 'campbell-casino-quilt-smooth.trycloudflare.com'],
+  // '*' alone doesn't match here (confirmed live: still blocked) --
+  // Next.js's allowedDevOrigins wants a hostname pattern, not a bare
+  // wildcard. cloudflared quick tunnels get a new random subdomain every
+  // restart, so a specific hostname breaks every time -- this wildcard
+  // covers any of them without needing to update it per-restart.
+  allowedDevOrigins: ['172.25.231.35', '*.trycloudflare.com'],
 
   // Optimize images
   images: {

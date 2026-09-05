@@ -115,8 +115,17 @@ async def notify_jira_approval_needed(db, incident, call) -> bool:
     """
     Second human-approval gate: DMs the resolved approver privately asking
     whether to create a Jira ticket from this call's captured discussion.
-    Falls back to the channel if the approver has no real Slack ID on
-    file -- same reasoning as notify_approval_needed.
+
+    Deliberately does NOT fall back to posting the actionable Create-Ticket
+    button in the incident channel the way the first approval gate does --
+    unlike an incident's own approve/reject (which is scoped to a specific
+    incident either way), anyone in the channel clicking "Create Jira
+    Ticket" here would create a real ticket on someone else's behalf with
+    no real approval having happened. If the approver can't be reached
+    privately (no Slack ID on file, or the DM itself fails), this posts a
+    plain, non-actionable notice instead -- the team still finds out
+    something needs following up on, but only the resolved approver can
+    actually trigger ticket creation, and only via their own DM.
     """
     from app.iDirectory.iDirectory_crudl import resolve_approver
 
@@ -127,18 +136,26 @@ async def notify_jira_approval_needed(db, incident, call) -> bool:
         f"*{incident.title}*  |  `{incident.service}` in `{incident.region}`\n\n"
         f"{summary}"
     )
-    blocks = _build_jira_approval_blocks(call.id, text)
 
     if approver and approver.slack_user_id:
+        blocks = _build_jira_approval_blocks(call.id, text)
         ok = await _post_dm_to_slack_user(approver.slack_user_id, text, blocks=blocks)
         if ok:
             print(f"[iOrchestrate] Jira-approval DM sent to {approver.slack_user_id} for call {call.id}")
             return True
-        print(f"[iOrchestrate] Jira-approval DM failed for call {call.id}, falling back to channel post")
+        print(f"[iOrchestrate] Jira-approval DM failed for call {call.id} -- posting a non-actionable notice to the channel instead")
+    else:
+        print(f"[iOrchestrate] No Slack ID on file for call {call.id}'s resolved approver -- posting a non-actionable notice to the channel instead")
 
-    ok = await _post_to_slack(text, blocks=blocks)
+    who = f"{approver.name} ({approver.email})" if approver else "no available approver found -- please assign manually"
+    fallback_text = (
+        f"*Jira ticket approval needed: Incident #{incident.id}* :memo:\n"
+        f"Couldn't reach the approver privately -- {who} should review this and create the ticket manually.\n"
+        f"*{incident.title}*  |  `{incident.service}` in `{incident.region}`"
+    )
+    ok = await _post_to_slack(fallback_text)
     if ok:
-        print(f"[iOrchestrate] Jira-approval request posted to channel for call {call.id}")
+        print(f"[iOrchestrate] Non-actionable Jira-approval notice posted to channel for call {call.id}")
     return ok
 
 
