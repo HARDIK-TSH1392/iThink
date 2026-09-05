@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import AsyncGenerator, List, Optional
+from typing import Any, AsyncGenerator, List, Optional, Tuple
 
 from app.config import get_settings
 from app.database import async_session
@@ -375,57 +375,21 @@ async def _maybe_push_shared_screens(
     return call
 
 
-async def _process_turn(
-    db: AsyncSession, call: IncidentCall, channel_name: str, payload: ChatCompletionRequest
+async def _decide_spoken_reply(
+    db: AsyncSession,
+    call: IncidentCall,
+    update,
+    old_facts: List[str],
+    latest_user_message: Optional[str],
+    health_score: int,
 ) -> str:
     """
-    One turn's worth of chat_completions_endpoint's work -- generate (or
-    skip) a structuring update, merge it into structured_state, and decide
-    what (if anything) gets said. Pulled out of the endpoint so it can run
-    entirely inside get_call_turn_lock's per-call lock (see that function's
-    docstring for why: overlapping turns racing on the same call's
-    structured_state is a real, observed lost-update bug, not
-    hypothetical). Returns the text to speak, "" for silence.
+    Given a StructuringUpdate already merged into call.structured_state,
+    decide what (if anything) actually gets spoken. Shared by both a
+    normal turn and a tool-result follow-up turn (see _process_turn and
+    _process_tool_result_turn) -- the decision logic is identical either
+    way, only how `update` got produced differs.
     """
-    if _is_silence_trigger(payload.messages):
-        # The room's gone quiet -- this isn't real speech to extract facts
-        # from, so skip generate_structuring_update entirely. Stay silent
-        # when there's nobody to nudge (a lone participant), otherwise say
-        # something shaped by how far the call has actually gotten.
-        participant_count = await get_live_participant_count(channel_name)
-        if participant_count is not None and participant_count <= 1:
-            return ""
-        spoken_reply = build_silence_prompt(call.structured_state or {})
-        await record_agent_utterance(db, call.id, spoken_reply, "silence_check")
-        return spoken_reply
-
-    incident = await get_incident(db, call.incident_id)
-    service = incident.service if incident else None
-
-    # Captured before apply_structuring_update mutates structured_state --
-    # need the PRE-merge facts list to know whether corrects_fact actually
-    # matched and applied (vs. a hallucinated/non-matching reference that
-    # apply_structuring_update silently no-ops on), so the spoken callout
-    # below never claims a correction happened when nothing was updated.
-    old_facts = list((call.structured_state or {}).get("facts", []))
-
-    update, deploy_check_result = await generate_structuring_update(
-        payload.messages, call.structured_state or {}, service
-    )
-    call = await apply_structuring_update(db, call, update)
-    call = await _maybe_push_shared_screens(db, call, channel_name, incident, update, deploy_check_result)
-
-    # Coordination-health score: a rough, code-computed aggregate over the
-    # call's own state (open conflicts, missing info, unowned items, time
-    # since the last decision) -- recorded every turn, cheaply, regardless
-    # of whether anything below actually speaks. See detect_health_score_drop.
-    health_score = compute_coordination_health_score(call.structured_state)
-    call = await record_health_score(db, call, health_score)
-
-    latest_user_message = next(
-        (m.content for m in reversed(payload.messages) if m.role == "user"), None
-    )
-
     # The LLM only detects *that* the room sounds like it's wrapping up;
     # the actual words are ours, not a paraphrase, so what's promised about
     # Slack/Jira is always accurate. Diagnostic fallbacks (no API key
@@ -493,6 +457,172 @@ async def _process_turn(
     return ""
 
 
+def _find_tool_name(payload: ChatCompletionRequest, tool_call_id: Optional[str]) -> Optional[str]:
+    """
+    A role="tool" result message doesn't always carry its own tool name --
+    look it up from the preceding assistant message's tool_calls entry
+    with the matching id, the only place OpenAI's contract guarantees it.
+    """
+    if not tool_call_id:
+        return None
+    for message in reversed(payload.messages):
+        if message.role != "assistant" or not message.tool_calls:
+            continue
+        for tool_call in message.tool_calls:
+            if tool_call.get("id") == tool_call_id:
+                return (tool_call.get("function") or {}).get("name")
+    return None
+
+
+async def _maybe_push_tool_result_screen(
+    db: AsyncSession, call: IncidentCall, channel_name: str, tool_name: Optional[str], tool_result_text: str
+) -> IncidentCall:
+    """
+    Shows everyone on the call the actual result of a native MCP tool call
+    (see chat_completions_endpoint's tool-result branch). get_recent_logs
+    is our own tool (backend/ilogs_mcp_service/) so its exact shape is
+    known and rendered as a proper "logs" screen, same as the deterministic
+    logs path; any GitHub tool's result is shown as a generic "tool_result"
+    screen instead of forcing it into the commits-specific shape, since
+    GitHub's MCP surface has ~30 tools with different return shapes and
+    only some of them (search_commits, get_commit) are actually commits.
+    """
+    if not tool_name:
+        return call
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    if tool_name == "get_recent_logs":
+        try:
+            logs = json.loads(tool_result_text)
+        except (json.JSONDecodeError, TypeError):
+            logs = []
+        screen = {
+            "type": "logs",
+            "title": "Server logs (via native MCP tool call)",
+            "logs": logs if isinstance(logs, list) else [],
+            "timestamp": now,
+        }
+    else:
+        screen = {
+            "type": "tool_result",
+            "title": f"Tool result: {tool_name}",
+            "text": tool_result_text[:4000],
+            "timestamp": now,
+        }
+
+    return await _push_shared_screen(db, call, channel_name, screen)
+
+
+async def _process_tool_result_turn(
+    db: AsyncSession,
+    call: IncidentCall,
+    channel_name: str,
+    payload: ChatCompletionRequest,
+    tool_message,
+) -> Tuple[Optional[str], None]:
+    """
+    Follow-up request after the model called a native MCP tool on a prior
+    turn (see _process_turn) and Agora executed it -- this request's last
+    message carries the tool's actual result. Runs the same structuring
+    pipeline as an ordinary turn, just with the tool's result injected as
+    context instead of new conversation to extract facts from, and pushes
+    a shared screen from the real result data.
+    """
+    incident = await get_incident(db, call.incident_id)
+    service = incident.service if incident else None
+    tool_name = tool_message.name or _find_tool_name(payload, tool_message.tool_call_id)
+    tool_result_text = tool_message.content or ""
+
+    old_facts = list((call.structured_state or {}).get("facts", []))
+
+    result = await generate_structuring_update(
+        payload.messages, call.structured_state or {}, service, tool_result_text=tool_result_text
+    )
+    update = result.update
+    call = await apply_structuring_update(db, call, update)
+    call = await _maybe_push_tool_result_screen(db, call, channel_name, tool_name, tool_result_text)
+
+    health_score = compute_coordination_health_score(call.structured_state)
+    call = await record_health_score(db, call, health_score)
+
+    latest_user_message = next(
+        (m.content for m in reversed(payload.messages) if m.role == "user"), None
+    )
+    spoken_reply = await _decide_spoken_reply(db, call, update, old_facts, latest_user_message, health_score)
+    return spoken_reply, None
+
+
+async def _process_turn(
+    db: AsyncSession, call: IncidentCall, channel_name: str, payload: ChatCompletionRequest
+) -> Tuple[Optional[str], Optional[Any]]:
+    """
+    One turn's worth of chat_completions_endpoint's work -- generate (or
+    skip) a structuring update, merge it into structured_state, and decide
+    what (if anything) gets said. Pulled out of the endpoint so it can run
+    entirely inside get_call_turn_lock's per-call lock (see that function's
+    docstring for why: overlapping turns racing on the same call's
+    structured_state is a real, observed lost-update bug, not
+    hypothetical). Returns (spoken_reply, tool_call) -- exactly one of the
+    two is set: tool_call when the model decided to call an Agora-native
+    MCP tool this turn (see StructuringResult), spoken_reply ("" for
+    silence) otherwise.
+    """
+    last_message = payload.messages[-1] if payload.messages else None
+    if last_message is not None and last_message.role == "tool":
+        return await _process_tool_result_turn(db, call, channel_name, payload, last_message)
+
+    if _is_silence_trigger(payload.messages):
+        # The room's gone quiet -- this isn't real speech to extract facts
+        # from, so skip generate_structuring_update entirely. Stay silent
+        # when there's nobody to nudge (a lone participant), otherwise say
+        # something shaped by how far the call has actually gotten.
+        participant_count = await get_live_participant_count(channel_name)
+        if participant_count is not None and participant_count <= 1:
+            return "", None
+        spoken_reply = build_silence_prompt(call.structured_state or {})
+        await record_agent_utterance(db, call.id, spoken_reply, "silence_check")
+        return spoken_reply, None
+
+    incident = await get_incident(db, call.incident_id)
+    service = incident.service if incident else None
+
+    # Captured before apply_structuring_update mutates structured_state --
+    # need the PRE-merge facts list to know whether corrects_fact actually
+    # matched and applied (vs. a hallucinated/non-matching reference that
+    # apply_structuring_update silently no-ops on), so the spoken callout
+    # below never claims a correction happened when nothing was updated.
+    old_facts = list((call.structured_state or {}).get("facts", []))
+
+    result = await generate_structuring_update(
+        payload.messages, call.structured_state or {}, service, tools=payload.tools
+    )
+    if result.tool_call is not None:
+        # The model decided to call a native MCP tool instead of answering
+        # directly -- nothing to structure or speak yet, Agora executes
+        # the tool and sends the result back as a follow-up request (see
+        # _process_tool_result_turn above).
+        return None, result.tool_call
+
+    update = result.update
+    deploy_check_result = result.deploy_check_result
+    call = await apply_structuring_update(db, call, update)
+    call = await _maybe_push_shared_screens(db, call, channel_name, incident, update, deploy_check_result)
+
+    # Coordination-health score: a rough, code-computed aggregate over the
+    # call's own state (open conflicts, missing info, unowned items, time
+    # since the last decision) -- recorded every turn, cheaply, regardless
+    # of whether anything below actually speaks. See detect_health_score_drop.
+    health_score = compute_coordination_health_score(call.structured_state)
+    call = await record_health_score(db, call, health_score)
+
+    latest_user_message = next(
+        (m.content for m in reversed(payload.messages) if m.role == "user"), None
+    )
+    spoken_reply = await _decide_spoken_reply(db, call, update, old_facts, latest_user_message, health_score)
+    return spoken_reply, None
+
+
 def _sse_chunk(completion_id: str, created: int, model: str, delta: dict, finish_reason) -> str:
     payload = {
         "id": completion_id,
@@ -549,12 +679,36 @@ async def chat_completions_endpoint(
     lock = await get_call_turn_lock(call.id)
     async with lock:
         call = await get_call(db, call.id)
-        spoken_reply = await _process_turn(db, call, channel_name, payload)
+        spoken_reply, tool_call = await _process_turn(db, call, channel_name, payload)
+
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    if tool_call is not None:
+        # The model decided to call a native MCP tool -- standard OpenAI
+        # streaming tool-call format so Agora's engine actually executes
+        # it against the registered MCP server and sends the result back
+        # as a follow-up request (see _process_tool_result_turn).
+        async def tool_call_stream():
+            yield _sse_chunk(
+                completion_id, created, payload.model,
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": f"call_{uuid.uuid4().hex[:12]}",
+                        "type": "function",
+                        "function": {"name": tool_call.name, "arguments": json.dumps(dict(tool_call.args or {}))},
+                    }],
+                },
+                None,
+            )
+            yield _sse_chunk(completion_id, created, payload.model, {}, "tool_calls")
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(tool_call_stream(), media_type="text/event-stream")
 
     async def event_stream():
-        completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        created = int(time.time())
-
         yield _sse_chunk(completion_id, created, payload.model, {"role": "assistant"}, None)
         yield _sse_chunk(completion_id, created, payload.model, {"content": spoken_reply}, None)
         yield _sse_chunk(completion_id, created, payload.model, {}, "stop")

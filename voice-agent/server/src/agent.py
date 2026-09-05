@@ -168,6 +168,28 @@ class Agent:
         # generate_channel_name) and doubles as the lookup key here.
         # STT/TTS stay on managed defaults — only the LLM step is ours.
         ithink_base = os.getenv("ITHINK_BACKEND_BASE_URL", "http://127.0.0.1:8123/api/v1")
+
+        # Native MCP tool-calling -- Agora's platform calls these MCP
+        # servers directly and forwards real OpenAI-style `tools`/
+        # `tool_choice` to our custom LLM endpoint (confirmed live: only
+        # works with advanced_features.enable_tools=True below, silently
+        # ignored otherwise). GitHub's is the real, official remote MCP
+        # server; iLogs' is our own thin MCP wrapper around this backend's
+        # GET /ilogs/ (see backend/ilogs_mcp_service/) -- both need a
+        # publicly reachable endpoint since Agora's cloud calls them, not
+        # this local process.
+        mcp_servers = []
+        github_token = os.getenv("GITHUB_TOKEN")
+        if github_token:
+            mcp_servers.append({
+                "name": "github",
+                "endpoint": "https://api.githubcopilot.com/mcp/",
+                "headers": {"Authorization": f"Bearer {github_token}"},
+            })
+        ilogs_mcp_url = os.getenv("ILOGS_MCP_URL")
+        if ilogs_mcp_url:
+            mcp_servers.append({"name": "ilogs", "endpoint": ilogs_mcp_url})
+
         llm = CustomLLM(
             base_url=os.getenv(
                 "ITHINK_LLM_URL",
@@ -180,6 +202,7 @@ class Agent:
             max_history=15,
             max_tokens=1024,
             temperature=0.7,
+            mcp_servers=mcp_servers or None,
         )
         stt = DeepgramSTT(
             model="nova-3",
