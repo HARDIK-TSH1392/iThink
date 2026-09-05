@@ -1,3 +1,4 @@
+from datetime import datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import AsyncGenerator, List, Optional
@@ -74,6 +75,7 @@ async def list_ilogs(
     region: Optional[str] = Query(None),
     service: Optional[str] = Query(None),
     severity: Optional[str] = Query(None),
+    since: Optional[datetime] = Query(None, description="Only logs at or after this timestamp"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -88,6 +90,7 @@ async def list_ilogs(
         region=region,
         service=service,
         severity=severity,
+        since=since,
         limit=limit,
         offset=offset,
     )

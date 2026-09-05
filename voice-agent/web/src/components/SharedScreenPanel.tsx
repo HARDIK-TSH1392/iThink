@@ -1,6 +1,6 @@
 "use client";
 
-import { GitCommitHorizontal, ScrollText, ScreenShareOff } from "lucide-react";
+import { GitCommitHorizontal, ScrollText, ScreenShareOff, Wrench } from "lucide-react";
 import { useState } from "react";
 
 import type { SharedScreen } from "@/services/api";
@@ -54,30 +54,40 @@ function ScreenBody({ screen }: { screen: SharedScreen }) {
 		);
 	}
 
-	if (screen.logs.length === 0) {
-		return <p className="text-sm text-muted-foreground">No log entries found since the incident started.</p>;
+	if (screen.type === "logs") {
+		if (screen.logs.length === 0) {
+			return <p className="text-sm text-muted-foreground">No log entries found since the incident started.</p>;
+		}
+		return (
+			<ul className="flex flex-col gap-2">
+				{screen.logs.map((log, index) => (
+					<li
+						key={log.id ?? index}
+						className="flex flex-col gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2"
+					>
+						<div className="flex items-center justify-between gap-2">
+							<span
+								className={`shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${
+									SEVERITY_STYLES[log.severity] ?? "border-border bg-muted text-muted-foreground"
+								}`}
+							>
+								{log.severity}
+							</span>
+							<span className="text-xs text-muted-foreground">{formatTimestamp(log.timestamp)}</span>
+						</div>
+						<span className="text-sm text-foreground">{log.message}</span>
+					</li>
+				))}
+			</ul>
+		);
 	}
+
+	// A native MCP tool call Watcher made that isn't get_recent_logs -- raw
+	// text, since GitHub's ~30 MCP tools each return a different shape.
 	return (
-		<ul className="flex flex-col gap-2">
-			{screen.logs.map((log) => (
-				<li
-					key={log.id}
-					className="flex flex-col gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2"
-				>
-					<div className="flex items-center justify-between gap-2">
-						<span
-							className={`shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${
-								SEVERITY_STYLES[log.severity] ?? "border-border bg-muted text-muted-foreground"
-							}`}
-						>
-							{log.severity}
-						</span>
-						<span className="text-xs text-muted-foreground">{formatTimestamp(log.timestamp)}</span>
-					</div>
-					<span className="text-sm text-foreground">{log.message}</span>
-				</li>
-			))}
-		</ul>
+		<pre className="whitespace-pre-wrap break-words rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-foreground">
+			{screen.text}
+		</pre>
 	);
 }
 
@@ -123,10 +133,12 @@ export function SharedScreenPanel({ screens }: SharedScreenPanelProps) {
 								>
 									{screen.type === "github_commits" ? (
 										<GitCommitHorizontal className="h-3 w-3" />
-									) : (
+									) : screen.type === "logs" ? (
 										<ScrollText className="h-3 w-3" />
+									) : (
+										<Wrench className="h-3 w-3" />
 									)}
-									{screen.type === "github_commits" ? "Commits" : "Logs"}
+									{screen.type === "github_commits" ? "Commits" : screen.type === "logs" ? "Logs" : "Tool"}
 								</button>
 							))}
 						</div>
