@@ -893,7 +893,7 @@ export default function ConversationComponent({
 							{/* A special, always-present tile (not a participant) -- shows
 							    the most recent GitHub/logs/MCP lookup directly in the grid,
 							    live, with nothing to click or switch to. */}
-							<McpResponseTile screen={sharedScreens.length > 0 ? sharedScreens[sharedScreens.length - 1] : null} />
+							<McpResponseTile screens={sharedScreens} />
 						</div>
 					</section>
 				}
