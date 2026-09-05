@@ -473,6 +473,27 @@ async def _decide_spoken_reply(
     return ""
 
 
+def _incident_age_minutes(incident) -> Optional[int]:
+    """
+    Minutes since this incident was created, or None when there's no
+    incident to measure from. See _build_structuring_prompt's age_line --
+    a log-lookup tool's own default window is relative to "now," not to
+    when the incident actually started, so the model needs this to widen
+    since_minutes itself rather than silently missing earlier log entries.
+    """
+    if incident is None:
+        return None
+    # Incident.created_at is a naive DateTime column (SQLite has no real
+    # tz-aware type) but is always written as UTC (server_default=func.now())
+    # -- confirmed live (incident 101: tzinfo=None) -- so it needs stamping
+    # as UTC before comparing against an aware now(), or this raises
+    # "can't subtract offset-naive and offset-aware datetimes".
+    created_at = incident.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - created_at).total_seconds() // 60))
+
+
 def _find_tool_name(payload: ChatCompletionRequest, tool_call_id: Optional[str]) -> Optional[str]:
     """
     A role="tool" result message doesn't always carry its own tool name --
@@ -547,13 +568,16 @@ async def _process_tool_result_turn(
     """
     incident = await get_incident(db, call.incident_id)
     service = incident.service if incident else None
+    region = incident.region if incident else None
+    incident_age_minutes = _incident_age_minutes(incident)
     tool_name = tool_message.name or _find_tool_name(payload, tool_message.tool_call_id)
     tool_result_text = tool_message.content or ""
 
     old_facts = list((call.structured_state or {}).get("facts", []))
 
     result = await generate_structuring_update(
-        payload.messages, call.structured_state or {}, service, tool_result_text=tool_result_text
+        payload.messages, call.structured_state or {}, service, tool_result_text=tool_result_text,
+        region=region, incident_age_minutes=incident_age_minutes,
     )
     update = result.update
     call = await apply_structuring_update(db, call, update)
@@ -645,6 +669,8 @@ async def _process_turn(
 
     incident = await get_incident(db, call.incident_id)
     service = incident.service if incident else None
+    region = incident.region if incident else None
+    incident_age_minutes = _incident_age_minutes(incident)
 
     # Captured before apply_structuring_update mutates structured_state --
     # need the PRE-merge facts list to know whether corrects_fact actually
@@ -654,7 +680,8 @@ async def _process_turn(
     old_facts = list((call.structured_state or {}).get("facts", []))
 
     result = await generate_structuring_update(
-        payload.messages, call.structured_state or {}, service, tools=payload.tools
+        payload.messages, call.structured_state or {}, service, tools=payload.tools,
+        region=region, incident_age_minutes=incident_age_minutes,
     )
     if result.tool_call is not None:
         # The model decided to call a native MCP tool instead of answering

@@ -584,6 +584,9 @@ def _build_structuring_prompt(
     existing_state: dict,
     deploy_check_result: Optional[dict] = None,
     tool_result_text: Optional[str] = None,
+    service: Optional[str] = None,
+    region: Optional[str] = None,
+    incident_age_minutes: Optional[int] = None,
 ) -> str:
     conversation = "\n".join(f"{m.role}: {m.content or ''}" for m in messages)
     deploy_summary = deploy_check_result.get("summary") if deploy_check_result else None
@@ -592,6 +595,44 @@ def _build_structuring_prompt(
         if deploy_summary
         else ""
     )
+    # Confirmed live: without this, a native-MCP tool call (get_recent_logs
+    # or GitHub's commit-listing tools) had no way to know which service/
+    # region/repo this incident is actually about -- it only worked when a
+    # participant happened to say the exact service name out loud in this
+    # call's own conversation, and returned nothing for a service like
+    # "cdn-edge" that never got mentioned by name. service/region are
+    # already known, deterministic facts (see generate_structuring_update's
+    # docstring) -- surfacing them here means a tool call fills in the
+    # right arguments instead of guessing from conversation content.
+    incident_context_section = ""
+    if service:
+        repo = SERVICE_TO_GITHUB_REPO.get(service)
+        repo_line = (
+            f"Linked GitHub repo for this service: {repo} -- use this exact repo when looking up commits/deploys."
+            if repo
+            else "No GitHub repo is linked for this service -- if asked for commits/deploys, say so rather than guessing a repo."
+        )
+        # get_recent_logs' own default window is generous (24h, see
+        # ilogs_mcp_service/server.py) precisely because logs leading up to
+        # an incident typically predate when it was officially detected --
+        # this is just context, not a precise value to compute against;
+        # asking the model to do that math itself was the fragile version
+        # of this fix (it doesn't know how far pre-detection logs go back
+        # either).
+        age_line = (
+            f"This incident was created {incident_age_minutes} minute(s) ago -- if a log lookup "
+            "comes back empty, don't assume there's nothing to find; widen since_minutes well beyond "
+            "the tool's default before concluding that.\n"
+            if incident_age_minutes is not None
+            else ""
+        )
+        incident_context_section = (
+            f"\nThis incident's service is `{service}`"
+            + (f" in region `{region}`" if region else "")
+            + " -- use this exact value (not something inferred from conversation) as the service/region argument for "
+            "any log or GitHub lookup tool you call.\n"
+            f"{repo_line}\n{age_line}"
+        )
     # tool_result_text: this turn is the follow-up after the model itself
     # called an Agora-native MCP tool (see chat_completions_endpoint) --
     # same "this directly answers the question" framing as the deploy
@@ -604,7 +645,7 @@ def _build_structuring_prompt(
     return f"""Incident state recorded so far (facts/hypotheses/decisions already
 confirmed in this call — use this to detect contradictions, not to repeat):
 {existing_state}
-{deploy_section}{tool_section}
+{incident_context_section}{deploy_section}{tool_section}
 Conversation so far:
 {conversation}
 
@@ -662,6 +703,8 @@ async def generate_structuring_update(
     service: Optional[str] = None,
     tools: Optional[List[dict]] = None,
     tool_result_text: Optional[str] = None,
+    region: Optional[str] = None,
+    incident_age_minutes: Optional[int] = None,
 ) -> StructuringResult:
     """
     One turn of live structuring: given the conversation and what's already
@@ -670,6 +713,15 @@ async def generate_structuring_update(
     should say. Degrades to a plain fallback reply (not an error) when no
     API key is configured, same reasoning as the original proxy-only version
     this replaces — prove the wiring survives even without a real key.
+
+    service/region are the incident's own, known-deterministic values --
+    used both for the existing GitHub-deploy-check heuristic below AND
+    (via _build_structuring_prompt's incident_context_section) surfaced
+    directly to the model so a native MCP tool call (get_recent_logs,
+    GitHub's commit tools) has the right arguments instead of only working
+    when a participant happened to say the service name out loud. Confirmed
+    live: a service with no such mention in conversation (e.g. "cdn-edge")
+    returned nothing from either tool before this was added.
 
     service is the incident's own service (a known, deterministic fact --
     not guessed from conversation) used to check GitHub for recent deploys
@@ -693,7 +745,10 @@ async def generate_structuring_update(
     gemini_tool = _convert_tools_to_gemini(tools)
 
     client = _get_client()
-    prompt = _build_structuring_prompt(messages, existing_state, deploy_check_result, tool_result_text)
+    prompt = _build_structuring_prompt(
+        messages, existing_state, deploy_check_result, tool_result_text,
+        service=service, region=region, incident_age_minutes=incident_age_minutes,
+    )
     config = types.GenerateContentConfig(
         system_instruction=STRUCTURING_SYSTEM_INSTRUCTION,
         response_mime_type="application/json",
