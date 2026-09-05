@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 from app.iNcidents.iNcidents_crudl import get_incident
 from app.iDirectory.iDirectory_crudl import find_employee_by_name
 
-from .iCall_model import IncidentCall, CallUtterance
+from .iCall_model import IncidentCall, CallUtterance, AgentUtterance
 from .iCall_schema import CallUtteranceCreate, StructuringUpdate
 from .iCall_utils import (
     generate_channel_name,
@@ -35,6 +35,31 @@ async def _get_incident_lock(incident_id: int) -> asyncio.Lock:
         if incident_id not in _incident_call_locks:
             _incident_call_locks[incident_id] = asyncio.Lock()
         return _incident_call_locks[incident_id]
+
+
+# Same race as above, different trigger: Agora's Custom LLM webhook fires
+# once per completed STT turn, and fragmented speech (a sentence split
+# across two turns by a mid-sentence pause) can produce two overlapping
+# chat_completions_endpoint requests for the same call. Each reads
+# call.structured_state, spends several seconds in a Gemini call, then
+# writes back -- without serializing that per call_id, the second commit
+# silently clobbers the first's changes (a real lost-update, not
+# hypothetical: confirmed live, incident-29 -- an owned action item both
+# turns extracted and spoke about ended up recorded only once, from
+# whichever request committed last). Locking also gives the second turn
+# an accurate existing_state to extract against (see
+# _build_structuring_prompt's "use this to detect contradictions, not to
+# repeat"), since it now only starts after the first turn's update has
+# actually landed, instead of both racing off the same stale snapshot.
+_call_turn_locks: Dict[int, asyncio.Lock] = {}
+_call_turn_locks_guard = asyncio.Lock()
+
+
+async def get_call_turn_lock(call_id: int) -> asyncio.Lock:
+    async with _call_turn_locks_guard:
+        if call_id not in _call_turn_locks:
+            _call_turn_locks[call_id] = asyncio.Lock()
+        return _call_turn_locks[call_id]
 
 
 class IncidentNotFoundError(Exception):
@@ -348,6 +373,37 @@ async def list_utterances(db: AsyncSession, call_id: int) -> List[CallUtterance]
         select(CallUtterance)
         .where(CallUtterance.call_id == call_id)
         .order_by(CallUtterance.turn_index.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def record_agent_utterance(
+    db: AsyncSession, call_id: int, text: str, reason: str
+) -> AgentUtterance:
+    """
+    Persists one line the agent actually spoke. Call this only when
+    spoken_reply ended up non-empty -- a turn the gate decided to stay
+    silent on has nothing to record. See AgentUtterance's docstring for
+    why this is a separate table from CallUtterance rather than a
+    special speaker_uid on it.
+    """
+    utterance = AgentUtterance(
+        call_id=call_id,
+        text=text,
+        reason=reason,
+        timestamp=datetime.now(timezone.utc),
+    )
+    db.add(utterance)
+    await db.commit()
+    await db.refresh(utterance)
+    return utterance
+
+
+async def list_agent_utterances(db: AsyncSession, call_id: int) -> List[AgentUtterance]:
+    result = await db.execute(
+        select(AgentUtterance)
+        .where(AgentUtterance.call_id == call_id)
+        .order_by(AgentUtterance.timestamp.asc())
     )
     return list(result.scalars().all())
 

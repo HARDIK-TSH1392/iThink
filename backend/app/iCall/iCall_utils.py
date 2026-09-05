@@ -614,6 +614,24 @@ def should_speak_aloud(update: StructuringUpdate, latest_user_message: Optional[
     return False
 
 
+def describe_speak_reason(update: StructuringUpdate, latest_user_message: Optional[str]) -> str:
+    """
+    Same branch order as should_speak_aloud, but names which check fired
+    instead of returning a bare bool -- only for AgentUtterance.reason
+    (see iCall_api.chat_completions_endpoint), so "why did the AI say
+    that" stays answerable after the fact. Only call this when
+    should_speak_aloud already returned True; it assumes one of these
+    branches fired and doesn't itself re-check that.
+    """
+    if update.conflict:
+        return "conflict"
+    if update.missing_info:
+        return "missing_info"
+    if any(item.owner for item in update.action_items):
+        return "action_item_owner"
+    return "direct_address"
+
+
 # -----------------------------------------------------------------------------
 # Pattern watching over the accumulated call state -- the difference between
 # a passive log L3 polls and a memory that notices patterns in itself. Every

@@ -56,6 +56,19 @@ class CallUtteranceRead(BaseModel):
         from_attributes = True
 
 
+class AgentUtteranceRead(BaseModel):
+    """Schema for reading one line the agent actually spoke (response)."""
+
+    id: int
+    call_id: int
+    text: str
+    reason: str
+    timestamp: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class ChatMessage(BaseModel):
     """
     One message in the incoming request. Agora's Custom LLM contract adds

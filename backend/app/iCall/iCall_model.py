@@ -95,3 +95,41 @@ class CallUtterance(Base):
         # record_utterance's IntegrityError handling below.
         UniqueConstraint("call_id", "turn_index", name="uq_call_utterances_call_turn"),
     )
+
+
+class AgentUtterance(Base):
+    """
+    One line the agent actually spoke -- deliberately a separate table from
+    CallUtterance, not the same one with a special speaker_uid. spoken_reply
+    was never persisted anywhere before this (confirmed live: there was no
+    way to answer "what did the agent actually say" after a call except by
+    reconstructing likely content from the deterministic gate rules).
+
+    Also structurally different from CallUtterance: there's no Agora
+    turn_id to key on here (the backend's chat_completions_endpoint sees a
+    message history, not Agora's own turn counter), so this has no
+    turn_index/unique-constraint scheme -- just an append-only log in
+    call order via id/timestamp, written once per turn the gate actually
+    decided to speak (never for a turn that stayed silent).
+    """
+
+    __tablename__ = "agent_utterances"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+
+    call_id: Mapped[int] = mapped_column(
+        ForeignKey("incident_calls.id", ondelete="CASCADE"), index=True
+    )
+
+    text: Mapped[str] = mapped_column(String)
+
+    # Which branch of chat_completions_endpoint's gate produced this --
+    # "conflict", "missing_info", "action_item_owner", "direct_address",
+    # "is_wrapping_up", "pattern:<name>", "health_score_drop",
+    # "silence_check", or "fallback:<reply-constant-name>". Same
+    # explainability goal as record_pattern_nudge's own reasoning: "why
+    # did the AI say that" should be answerable after the fact, not just
+    # "it said something."
+    reason: Mapped[str] = mapped_column(String, index=True)
+
+    timestamp: Mapped[datetime] = mapped_column(DateTime, index=True)
