@@ -283,15 +283,22 @@ async def post_approval_request_notification(
     """
     Notify that an incident needs approval, as soon as it reaches
     awaiting_approval -- the "someone has to know to check" gap. DMs the
-    resolved approver directly if their Slack ID is on file; otherwise
-    falls back to posting in the channel (still flagging who should act,
-    just not privately) -- no owning team or nobody available also falls
-    back to the channel, flagged loudly rather than notifying nobody.
-
-    Includes real Approve/Reject buttons (Block Kit) -- clicking one hits
+    resolved approver directly if their Slack ID is on file, with real
+    Approve/Reject buttons (Block Kit) -- clicking one hits
     /iorchestrate/slack/interact, which is verified, applies the decision
     through the same iNcidents logic the API uses, and updates this
     message in place.
+
+    Deliberately does NOT fall back to posting those buttons in the
+    incident channel -- same reasoning as notify_jira_approval_needed's
+    identical gate: slack_interactivity_endpoint verifies the request came
+    from Slack, but never checks that the clicking user IS the resolved
+    approver, so an actionable button visible to the whole channel means
+    anyone in it can approve or reject a real incident. When the approver
+    can't be reached privately (no Slack ID on file, or the DM itself
+    fails), this posts a plain, non-actionable notice instead -- the team
+    still finds out an incident needs approval, but only the resolved
+    approver's own DM (or a direct API call) can actually decide it.
     """
     who = f"{approver_name} ({approver_email})" if approver_name else (
         "⚠️ no available approver found — please assign manually"
@@ -337,11 +344,19 @@ async def post_approval_request_notification(
         if ok:
             print(f"[iOrchestrate] Approval-request DM sent to {approver_slack_user_id} for incident {incident_id}")
             return True
-        print(f"[iOrchestrate] DM failed for incident {incident_id}, falling back to channel post")
+        print(f"[iOrchestrate] DM failed for incident {incident_id} -- posting a non-actionable notice to the channel instead")
+    else:
+        print(f"[iOrchestrate] No Slack ID on file for incident {incident_id}'s resolved approver -- posting a non-actionable notice to the channel instead")
 
-    ok = await _post_to_slack(text, blocks=blocks)
+    fallback_text = (
+        f"*Approval needed: Incident #{incident_id}* :rotating_light:\n"
+        f"Couldn't reach the approver privately -- {who} should review this and approve/reject manually.\n"
+        f"{headline}\n"
+        f"When: {detected_at.isoformat()}  |  Where: `{service}` in `{region}`  |  Priority: *{priority or 'unset'}*"
+    )
+    ok = await _post_to_slack(fallback_text)
     if ok:
-        print(f"[iOrchestrate] Approval-request notification posted to channel for incident {incident_id}")
+        print(f"[iOrchestrate] Non-actionable approval-request notice posted to channel for incident {incident_id}")
     return ok
 
 
