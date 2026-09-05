@@ -277,14 +277,24 @@ async def record_utterance(
     db: AsyncSession, call_id: int, event: CallUtteranceCreate
 ) -> CallUtterance:
     """
-    A duplicate post of a turn_index already recorded for this call isn't a
-    new utterance -- it's the same race as get_or_create_call below and
-    TeamService.set_owner (iDirectory_crudl): the browser's own de-dupe
-    (postedTurnIds, a useRef) isn't atomic across two independent mounts of
-    the same effect, so two concurrent posts can both pass it. The unique
-    constraint on (call_id, turn_index) is what actually enforces
-    exclusivity; this just turns the loser's IntegrityError into "return
-    what's already there" instead of a 500.
+    A duplicate post of a turn_index already recorded for this call isn't
+    always a new utterance -- it's the same race as get_or_create_call
+    below and TeamService.set_owner (iDirectory_crudl): the browser's own
+    de-dupe (postedTurnText, a useRef) isn't atomic across two independent
+    mounts of the same effect, so two concurrent posts of identical text
+    can both pass it. The unique constraint on (call_id, turn_index) is
+    what actually enforces exclusivity there; this turns the loser's
+    IntegrityError into "return what's already there" instead of a 500.
+
+    But a second post for the same turn_index isn't always a pure race --
+    confirmed live (incident-25): the transcript source can revise a
+    turn's text after it's first posted (the live UI showed a full
+    sentence while the stored row was stuck on the first, incomplete
+    fragment). When the incoming text actually differs from what's
+    stored, update the row instead of leaving it stale -- the client only
+    sends a second post for a given turn_index when its own tracked text
+    for that key has changed, so this isn't reachable from ordinary
+    duplicate/race posts of identical text.
     """
     utterance = CallUtterance(call_id=call_id, **event.model_dump())
     db.add(utterance)
@@ -292,13 +302,19 @@ async def record_utterance(
         await db.commit()
     except IntegrityError:
         await db.rollback()
-        existing = await db.execute(
+        result = await db.execute(
             select(CallUtterance).where(
                 CallUtterance.call_id == call_id,
                 CallUtterance.turn_index == event.turn_index,
             )
         )
-        return existing.scalar_one()
+        existing = result.scalar_one()
+        if event.text != existing.text:
+            existing.text = event.text
+            existing.timestamp = event.timestamp
+            await db.commit()
+            await db.refresh(existing)
+        return existing
     await db.refresh(utterance)
     return utterance
 

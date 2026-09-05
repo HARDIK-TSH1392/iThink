@@ -282,7 +282,27 @@ export default function ConversationComponent({
 		isReady,
 	);
 
-	const { localMicrophoneTrack } = useLocalMicrophoneTrack(isReady);
+	// Agora's SDK defaults an unconfigured mic track to "music_standard"
+	// (48kHz, 32Kbps) -- a music-fidelity target, not a voice one. Confirmed
+	// live across every call this session (incident-14/16/17/19/20/21):
+	// SEND_AUDIO_BITRATE_TOO_LOW fired constantly for whichever participant
+	// was on a phone, which matches -- phones/cellular routinely can't
+	// sustain that target consistently, while a human ear tolerates the dip
+	// fine but Deepgram's STT doesn't, silently producing nothing usable.
+	// "speech_standard" only needs 24Kbps (25% less) and is Agora's own
+	// documented recommendation for voice calls specifically -- real
+	// population here is always a laptop-plus-phone mix, so the track
+	// needs to be built for the weaker device's network, not the default.
+	// { ANS: true, AEC: true } is the hook's own default, but only when no
+	// config object is passed at all -- passing one here to add
+	// encoderConfig replaces that default outright (it's a plain JS default
+	// parameter, not a merge), so both are restated explicitly to avoid
+	// silently losing echo cancellation and noise suppression.
+	const { localMicrophoneTrack } = useLocalMicrophoneTrack(isReady, {
+		ANS: true,
+		AEC: true,
+		encoderConfig: "speech_standard",
+	});
 
 	useEffect(() => {
 		if (!client) return;
@@ -462,10 +482,8 @@ export default function ConversationComponent({
 	// Persists each finalized human line to the main backend (iCall), keyed
 	// by the corrected per-speaker uid from normalizeTranscript -- this is
 	// what post-call role inference reads (see iCall_service.
-	// infer_and_store_participant_roles). Posted once per turn_id (a Set
-	// ref, not state, since this is a side effect with nothing to render).
-	// Agent lines are skipped -- role inference is about the humans on the
-	// call, not the agent itself.
+	// infer_and_store_participant_roles). Agent lines are skipped -- role
+	// inference is about the humans on the call, not the agent itself.
 	//
 	// Does NOT filter on turn status beyond what getMessageList already
 	// excludes (IN_PROGRESS) -- a prior version also skipped INTERRUPTED
@@ -477,21 +495,32 @@ export default function ConversationComponent({
 	// effect both passing the check below) is handled server-side instead,
 	// by a unique constraint on (call_id, turn_index) in record_utterance --
 	// a guarantee that holds regardless of what status a turn carries.
-	const postedTurnIds = useRef<Set<string | number>>(new Set());
+	//
+	// Tracks the *text already posted* per key, not just whether the key
+	// was ever posted -- confirmed live (incident-25): a turn can still get
+	// revised/extended by the transcript source after its first appearance
+	// (the live panel showed Bag's full sentence, but the stored row was
+	// stuck at "Actually, Rahul", the first, incomplete snapshot). Posting
+	// once per key permanently locked in whatever text was present at that
+	// first post. Re-posting when the text for an already-seen key changes
+	// lets record_utterance's upsert-on-conflict keep the stored row
+	// current instead of stuck on a stale fragment.
+	const postedTurnText = useRef<Map<string | number, string>>(new Map());
 	useEffect(() => {
 		for (const message of messageList) {
 			const key = message.turn_id ?? `${message.uid}-${message.createdAt}`;
-			if (postedTurnIds.current.has(key)) continue;
 			if (String(message.uid) === agentUID) continue;
-			if (!message.text?.trim()) continue;
+			const text = message.text?.trim();
+			if (!text) continue;
+			if (postedTurnText.current.get(key) === text) continue;
 
-			postedTurnIds.current.add(key);
+			postedTurnText.current.set(key, text);
 			recordUtterance(
 				agoraData.channel,
 				String(message.uid),
 				participantNames[String(message.uid)],
-				message.text,
-				typeof message.turn_id === "number" ? message.turn_id : postedTurnIds.current.size,
+				text,
+				typeof message.turn_id === "number" ? message.turn_id : postedTurnText.current.size,
 				message.createdAt ?? Date.now(),
 			).catch((error) => {
 				console.error("Failed to record utterance:", error);
@@ -614,6 +643,47 @@ export default function ConversationComponent({
 	useClientEvent(client, "connection-state-change", (curState) => {
 		setConnectionState(curState);
 	});
+
+	// Confirmed live (incident-20): a signaling-layer hiccup ("ws request
+	// timeout" on the RTC client, not the audio media path) can leave
+	// transcript delivery permanently stalled even after the RTC client's
+	// own connection-state cycles back to CONNECTED and audio keeps working
+	// fine -- the only thing that fixed it was a full manual page rejoin.
+	// AgoraVoiceAI's stream-message handling (how transcripts actually
+	// arrive -- see agora-agent-client-toolkit's useTranscript) only resets
+	// its internal state (chunked-message reassembly cache, its own raw
+	// event bindings) on unsubscribe()/destroy(), never automatically on a
+	// mid-session reconnect. unsubscribe() then subscribeMessage() again is
+	// the toolkit's own public, documented pair for exactly this -- it
+	// explicitly preserves the ai.on(...) consumer callbacks registered
+	// above (destroy() would remove those instead) and doesn't touch the
+	// live RTC/RTM connection, so this is much lower-risk than forcing an
+	// actual leave+rejoin of the call.
+	const prevConnectionStateRef = useRef(connectionState);
+	const lastResubscribeAtRef = useRef(0);
+	useEffect(() => {
+		const prevState = prevConnectionStateRef.current;
+		prevConnectionStateRef.current = connectionState;
+
+		const wasInterrupted = prevState === "RECONNECTING" || prevState === "DISCONNECTED";
+		if (connectionState !== "CONNECTED" || !wasInterrupted) return;
+
+		// Guards against re-triggering on rapid reconnect/connect flapping --
+		// one resubscribe per interruption is enough, and doing it too often
+		// risks racing a message that arrives in the brief unsubscribed gap.
+		const RESUBSCRIBE_COOLDOWN_MS = 5_000;
+		if (Date.now() - lastResubscribeAtRef.current < RESUBSCRIBE_COOLDOWN_MS) return;
+		lastResubscribeAtRef.current = Date.now();
+
+		const ai = AgoraVoiceAI.getInstance();
+		if (!ai) return;
+		try {
+			ai.unsubscribe();
+			ai.subscribeMessage(agoraData.channel);
+		} catch (error) {
+			console.error("[AgoraVoiceAI] Failed to resubscribe after reconnect:", error);
+		}
+	}, [connectionState, agoraData.channel]);
 
 	// Agora's own uplink/downlink quality signal (0=unknown, 1=excellent,
 	// ..., 6=disconnected), fired ~every 2s once joined. Surfaced so a poor
