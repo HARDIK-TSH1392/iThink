@@ -482,10 +482,8 @@ export default function ConversationComponent({
 	// Persists each finalized human line to the main backend (iCall), keyed
 	// by the corrected per-speaker uid from normalizeTranscript -- this is
 	// what post-call role inference reads (see iCall_service.
-	// infer_and_store_participant_roles). Posted once per turn_id (a Set
-	// ref, not state, since this is a side effect with nothing to render).
-	// Agent lines are skipped -- role inference is about the humans on the
-	// call, not the agent itself.
+	// infer_and_store_participant_roles). Agent lines are skipped -- role
+	// inference is about the humans on the call, not the agent itself.
 	//
 	// Does NOT filter on turn status beyond what getMessageList already
 	// excludes (IN_PROGRESS) -- a prior version also skipped INTERRUPTED
@@ -497,21 +495,32 @@ export default function ConversationComponent({
 	// effect both passing the check below) is handled server-side instead,
 	// by a unique constraint on (call_id, turn_index) in record_utterance --
 	// a guarantee that holds regardless of what status a turn carries.
-	const postedTurnIds = useRef<Set<string | number>>(new Set());
+	//
+	// Tracks the *text already posted* per key, not just whether the key
+	// was ever posted -- confirmed live (incident-25): a turn can still get
+	// revised/extended by the transcript source after its first appearance
+	// (the live panel showed Bag's full sentence, but the stored row was
+	// stuck at "Actually, Rahul", the first, incomplete snapshot). Posting
+	// once per key permanently locked in whatever text was present at that
+	// first post. Re-posting when the text for an already-seen key changes
+	// lets record_utterance's upsert-on-conflict keep the stored row
+	// current instead of stuck on a stale fragment.
+	const postedTurnText = useRef<Map<string | number, string>>(new Map());
 	useEffect(() => {
 		for (const message of messageList) {
 			const key = message.turn_id ?? `${message.uid}-${message.createdAt}`;
-			if (postedTurnIds.current.has(key)) continue;
 			if (String(message.uid) === agentUID) continue;
-			if (!message.text?.trim()) continue;
+			const text = message.text?.trim();
+			if (!text) continue;
+			if (postedTurnText.current.get(key) === text) continue;
 
-			postedTurnIds.current.add(key);
+			postedTurnText.current.set(key, text);
 			recordUtterance(
 				agoraData.channel,
 				String(message.uid),
 				participantNames[String(message.uid)],
-				message.text,
-				typeof message.turn_id === "number" ? message.turn_id : postedTurnIds.current.size,
+				text,
+				typeof message.turn_id === "number" ? message.turn_id : postedTurnText.current.size,
 				message.createdAt ?? Date.now(),
 			).catch((error) => {
 				console.error("Failed to record utterance:", error);
