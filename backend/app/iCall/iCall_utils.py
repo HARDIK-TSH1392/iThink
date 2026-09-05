@@ -16,6 +16,7 @@ from .iCall_schema import (
     CallRoleClassification,
     ActionItemOwnerAssignments,
     UnresolvedRisksSummary,
+    ReviewedTicketContent,
 )
 
 # -----------------------------------------------------------------------------
@@ -1449,6 +1450,129 @@ async def summarize_unresolved_risks(structured_state: dict) -> UnresolvedRisksS
     except Exception as exc:
         print(f"[iCall] Unresolved-risks response didn't match schema, leaving risks empty: {exc}")
         return UnresolvedRisksSummary()
+
+
+# -----------------------------------------------------------------------------
+# Pre-Jira-ticket content review -- confirmed live (incident-101, a solo
+# test call): the room's raw recorded state can carry test artifacts
+# ("wait for the teammate to join"), and repeated/garbled restatements of
+# the same guess across turns (STT noise -- "reverse east" for "US East"),
+# that read fine as a live coordination aid but badly as an external ticket
+# someone outside the call has to act on. This is a one-time, read-only
+# cleanup applied ONLY when building the ticket body -- never written back
+# to IncidentCall.structured_state, so it can never affect the live call's
+# own system-of-record (corrects_fact matching, health scoring, the stale-
+# action-item nudge) the way editing the real state in place would.
+# -----------------------------------------------------------------------------
+
+TICKET_CONTENT_REVIEW_SYSTEM_INSTRUCTION = """You are cleaning up a live
+incident call's recorded notes before they become a Jira ticket description
+that someone outside the call will read and act on. Your job is to make it
+read like a real ticket, not to change what actually happened.
+
+Rules:
+- Remove an item only when it's clearly not about the incident itself --
+  call logistics or filler like "wait for the teammate to join," a greeting
+  that got recorded as a fact, or an obvious test/placeholder statement.
+  When in doubt, keep it: don't remove anything that could plausibly matter
+  to someone investigating this incident later.
+- Merge hypotheses that are just restatements of the same underlying guess
+  worded differently across turns (common with live speech-to-text noise,
+  e.g. "the network is down in a specific region" / "the region is US
+  East" / a mis-transcribed variant of the same word) into ONE clearly
+  phrased version. Do not merge hypotheses that are actually different
+  theories, even if they sound related.
+- Fix awkward, garbled, or run-on phrasing into clear, professional
+  English -- without changing what was actually asked, decided, or
+  observed, and without resolving a question that was never actually
+  answered on the call. A still-open conflict must stay phrased as an open
+  question, just a clearly worded one.
+- Never invent information that wasn't recorded, and never drop a
+  genuinely distinct fact, decision, missing-info gap, conflict, or risk --
+  only remove true noise and merge true duplicates.
+- Output must strictly match the response schema below.
+"""
+
+
+def _build_ticket_content_review_prompt(structured_state: dict) -> str:
+    return f"""Recorded state for this incident call, to be cleaned up for
+a Jira ticket:
+{structured_state}
+
+Produce the cleaned version per the rules above.
+"""
+
+
+def _passthrough_reviewed_ticket_content(structured_state: dict) -> ReviewedTicketContent:
+    """
+    Safe degrade for review_ticket_content: unlike summarize_unresolved_
+    risks (where "no risks" is a valid answer), an empty result here would
+    mean a Jira ticket gets created with its description silently wiped --
+    much worse than the pre-review, slightly messy text. On any failure,
+    fall back to the ORIGINAL unedited lists rather than an empty review.
+    """
+    state = structured_state or {}
+    return ReviewedTicketContent(
+        facts=list(state.get("facts", [])),
+        hypotheses=list(state.get("hypotheses", [])),
+        decisions=list(state.get("decisions", [])),
+        missing_info=list(state.get("missing_info", [])),
+        conflicts=list(state.get("conflicts", [])),
+        unresolved_risks=list(state.get("unresolved_risks", [])),
+    )
+
+
+async def review_ticket_content(structured_state: dict) -> ReviewedTicketContent:
+    """
+    One pass, run only when a Jira ticket is actually about to be created
+    (see iOrchestrate_api._handle_jira_decision) -- never on the live call
+    path. Falls back to the unedited original content (not an empty
+    result) whenever there's nothing to review or the model call fails.
+    """
+    fallback = _passthrough_reviewed_ticket_content(structured_state)
+    if not structured_state or not get_settings().gemini_api_key:
+        return fallback
+
+    client = _get_client()
+    prompt = _build_ticket_content_review_prompt(structured_state)
+    config = types.GenerateContentConfig(
+        system_instruction=TICKET_CONTENT_REVIEW_SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=ReviewedTicketContent,
+    )
+
+    async with _gemini_semaphore:
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=PRIMARY_MODEL,
+                    contents=prompt,
+                    config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            print(f"[iCall] Ticket-content review primary call failed/timed out, trying fallback: {exc}")
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=FALLBACK_MODEL,
+                        contents=prompt,
+                        config=config,
+                    ),
+                    timeout=GEMINI_CALL_TIMEOUT_S,
+                )
+            except Exception as exc2:
+                print(f"[iCall] Ticket-content review failed on both attempts, using unedited content: {exc2}")
+                return fallback
+
+    try:
+        return ReviewedTicketContent.model_validate_json(response.text)
+    except Exception as exc:
+        print(f"[iCall] Ticket-content review response didn't match schema, using unedited content: {exc}")
+        return fallback
 
 
 # -----------------------------------------------------------------------------

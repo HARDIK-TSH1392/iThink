@@ -242,6 +242,31 @@ class UnresolvedRisksSummary(BaseModel):
     risks: List[str] = Field(default_factory=list)
 
 
+class ReviewedTicketContent(BaseModel):
+    """
+    LLM output shape for the pre-Jira-ticket content review (see
+    iCall_utils.review_ticket_content). A cleaned-for-external-reading copy
+    of the call's recorded state -- never written back to
+    IncidentCall.structured_state, only used to build the Jira ticket body,
+    so this can never affect the live call's own system-of-record.
+
+    action_items is deliberately excluded: its owner/owner_uid resolution
+    already went through a carefully validated two-pass process (see
+    iCall_service._reconcile_action_item_owners) and its text is matched
+    against elsewhere by exact string (see iCall_utils._stale_unowned_
+    action_item) -- letting a review pass reword it risks silently
+    breaking that, for no real benefit, so action items go into the ticket
+    unedited.
+    """
+
+    facts: List[str] = Field(default_factory=list)
+    hypotheses: List[str] = Field(default_factory=list)
+    decisions: List[str] = Field(default_factory=list)
+    missing_info: List[str] = Field(default_factory=list)
+    conflicts: List[str] = Field(default_factory=list)
+    unresolved_risks: List[str] = Field(default_factory=list)
+
+
 class ChatCompletionRequest(BaseModel):
     """
     Request body Agora's Conversational AI Engine sends to a Custom LLM
