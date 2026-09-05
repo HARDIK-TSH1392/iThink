@@ -311,10 +311,19 @@ Hard constraints:
   to carry it out, record both: the decision, and a matching action item
   with that owner. Don't record a decision for someone merely floating an
   option or asking what to do — only once the room actually settles on one.
-- Set "conflict" only when something said in this turn contradicts a fact
-  or hypothesis already recorded in the state you were given below. Phrase
-  it as one short, targeted clarifying question you would ask out loud —
-  not a statement, not an accusation.
+- Set "conflict" whenever something said in this turn contradicts a fact
+  OR a hypothesis already recorded in the state you were given below --
+  hypotheses count just as much as facts here, not only direct fact-vs-fact
+  contradictions. For example: someone floats "might be a database
+  connection issue" (a hypothesis) and a later turn says "the database team
+  confirmed everything is fine on their side" -- that directly contradicts
+  the hypothesis and must be flagged as a conflict, phrased as a clarifying
+  question ("so is the database ruled out, or still a possibility?"), even
+  though the later statement also stands on its own as a new fact worth
+  recording. Recording the new fact is not a substitute for flagging the
+  conflict -- do both when both apply. Phrase the conflict itself as one
+  short, targeted clarifying question you would ask out loud -- not a
+  statement, not an accusation.
 - corrects_fact (optional): set this to the EXACT text of an existing fact
   from the state given below, only when something said in THIS turn
   directly resolves a contradiction as the room's now-confirmed answer
@@ -669,6 +678,20 @@ async def generate_structuring_update(
 # regardless of cooldown -- this only throttles re-asking the SAME open item.
 MISSING_INFO_NUDGE_COOLDOWN_S = 20
 
+# Confirmed live (incident-38): STT fragmenting one continuous utterance
+# ("Watcher." / "you tell me the current status?") into two turns can make
+# BOTH independently trip the direct_address gate -- each fragment is
+# processed sequentially under the per-call turn lock (no lost-update race
+# here, unlike the earlier Bob/rollback bug), and each one's own
+# latest_user_message check is individually valid, so the lock alone can't
+# catch this. Same class of problem as missing_info's repeat-nudging, same
+# fix shape: a short cooldown after actually speaking a direct-address
+# reply. Deliberately shorter than MISSING_INFO_NUDGE_COOLDOWN_S -- long
+# enough to bridge a fragmentation gap (observed live: 2.2s between the two
+# duplicate replies), short enough that a genuinely fast follow-up question
+# addressed to the agent still gets answered.
+DIRECT_ADDRESS_REPLY_COOLDOWN_S = 8
+
 
 def _has_speakable_missing_info(update_missing_info: List[str], structured_state: dict) -> bool:
     if not update_missing_info:
@@ -681,6 +704,14 @@ def _has_speakable_missing_info(update_missing_info: List[str], structured_state
         return True
     elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_nudge_at)).total_seconds()
     return elapsed >= MISSING_INFO_NUDGE_COOLDOWN_S
+
+
+def _direct_address_off_cooldown(structured_state: dict) -> bool:
+    last_reply_at = structured_state.get("last_direct_address_reply_at")
+    if not last_reply_at:
+        return True
+    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_reply_at)).total_seconds()
+    return elapsed >= DIRECT_ADDRESS_REPLY_COOLDOWN_S
 
 
 def should_speak_aloud(
@@ -708,7 +739,11 @@ def should_speak_aloud(
         return True
     if any(item.owner for item in update.action_items):
         return True
-    if latest_user_message and _is_direct_address(latest_user_message):
+    if (
+        latest_user_message
+        and _is_direct_address(latest_user_message)
+        and _direct_address_off_cooldown(structured_state)
+    ):
         return True
     return False
 

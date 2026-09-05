@@ -35,6 +35,8 @@ from .iCall_service import (
     record_agent_utterance,
     list_agent_utterances,
     record_missing_info_nudge,
+    record_direct_address_reply,
+    record_silence_streak,
     get_call_turn_lock,
     infer_and_store_participant_roles,
     IncidentNotFoundError,
@@ -391,12 +393,33 @@ async def _process_turn(
         # The room's gone quiet -- this isn't real speech to extract facts
         # from, so skip generate_structuring_update entirely. Stay silent
         # when there's nobody to nudge (a lone participant), otherwise say
-        # something shaped by how far the call has actually gotten.
+        # something shaped by how far the call has actually gotten and by
+        # how long it's STAYED quiet through previous nudges.
+        #
+        # Escalates rather than repeating: confirmed live (incident-38) the
+        # brief nudge fired 10 times verbatim over 5.5 minutes with nothing
+        # else said -- not "spoken status summaries at appropriate moments"
+        # from the brief, just a loop. 1st trigger in a quiet streak: the
+        # existing brief nudge. 2nd: an actual status recap -- this IS the
+        # "appropriate moment" for one, the room's had two chances to speak
+        # up and hasn't. 3rd+: stay silent -- by then more nagging doesn't
+        # help, and repeating a full recap every 30s would be just as
+        # inappropriate as repeating the nudge was.
         participant_count = await get_live_participant_count(channel_name)
         if participant_count is not None and participant_count <= 1:
             return ""
-        spoken_reply = build_silence_prompt(call.structured_state or {})
-        await record_agent_utterance(db, call.id, spoken_reply, "silence_check")
+        streak = (call.structured_state or {}).get("silence_streak", 0) + 1
+        if streak == 1:
+            spoken_reply = build_silence_prompt(call.structured_state or {})
+            reason = "silence_check"
+        elif streak == 2:
+            spoken_reply = build_health_recap(call.structured_state or {})
+            reason = "silence_recap"
+        else:
+            await record_silence_streak(db, call, streak)
+            return ""
+        await record_silence_streak(db, call, streak)
+        await record_agent_utterance(db, call.id, spoken_reply, reason)
         return spoken_reply
 
     incident = await get_incident(db, call.incident_id)
@@ -465,6 +488,8 @@ async def _process_turn(
         reason = describe_speak_reason(update, latest_user_message, call.structured_state)
         if reason == "missing_info":
             call = await record_missing_info_nudge(db, call)
+        elif reason == "direct_address":
+            call = await record_direct_address_reply(db, call)
         await record_agent_utterance(db, call.id, spoken_reply, reason)
         return spoken_reply
 
