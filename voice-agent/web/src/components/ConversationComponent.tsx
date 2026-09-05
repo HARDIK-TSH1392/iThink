@@ -16,7 +16,7 @@ import {
 	QuickstartPipelineMetrics,
 } from "@/components/QuickstartPipelineMetrics";
 import { QuickstartTranscriptPanel } from "@/components/QuickstartTranscriptPanel";
-import { SharedScreenPanel } from "@/components/SharedScreenPanel";
+import { McpResponseTile } from "@/components/McpResponseTile";
 import { DEFAULT_AGENT_UID } from "@/lib/agora";
 import {
 	type ChatNote,
@@ -228,10 +228,6 @@ export default function ConversationComponent({
 	// never re-fetched by polling, since the whole point of the RTM push is
 	// to avoid that round trip.
 	const [sharedScreens, setSharedScreens] = useState<SharedScreen[]>(initialSharedScreens);
-	// Increments on every new live broadcast so the layout can force its
-	// panel open even if the viewer currently has a different one selected
-	// -- a plain boolean wouldn't re-trigger on a second screen in a row.
-	const [screenBroadcastSignal, setScreenBroadcastSignal] = useState(0);
 
 	useEffect(() => {
 		const handleSharedScreenMessage = (event: { message: string | Uint8Array }) => {
@@ -248,7 +244,6 @@ export default function ConversationComponent({
 			if (!isSharedScreenBroadcast(parsed)) return;
 
 			setSharedScreens((prev) => [...prev, parsed.screen]);
-			setScreenBroadcastSignal((count) => count + 1);
 		};
 
 		rtmClient.addEventListener("message", handleSharedScreenMessage);
@@ -895,6 +890,10 @@ export default function ConversationComponent({
 									</div>
 								));
 							})()}
+							{/* A special, always-present tile (not a participant) -- shows
+							    the most recent GitHub/logs/MCP lookup directly in the grid,
+							    live, with nothing to click or switch to. */}
+							<McpResponseTile screen={sharedScreens.length > 0 ? sharedScreens[sharedScreens.length - 1] : null} />
 						</div>
 					</section>
 				}
@@ -923,8 +922,7 @@ export default function ConversationComponent({
 						lateJoinRecap={lateJoinRecap}
 					/>
 				}
-				screensPanel={<SharedScreenPanel screens={sharedScreens} />}
-				autoOpenScreensSignal={screenBroadcastSignal}
+				chatHasUnread={!!lateJoinRecap}
 				onEndConversation={handleEndConversation}
 			/>
 		</>
