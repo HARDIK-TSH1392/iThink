@@ -46,7 +46,7 @@ export default function RootLayout({
 	children: React.ReactNode;
 }) {
 	return (
-		<html lang="en" className={`${instrumentSans.variable} h-full`}>
+		<html lang="en" className={`${instrumentSans.variable} h-full`} suppressHydrationWarning>
 			<body className="h-full min-h-screen">{children}</body>
 		</html>
 	);

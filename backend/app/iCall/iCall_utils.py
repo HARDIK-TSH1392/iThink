@@ -244,6 +244,12 @@ Hard constraints:
   narrator repeating back everything you heard. If is_wrapping_up is true,
   spoken_reply is ignored (the caller substitutes a fixed closing line) --
   don't spend effort crafting one.
+- A turn that's just a greeting or social opener ("hello", "hi", "hey",
+  "anyone there?") with no actual content yet has nothing to extract --
+  leave facts/hypotheses/decisions/action_items/missing_info empty and
+  reply naturally ("Hi, go ahead" / "I'm here, listening"). Don't say
+  "okay, noted" or similar to a greeting -- there's nothing to have noted
+  yet, and it reads as ignoring what was actually said.
 - agent_chat_note (optional): use this instead of expanding spoken_reply
   when you have something worth flagging that doesn't need to interrupt
   the room -- e.g. a secondary observation, a connection between two facts

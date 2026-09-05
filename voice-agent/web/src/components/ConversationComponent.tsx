@@ -516,14 +516,59 @@ export default function ConversationComponent({
 		client.enableAudioVolumeIndicator();
 	}, [client]);
 
+	// Detects a mic that's gone silent while still "on" -- observed live on
+	// mobile (incident-14, incident-16): a participant's audio stops
+	// reaching the pipeline entirely partway through the call (OS/browser
+	// suspending the mic on backgrounding, a permission getting revoked,
+	// etc.) with nothing in the UI showing it. Tracked from the same
+	// volume-indicator ticks already used for the speaking-ring indicator,
+	// so this adds no extra polling.
+	const MIC_SILENCE_WARNING_MS = 45_000;
+	const lastLocalAudioAtRef = useRef<number>(Date.now());
+	const [micSilenceWarning, setMicSilenceWarning] = useState(false);
+
 	useClientEvent(client, "volume-indicator", (volumes) => {
 		const SPEAKING_THRESHOLD = 15;
 		const next = new Set<string>();
+		const localUidStr = String(agoraData.uid);
 		for (const v of volumes) {
 			if (v.level > SPEAKING_THRESHOLD) next.add(String(v.uid));
+			// Any non-trivial level counts as "the mic is producing audio" --
+			// this is about total silence, not about whether they're speaking
+			// loud enough to show the speaking ring.
+			if (String(v.uid) === localUidStr && v.level > 2) {
+				lastLocalAudioAtRef.current = Date.now();
+			}
 		}
 		setSpeakingUids(next);
 	});
+
+	useEffect(() => {
+		if (!isEnabled) {
+			setMicSilenceWarning(false);
+			return;
+		}
+		const interval = setInterval(() => {
+			setMicSilenceWarning(Date.now() - lastLocalAudioAtRef.current > MIC_SILENCE_WARNING_MS);
+		}, 5_000);
+		return () => clearInterval(interval);
+	}, [isEnabled]);
+
+	// Best-effort recovery for the same failure: some mobile browsers
+	// silently suspend an active mic track while the tab is backgrounded
+	// (screen lock, app switch) without ever erroring or firing a "muted"
+	// event -- re-asserting enabled state on return at least gives Agora a
+	// chance to resume a track that's still alive but stalled.
+	useEffect(() => {
+		const handleVisibilityChange = () => {
+			if (document.visibilityState === "visible" && localMicrophoneTrack && isEnabled) {
+				localMicrophoneTrack.setEnabled(true).catch(() => {});
+				lastLocalAudioAtRef.current = Date.now();
+			}
+		};
+		document.addEventListener("visibilitychange", handleVisibilityChange);
+		return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+	}, [localMicrophoneTrack, isEnabled]);
 
 	useEffect(() => {
 		const isAgentInRemoteUsers = remoteUsers.some(
@@ -662,15 +707,22 @@ export default function ConversationComponent({
 
 	return (
 		<>
-			{audioPlaybackBlocked && (
-				<div className="fixed inset-x-0 top-0 z-50 flex justify-center p-3">
-					<button
-						type="button"
-						onClick={handleResumeAudio}
-						className="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-lg"
-					>
-						Click to enable audio playback
-					</button>
+			{(audioPlaybackBlocked || micSilenceWarning) && (
+				<div className="fixed inset-x-0 top-0 z-50 flex flex-col items-center gap-2 p-3">
+					{audioPlaybackBlocked && (
+						<button
+							type="button"
+							onClick={handleResumeAudio}
+							className="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-lg"
+						>
+							Click to enable audio playback
+						</button>
+					)}
+					{micSilenceWarning && (
+						<div className="rounded-full bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground shadow-lg">
+							No audio detected from your microphone -- check it's not muted or blocked
+						</div>
+					)}
 				</div>
 			)}
 			<QuickstartConversationLayout
