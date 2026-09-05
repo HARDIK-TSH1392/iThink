@@ -59,11 +59,11 @@ export function QuickstartConversationLayout({
 			<header className="flex shrink-0 items-center justify-between border-b border-border px-4 py-4 md:h-[76px] md:px-6 md:py-0">
 				<div className="flex min-w-0 items-center gap-3">
 					<Image
-						src="/agora-logo-mark.svg"
-						alt="Agora"
+						src="/watcher-logo.jpeg"
+						alt="Watcher"
 						width={40}
 						height={40}
-						className="h-10 w-10 shrink-0 object-contain"
+						className="h-10 w-10 shrink-0 rounded-lg object-contain"
 					/>
 					<div className="flex min-w-0 flex-col justify-center gap-1">
 						<span className="truncate text-lg font-semibold leading-none tracking-[-0.025em] text-foreground">
