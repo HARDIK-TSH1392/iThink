@@ -153,6 +153,20 @@ async def apply_structuring_update(
     def _add_timeline_entry(entry_type: str, text: str) -> None:
         state["timeline"].append({"type": entry_type, "text": text, "timestamp": now})
 
+    # Fail safe, not fail silent: only remove the superseded fact when the
+    # model's corrects_fact text matches one already in the active list
+    # exactly. A hallucinated or slightly-misquoted reference just does
+    # nothing here -- better to occasionally leave a stale fact in place
+    # than to ever guess-delete the wrong one. The active facts list stays
+    # a current-understanding snapshot; the timeline (below) keeps the
+    # superseded fact too, since it's the actual historical record.
+    if update.corrects_fact and update.corrects_fact in state["facts"]:
+        state["facts"].remove(update.corrects_fact)
+        _add_timeline_entry(
+            "correction",
+            f'Correction: "{update.corrects_fact}" is superseded by updated information.',
+        )
+
     state["facts"].extend(update.facts)
     for fact in update.facts:
         _add_timeline_entry("fact", fact)
@@ -217,7 +231,9 @@ async def record_health_score(db: AsyncSession, call: IncidentCall, score: int) 
     return call
 
 
-async def record_pattern_nudge(db: AsyncSession, call: IncidentCall, pattern: str, message: str) -> IncidentCall:
+async def record_pattern_nudge(
+    db: AsyncSession, call: IncidentCall, pattern: str, message: str, score: Optional[int] = None
+) -> IncidentCall:
     """
     Logs a CEP-pattern-triggered nudge into the timeline -- unlike an
     ordinary spoken_reply (never persisted, see apply_structuring_update's
@@ -227,6 +243,12 @@ async def record_pattern_nudge(db: AsyncSession, call: IncidentCall, pattern: st
     because "why did the AI say that" should be answerable after the
     fact, the same explainability the whole pattern-watching design is
     for.
+
+    score, when given (the "health_score_drop" pattern only), is stashed
+    as last_health_score_drop_nudge_score so detect_health_score_drop can
+    tell "already nudged for this drop" from "it's gotten worse since" --
+    without this, that check fired repeatedly on consecutive turns with
+    nothing new to report (confirmed live, incident-26).
     """
     old = call.structured_state or {}
     timeline = list(old.get("timeline", []))
@@ -238,6 +260,8 @@ async def record_pattern_nudge(db: AsyncSession, call: IncidentCall, pattern: st
 
     new_state = dict(old)
     new_state["timeline"] = timeline
+    if score is not None:
+        new_state["last_health_score_drop_nudge_score"] = score
     call.structured_state = new_state
     await db.commit()
     await db.refresh(call)
