@@ -660,13 +660,60 @@ export default function ConversationComponent({
 		resubscribeTranscript();
 	}, [connectionState, resubscribeTranscript]);
 
-	// Watchdog for the same stall by a different trigger -- confirmed live
+	// The precise version of the fix above -- confirmed live (incident-34)
+	// that the RTC-connectionState trigger and the watchdog below aren't
+	// enough on their own. Traced unsubscribe()/subscribeMessage() into the
+	// installed toolkit's source: they only call bindRtmEvents()/
+	// unbindRtmEvents(), i.e. attach or detach listeners on whatever
+	// rtmEngine instance was set at init() -- neither one reconnects
+	// anything. So when the failure is the RTM transport itself ("ws open
+	// error"), re-subscribing to a still-broken engine does nothing, which
+	// is exactly what incident-34 showed: the watchdog fired and forced a
+	// resubscribe, and the stall continued anyway.
+	//
+	// The RTM SDK has its own connection lifecycle, separate from the RTC
+	// client's, and rtmClient.addEventListener("status", ...) is public API
+	// (already used once, at initial login, in LandingPage.tsx's
+	// waitForRtmConnected) -- not something AgoraVoiceAI exposes a hook for
+	// internally (checked: _handleRtmStatus only logs at debug level and
+	// never re-emits). Listening to it directly here means reacting to the
+	// moment the RTM transport itself -- not just the RTC client -- actually
+	// comes back, which is the one thing that can make re-subscribing
+	// meaningful again.
+	const prevRtmStateRef = useRef<string | undefined>(undefined);
+	useEffect(() => {
+		const onRtmStatus = (
+			connectionStatus: { newState?: string } | { state?: string } | Record<string, unknown>,
+		) => {
+			const nextState =
+				typeof connectionStatus === "object" && connectionStatus !== null
+					? "newState" in connectionStatus
+						? connectionStatus.newState
+						: "state" in connectionStatus
+							? connectionStatus.state
+							: undefined
+					: undefined;
+			const prevState = prevRtmStateRef.current;
+			prevRtmStateRef.current = typeof nextState === "string" ? nextState : prevState;
+
+			const wasInterrupted = prevState === "RECONNECTING" || prevState === "DISCONNECTED";
+			if (nextState !== "CONNECTED" || !wasInterrupted) return;
+			resubscribeTranscript();
+		};
+		rtmClient.addEventListener("status", onRtmStatus);
+		return () => rtmClient.removeEventListener("status", onRtmStatus);
+	}, [rtmClient, resubscribeTranscript]);
+
+	// Watchdog for the same stall as a backstop -- confirmed live
 	// (incident-33): a "ws open error" on the RTM/transcript channel left
 	// transcript delivery dead for an entire call while the RTC client's own
 	// connectionState sat at CONNECTED throughout (never cycled through
-	// RECONNECTING/DISCONNECTED), so the effect above never fired. Real
-	// speech WAS happening -- the backend logged 8 real structuring turns
-	// for that call -- only the browser-side transcript feed was dead.
+	// RECONNECTING/DISCONNECTED), so the RTC-based effect above never fired.
+	// Real speech WAS happening -- the backend logged real structuring turns
+	// for that call -- only the browser-side transcript feed was dead. Kept
+	// even now that the RTM-status trigger above exists: it catches
+	// whatever the RTM SDK's own reconnect logic doesn't announce cleanly,
+	// same reasoning as keeping the RTC-based trigger alongside it.
 	//
 	// agora-agent-client-toolkit already detects this exact condition (zero
 	// TRANSCRIPT_UPDATED events) and logs it, but only once, 15s after
