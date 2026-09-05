@@ -612,34 +612,6 @@ export default function ConversationComponent({
 		setIsAgentConnected(isAgentInRemoteUsers);
 	}, [remoteUsers, agentUID]);
 
-	// Real-time, room-wide warning for the exact failure confirmed live
-	// across incident-14/16/17/19: someone's outgoing audio degrades badly
-	// enough (low input level, or the encoder dropping bitrate) that real,
-	// substantive speech never produces usable STT output at all -- not a
-	// visible error, just silence where a transcript line should be. The
-	// periodic network-quality score (below) is too coarse/laggy to catch
-	// this moment-to-moment; these specific exception codes are Agora's own
-	// direct signal for it. Room-wide (not just the affected person) since
-	// the point is for everyone to know a gap might be happening right now,
-	// not just to help the affected person fix their own connection.
-	const AUDIO_QUALITY_PROBLEM_CODES = new Set([2001, 2003]); // AUDIO_INPUT_LEVEL_TOO_LOW, SEND_AUDIO_BITRATE_TOO_LOW
-	const AUDIO_QUALITY_RECOVER_CODES = new Set([4001, 4003]); // matching *_RECOVER codes
-	const [degradedAudioUids, setDegradedAudioUids] = useState<Set<string>>(new Set());
-
-	useClientEvent(client, "exception", (event) => {
-		const uid = String(event.uid);
-		if (AUDIO_QUALITY_PROBLEM_CODES.has(event.code)) {
-			setDegradedAudioUids((prev) => new Set(prev).add(uid));
-		} else if (AUDIO_QUALITY_RECOVER_CODES.has(event.code)) {
-			setDegradedAudioUids((prev) => {
-				if (!prev.has(uid)) return prev;
-				const next = new Set(prev);
-				next.delete(uid);
-				return next;
-			});
-		}
-	});
-
 	useClientEvent(client, "connection-state-change", (curState) => {
 		setConnectionState(curState);
 	});
@@ -809,16 +781,9 @@ export default function ConversationComponent({
 		onEndConversation();
 	}, [client, localMicrophoneTrack, onEndConversation]);
 
-	// Human participants only -- the agent's own audio quality doesn't
-	// affect whether *human* speech gets transcribed, which is what this
-	// warning is about.
-	const degradedAudioNames = Array.from(degradedAudioUids)
-		.filter((uid) => uid !== agentUID)
-		.map((uid) => participantNames[uid] ?? `Participant ${uid}`);
-
 	return (
 		<>
-			{(audioPlaybackBlocked || micSilenceWarning || degradedAudioNames.length > 0) && (
+			{(audioPlaybackBlocked || micSilenceWarning) && (
 				<div className="fixed inset-x-0 top-0 z-50 flex flex-col items-center gap-2 p-3">
 					{audioPlaybackBlocked && (
 						<button
@@ -832,12 +797,6 @@ export default function ConversationComponent({
 					{micSilenceWarning && (
 						<div className="rounded-full bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground shadow-lg">
 							No audio detected from your microphone -- check it's not muted or blocked
-						</div>
-					)}
-					{degradedAudioNames.length > 0 && (
-						<div className="rounded-full bg-amber-600 px-4 py-2 text-sm font-medium text-white shadow-lg">
-							Poor connection for {degradedAudioNames.join(", ")} -- recent speech may not be
-							transcribed accurately
 						</div>
 					)}
 				</div>
