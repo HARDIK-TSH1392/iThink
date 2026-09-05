@@ -97,7 +97,13 @@ echo "Starting iThink backend (port 8123)..."
 
 if [ "$USE_PROD" = true ]; then
   echo "Building voice-agent frontend for production..."
-  if ! (cd "$ROOT_DIR/voice-agent/web" && bun run build); then
+  # next.config.ts's rewrites() is evaluated at BUILD time and baked into
+  # .next/routes-manifest.json -- next start serves from that manifest as-is,
+  # it does not re-run rewrites() itself. Confirmed live: building without
+  # these set produces an empty rewrites array, silently 404ing every
+  # /api/* route (get_config, startAgent, recordUtterance, chatNotes, ...)
+  # even though next start's own env looked correct.
+  if ! (cd "$ROOT_DIR/voice-agent/web" && AGENT_BACKEND_URL=http://localhost:8000 ITHINK_BACKEND_URL=http://127.0.0.1:8123/api/v1 bun run build); then
     echo "Production build failed -- see output above. Not starting the frontend." >&2
     exit 1
   fi
