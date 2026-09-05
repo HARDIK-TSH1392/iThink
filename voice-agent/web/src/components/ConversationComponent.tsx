@@ -1,6 +1,6 @@
 "use client";
 
-import { Sparkles } from "lucide-react";
+import { MicOff, Sparkles } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ConnectionStatusPanel } from "@/components/ConnectionStatusPanel";
@@ -562,6 +562,24 @@ export default function ConversationComponent({
 		if (user.uid.toString() === agentUID) setIsAgentConnected(false);
 	});
 
+	// Remote mic mute/unmute for the participant tiles below. Muting here
+	// (see handleMicToggle) uses track.setEnabled, not unpublish/publish --
+	// that surfaces to other clients as "user-info-updated" with a
+	// "mute-audio"/"unmute-audio" message, a different event than
+	// user-published/user-unpublished (which is for a track being
+	// attached/detached entirely, not just muted).
+	const [remoteMutedUids, setRemoteMutedUids] = useState<Set<string>>(new Set());
+
+	useClientEvent(client, "user-info-updated", (uid, msg) => {
+		if (msg !== "mute-audio" && msg !== "unmute-audio") return;
+		setRemoteMutedUids((prev) => {
+			const next = new Set(prev);
+			if (msg === "mute-audio") next.add(String(uid));
+			else next.delete(String(uid));
+			return next;
+		});
+	});
+
 	// Per-participant speaking indicator for the grid view -- Agora reports
 	// volume levels for every uid in the channel (local + remote) on each
 	// tick; anything above a small threshold counts as "speaking" this tick.
@@ -959,6 +977,7 @@ export default function ConversationComponent({
 										avatarName: localName || "You",
 										isAgent: false,
 										speaking: speakingUids.has(String(localUid)) && isEnabled,
+										muted: !isEnabled,
 									},
 									...remoteUsers.map((user) => {
 										const isAgent = String(user.uid) === String(agentUID);
@@ -974,6 +993,10 @@ export default function ConversationComponent({
 											speaking: isAgent
 												? visualizerState === "talking"
 												: speakingUids.has(String(user.uid)),
+											// The agent has no manual mute toggle from a participant's
+											// perspective -- the indicator only means something for
+											// actual meeting members.
+											muted: isAgent ? false : remoteMutedUids.has(String(user.uid)),
 										};
 									}),
 								];
@@ -983,10 +1006,11 @@ export default function ConversationComponent({
 										key={tile.uid}
 										className="flex flex-col items-center gap-3 rounded-2xl border border-border bg-card/60 px-5 py-8"
 									>
-										<div
-											className={`flex h-24 w-24 items-center justify-center rounded-full font-medium transition-shadow ${
-												tile.isAgent ? "bg-primary/15 text-primary" : "bg-muted text-foreground"
-											} ${tile.speaking ? "ring-4 ring-primary/70 animate-pulse" : ""}`}
+										<div className="relative">
+											<div
+												className={`flex h-24 w-24 items-center justify-center rounded-full font-medium transition-shadow ${
+													tile.isAgent ? "bg-primary/15 text-primary" : "bg-muted text-foreground"
+												} ${tile.speaking ? "ring-4 ring-primary/70 animate-pulse" : ""}`}
 											aria-hidden="true"
 										>
 											{tile.isAgent ? (
@@ -995,10 +1019,20 @@ export default function ConversationComponent({
 												<span className="text-3xl">{getInitial(tile.avatarName)}</span>
 											)}
 										</div>
-										<span className="max-w-full truncate text-sm font-medium text-foreground">
-											{tile.label}
-										</span>
+										{tile.muted ? (
+											<span
+												className="absolute -bottom-1 -right-1 flex h-7 w-7 items-center justify-center rounded-full bg-destructive text-destructive-foreground ring-2 ring-card"
+												title={`${tile.label} is muted`}
+											>
+												<MicOff className="h-3.5 w-3.5" aria-hidden="true" />
+												<span className="sr-only">{tile.label} is muted</span>
+											</span>
+										) : null}
 									</div>
+									<span className="max-w-full truncate text-sm font-medium text-foreground">
+										{tile.label}
+									</span>
+								</div>
 								));
 							})()}
 							{/* A special, always-present tile (not a participant) -- shows
