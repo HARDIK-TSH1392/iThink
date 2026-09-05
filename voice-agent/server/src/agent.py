@@ -9,6 +9,8 @@ import os
 import time
 from typing import Any, Dict, Optional
 
+import httpx
+
 from agora_agent import Area, AsyncAgora
 from agora_agent.agentkit import Agent as AgoraAgent
 from agora_agent.agentkit.vendors import CustomLLM, DeepgramSTT, MiniMaxTTS, OpenAI
@@ -49,6 +51,28 @@ DEFAULT_GREETING = "Hi, this is Watcher. I'll listen in and keep track of what's
 # one person is on the call) instead of treating it as real speech to
 # extract facts from. Keep this in sync with SILENCE_TRIGGER_MARKER there.
 SILENCE_TRIGGER_MARKER = "[[ithink-silence-check]]"
+
+
+async def _fetch_keyterms(ithink_base: str, channel_name: str) -> Optional[str]:
+    """
+    Deepgram keyterm-prompting string for this call (see
+    iCall_utils.build_keyterms) -- boosts recognition of words STT has no
+    reason to get right on its own (the incident's service name, this
+    agent's own name, incident-call jargon). Confirmed live this session:
+    "auth-api" came back as "OT API" with no boosting at all.
+
+    Best-effort, same reasoning as _fetch_late_joiner_catchup in server.py:
+    a slow/unreachable backend should degrade to no boosting, never block
+    the agent from starting.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(f"{ithink_base}/icall/channel/{channel_name}/keyterms")
+            response.raise_for_status()
+            return response.json().get("data", {}).get("keyterm")
+    except Exception:
+        logger.warning("Failed to fetch keyterms for channel=%s", channel_name, exc_info=True)
+        return None
 
 
 class Agent:
@@ -157,7 +181,13 @@ class Agent:
             max_tokens=1024,
             temperature=0.7,
         )
-        stt = DeepgramSTT(model="nova-3", language="en")
+        stt = DeepgramSTT(
+            model="nova-3",
+            language="en",
+            keyterm=await _fetch_keyterms(ithink_base, channel_name),
+            smart_format=True,
+            punctuation=True,
+        )
         tts = MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_captivating_female1")
 
         # Optional BYOK example: replace the STT block above and set DEEPGRAM_API_KEY.
