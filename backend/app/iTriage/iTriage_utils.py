@@ -63,7 +63,7 @@ def _get_client() -> genai.Client:
     return _client
 
 
-SYSTEM_INSTRUCTION = """You are the triage-analysis component of iThink, an
+SYSTEM_INSTRUCTION = """You are the triage-analysis component of Watcher, an
 incident-coordination system. You are given a triggering log event plus
 correlated evidence from the same source/service/region.
 

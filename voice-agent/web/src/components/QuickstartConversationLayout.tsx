@@ -67,7 +67,7 @@ export function QuickstartConversationLayout({
 					/>
 					<div className="flex min-w-0 flex-col justify-center gap-1">
 						<span className="truncate text-lg font-semibold leading-none tracking-[-0.025em] text-foreground">
-							iThink
+							Watcher
 						</span>
 					</div>
 				</div>

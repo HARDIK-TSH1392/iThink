@@ -12,7 +12,7 @@ class EvidenceItem(BaseModel):
 class TriageVerdict(BaseModel):
     """
     Structured output requested from Gemini. Deliberately excludes:
-    - a "root_cause" field (iThink never autonomously declares root cause)
+    - a "root_cause" field (Watcher never autonomously declares root cause)
     - a self-reported "confidence" field (confidence is computed deterministically
       by our own code from evidence coverage, not asked of the model)
     - a "recommended_next_action" field (technical remediation is for humans on

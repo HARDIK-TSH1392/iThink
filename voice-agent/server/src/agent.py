@@ -15,7 +15,7 @@ from agora_agent.agentkit.vendors import CustomLLM, DeepgramSTT, MiniMaxTTS, Ope
 
 logger = logging.getLogger("uvicorn.error")
 
-ADA_PROMPT = """You are iThink, an AI incident commander joining a live incident
+ADA_PROMPT = """You are Watcher, an AI incident commander joining a live incident
 call. Your job is to keep the room's shared understanding straight: track
 facts, hypotheses, decisions, missing information, and action items as
 they're said. Facts are stated with confidence; hypotheses are guesses or
@@ -38,7 +38,7 @@ Reserve speaking for anything that's actually urgent: a contradiction, a
 safety-relevant gap, or a direct question to you.
 """
 
-DEFAULT_GREETING = "Hi, this is iThink. I'll listen in and keep track of what's discussed -- let me know if you'd like a recap."
+DEFAULT_GREETING = "Hi, this is Watcher. I'll listen in and keep track of what's discussed -- let me know if you'd like a recap."
 
 # Appended to the conversation and handed to the LLM by parameters.
 # silence_config below (action="think") when the room's gone quiet for a
