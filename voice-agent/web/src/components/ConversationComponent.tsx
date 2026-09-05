@@ -1,6 +1,6 @@
 "use client";
 
-import { Sparkles } from "lucide-react";
+import { Hand, MicOff, Sparkles } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ConnectionStatusPanel } from "@/components/ConnectionStatusPanel";
@@ -19,6 +19,7 @@ import {
 import { QuickstartTranscriptPanel } from "@/components/QuickstartTranscriptPanel";
 import { McpResponseTile } from "@/components/McpResponseTile";
 import { DEFAULT_AGENT_UID } from "@/lib/agora";
+import { playHandRaiseChime, playJoinChime } from "@/lib/chimes";
 import {
 	type ChatNote,
 	type SharedScreen,
@@ -109,6 +110,28 @@ function isSharedScreenBroadcast(value: unknown): value is SharedScreenBroadcast
 		typeof value === "object" &&
 		(value as { type?: unknown }).type === "ithink_shared_screen" &&
 		!!(value as { screen?: unknown }).screen
+	);
+}
+
+// Peer-to-peer, not backend-mediated -- unlike the shared-screen broadcast
+// above (pushed server-side via the Signaling REST API), a raised hand is
+// purely ephemeral client UI state with nothing worth persisting, so each
+// client publishes this directly to the RTM channel itself (see
+// toggleHandRaise) and every other subscribed client's own "message"
+// listener picks it up the same way it already does for shared screens.
+type HandRaiseBroadcast = {
+	type: "ithink_hand_raise";
+	uid: string;
+	raised: boolean;
+};
+
+function isHandRaiseBroadcast(value: unknown): value is HandRaiseBroadcast {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		(value as { type?: unknown }).type === "ithink_hand_raise" &&
+		typeof (value as { uid?: unknown }).uid === "string" &&
+		typeof (value as { raised?: unknown }).raised === "boolean"
 	);
 }
 
@@ -269,6 +292,73 @@ export default function ConversationComponent({
 			rtmClient.removeEventListener("message", handleSharedScreenMessage);
 		};
 	}, [rtmClient]);
+
+	// Raised hands, keyed by uid string -- includes the local participant's
+	// own uid so tiles.map below can treat every tile the same way rather
+	// than special-casing "am I the local tile." toggleHandRaise updates
+	// this optimistically for the local uid (no round trip needed to know
+	// your own state) and separately publishes it for everyone else.
+	const [raisedHandUids, setRaisedHandUids] = useState<Set<string>>(new Set());
+
+	useEffect(() => {
+		const handleHandRaiseMessage = (event: { message: string | Uint8Array }) => {
+			const payloadText =
+				typeof event.message === "string" ? event.message : new TextDecoder().decode(event.message);
+
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(payloadText);
+			} catch {
+				return;
+			}
+
+			if (!isHandRaiseBroadcast(parsed)) return;
+
+			// Only chime on a hand going UP -- lowering one is a quiet
+			// action, nothing worth a sound for.
+			if (parsed.raised) playHandRaiseChime();
+
+			setRaisedHandUids((prev) => {
+				const next = new Set(prev);
+				if (parsed.raised) next.add(parsed.uid);
+				else next.delete(parsed.uid);
+				return next;
+			});
+		};
+
+		rtmClient.addEventListener("message", handleHandRaiseMessage);
+		return () => {
+			rtmClient.removeEventListener("message", handleHandRaiseMessage);
+		};
+	}, [rtmClient]);
+
+	const toggleHandRaise = useCallback(async () => {
+		const uidStr = String(agoraData.uid);
+		const next = !raisedHandUids.has(uidStr);
+
+		setRaisedHandUids((prev) => {
+			const updated = new Set(prev);
+			if (next) updated.add(uidStr);
+			else updated.delete(uidStr);
+			return updated;
+		});
+
+		// RTM never echoes a client's own published message back to itself --
+		// the receive handler below (which plays this same chime) only ever
+		// fires for OTHER participants, so raising your own hand needs its
+		// own explicit play call or the person who just clicked hears nothing.
+		if (next) playHandRaiseChime();
+
+		try {
+			await rtmClient.publish(
+				agoraData.channel,
+				JSON.stringify({ type: "ithink_hand_raise", uid: uidStr, raised: next }),
+				{ channelType: "MESSAGE" },
+			);
+		} catch (error) {
+			console.error("Failed to broadcast hand-raise state:", error);
+		}
+	}, [agoraData.channel, agoraData.uid, raisedHandUids, rtmClient]);
 
 	const [isReady, setIsReady] = useState(false);
 	useEffect(() => {
@@ -554,10 +644,29 @@ export default function ConversationComponent({
 
 	useClientEvent(client, "user-joined", (user) => {
 		if (user.uid.toString() === agentUID) setIsAgentConnected(true);
+		playJoinChime();
 	});
 
 	useClientEvent(client, "user-left", (user) => {
 		if (user.uid.toString() === agentUID) setIsAgentConnected(false);
+	});
+
+	// Remote mic mute/unmute for the participant tiles below. Muting here
+	// (see handleMicToggle) uses track.setEnabled, not unpublish/publish --
+	// that surfaces to other clients as "user-info-updated" with a
+	// "mute-audio"/"unmute-audio" message, a different event than
+	// user-published/user-unpublished (which is for a track being
+	// attached/detached entirely, not just muted).
+	const [remoteMutedUids, setRemoteMutedUids] = useState<Set<string>>(new Set());
+
+	useClientEvent(client, "user-info-updated", (uid, msg) => {
+		if (msg !== "mute-audio" && msg !== "unmute-audio") return;
+		setRemoteMutedUids((prev) => {
+			const next = new Set(prev);
+			if (msg === "mute-audio") next.add(String(uid));
+			else next.delete(String(uid));
+			return next;
+		});
 	});
 
 	// Per-participant speaking indicator for the grid view -- Agora reports
@@ -957,6 +1066,8 @@ export default function ConversationComponent({
 										avatarName: localName || "You",
 										isAgent: false,
 										speaking: speakingUids.has(String(localUid)) && isEnabled,
+										muted: !isEnabled,
+										handRaised: raisedHandUids.has(String(localUid)),
 									},
 									...remoteUsers.map((user) => {
 										const isAgent = String(user.uid) === String(agentUID);
@@ -972,6 +1083,11 @@ export default function ConversationComponent({
 											speaking: isAgent
 												? visualizerState === "talking"
 												: speakingUids.has(String(user.uid)),
+											// The agent has no manual mute toggle from a participant's
+											// perspective -- the indicator only means something for
+											// actual meeting members.
+											muted: isAgent ? false : remoteMutedUids.has(String(user.uid)),
+											handRaised: isAgent ? false : raisedHandUids.has(String(user.uid)),
 										};
 									}),
 								];
@@ -981,10 +1097,11 @@ export default function ConversationComponent({
 										key={tile.uid}
 										className="flex flex-col items-center gap-3 rounded-2xl border border-border bg-card/60 px-5 py-8"
 									>
-										<div
-											className={`flex h-24 w-24 items-center justify-center rounded-full font-medium transition-shadow ${
-												tile.isAgent ? "bg-primary/15 text-primary" : "bg-muted text-foreground"
-											} ${tile.speaking ? "ring-4 ring-primary/70 animate-pulse" : ""}`}
+										<div className="relative">
+											<div
+												className={`flex h-24 w-24 items-center justify-center rounded-full font-medium transition-shadow ${
+													tile.isAgent ? "bg-primary/15 text-primary" : "bg-muted text-foreground"
+												} ${tile.speaking ? "ring-4 ring-primary/70 animate-pulse" : ""}`}
 											aria-hidden="true"
 										>
 											{tile.isAgent ? (
@@ -993,10 +1110,29 @@ export default function ConversationComponent({
 												<span className="text-3xl">{getInitial(tile.avatarName)}</span>
 											)}
 										</div>
-										<span className="max-w-full truncate text-sm font-medium text-foreground">
-											{tile.label}
-										</span>
+										{tile.muted ? (
+											<span
+												className="absolute -bottom-1 -right-1 flex h-7 w-7 items-center justify-center rounded-full bg-destructive text-destructive-foreground ring-2 ring-card"
+												title={`${tile.label} is muted`}
+											>
+												<MicOff className="h-3.5 w-3.5" aria-hidden="true" />
+												<span className="sr-only">{tile.label} is muted</span>
+											</span>
+										) : null}
+										{tile.handRaised ? (
+											<span
+												className="absolute -top-1 -right-1 flex h-7 w-7 items-center justify-center rounded-full bg-amber-500 text-white ring-2 ring-card"
+												title={`${tile.label} raised their hand`}
+											>
+												<Hand className="h-3.5 w-3.5" aria-hidden="true" />
+												<span className="sr-only">{tile.label} raised their hand</span>
+											</span>
+										) : null}
 									</div>
+									<span className="max-w-full truncate text-sm font-medium text-foreground">
+										{tile.label}
+									</span>
+								</div>
 								));
 							})()}
 							{/* A special, always-present tile (not a participant) -- shows
@@ -1021,6 +1157,20 @@ export default function ConversationComponent({
 							/>
 						</div>
 						<MicrophoneSelector localMicrophoneTrack={localMicrophoneTrack} />
+						<button
+							type="button"
+							onClick={toggleHandRaise}
+							aria-pressed={raisedHandUids.has(String(agoraData.uid))}
+							aria-label={raisedHandUids.has(String(agoraData.uid)) ? "Lower hand" : "Raise hand"}
+							title={raisedHandUids.has(String(agoraData.uid)) ? "Lower hand" : "Raise hand"}
+							className={`flex h-11 w-11 items-center justify-center rounded-full border transition-colors ${
+								raisedHandUids.has(String(agoraData.uid))
+									? "border-amber-500 bg-amber-500/15 text-amber-500"
+									: "border-border bg-card text-foreground hover:bg-muted"
+							}`}
+						>
+							<Hand className="h-5 w-5" strokeWidth={1.75} aria-hidden="true" />
+						</button>
 					</fieldset>
 				}
 				chatPanel={

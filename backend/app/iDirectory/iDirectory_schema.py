@@ -11,6 +11,7 @@ EmployeeRole = Literal["member", "lead", "manager"]
 EmployeeTitle = Literal[
     "backend_engineer",
     "frontend_engineer",
+    "ai_engineer",
     "devops",
     "team_lead",
     "manager",

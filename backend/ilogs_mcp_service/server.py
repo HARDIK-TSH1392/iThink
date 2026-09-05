@@ -35,7 +35,7 @@ app = MCPServer(
 async def get_recent_logs(
     service: str,
     region: str = "",
-    since_minutes: int = 60,
+    since_minutes: int = 1440,
     severity: str = "",
     limit: int = 20,
 ) -> list[dict]:
@@ -44,6 +44,16 @@ async def get_recent_logs(
     region and minimum severity, from the last `since_minutes` minutes.
     Returns each entry's severity, message, timestamp, and source_id,
     newest first.
+
+    Default widened from 60 to 1440 (24h): confirmed live that the model
+    calling this tool has no reliable way to know how long ago an incident
+    actually started (logs leading up to it typically predate when it was
+    officially detected/created), so a tight default silently returned "no
+    log entries found" for a real, ongoing incident purely because more
+    than an hour of real time had passed since the log was recorded --
+    not a data problem, just too narrow a default window for an incident-
+    investigation tool. The caller can still pass a smaller value
+    explicitly when it actually wants a tight recent window.
     """
     from datetime import datetime, timedelta, timezone
 

@@ -8,6 +8,7 @@ from app.database import async_session
 from app.iNcidents.iNcidents_crudl import get_incident, record_approval_decision
 from app.iNcidents.iNcidents_utils import STATUS_AWAITING_APPROVAL
 from app.iCall.iCall_service import get_call
+from app.iCall.iCall_utils import review_ticket_content
 
 from .iOrchestrate_utils import (
     verify_slack_signature,
@@ -62,7 +63,20 @@ async def _handle_jira_decision(db, action_id: str, call_id: int, user_name: str
         await update_slack_message(response_url, f"⚠️ Incident for call #{call_id} not found.")
         return
 
-    summary_text = format_call_summary(call.structured_state)
+    # Confirmed live (incident-101, a solo test call): the room's raw
+    # recorded state can carry test artifacts ("wait for the teammate to
+    # join") and garbled/repeated restatements of the same guess -- fine
+    # for a live coordination aid, bad for an external ticket someone else
+    # has to act on. review_ticket_content is a read-only cleanup applied
+    # only here, right before the ticket is built -- it never touches
+    # call.structured_state itself, so the live call's own record (and
+    # Slack's post-call summary, which intentionally stays raw/verbatim)
+    # are unaffected. action_items/timeline etc. pass through untouched.
+    reviewed = await review_ticket_content(call.structured_state or {})
+    ticket_state = dict(call.structured_state or {})
+    ticket_state.update(reviewed.model_dump())
+
+    summary_text = format_call_summary(ticket_state, call.participant_roles)
     url = await create_jira_ticket(incident.id, incident.title, summary_text)
 
     if url:

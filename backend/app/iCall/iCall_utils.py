@@ -16,6 +16,7 @@ from .iCall_schema import (
     CallRoleClassification,
     ActionItemOwnerAssignments,
     UnresolvedRisksSummary,
+    ReviewedTicketContent,
 )
 
 # -----------------------------------------------------------------------------
@@ -584,6 +585,9 @@ def _build_structuring_prompt(
     existing_state: dict,
     deploy_check_result: Optional[dict] = None,
     tool_result_text: Optional[str] = None,
+    service: Optional[str] = None,
+    region: Optional[str] = None,
+    incident_age_minutes: Optional[int] = None,
 ) -> str:
     conversation = "\n".join(f"{m.role}: {m.content or ''}" for m in messages)
     deploy_summary = deploy_check_result.get("summary") if deploy_check_result else None
@@ -592,6 +596,44 @@ def _build_structuring_prompt(
         if deploy_summary
         else ""
     )
+    # Confirmed live: without this, a native-MCP tool call (get_recent_logs
+    # or GitHub's commit-listing tools) had no way to know which service/
+    # region/repo this incident is actually about -- it only worked when a
+    # participant happened to say the exact service name out loud in this
+    # call's own conversation, and returned nothing for a service like
+    # "cdn-edge" that never got mentioned by name. service/region are
+    # already known, deterministic facts (see generate_structuring_update's
+    # docstring) -- surfacing them here means a tool call fills in the
+    # right arguments instead of guessing from conversation content.
+    incident_context_section = ""
+    if service:
+        repo = SERVICE_TO_GITHUB_REPO.get(service)
+        repo_line = (
+            f"Linked GitHub repo for this service: {repo} -- use this exact repo when looking up commits/deploys."
+            if repo
+            else "No GitHub repo is linked for this service -- if asked for commits/deploys, say so rather than guessing a repo."
+        )
+        # get_recent_logs' own default window is generous (24h, see
+        # ilogs_mcp_service/server.py) precisely because logs leading up to
+        # an incident typically predate when it was officially detected --
+        # this is just context, not a precise value to compute against;
+        # asking the model to do that math itself was the fragile version
+        # of this fix (it doesn't know how far pre-detection logs go back
+        # either).
+        age_line = (
+            f"This incident was created {incident_age_minutes} minute(s) ago -- if a log lookup "
+            "comes back empty, don't assume there's nothing to find; widen since_minutes well beyond "
+            "the tool's default before concluding that.\n"
+            if incident_age_minutes is not None
+            else ""
+        )
+        incident_context_section = (
+            f"\nThis incident's service is `{service}`"
+            + (f" in region `{region}`" if region else "")
+            + " -- use this exact value (not something inferred from conversation) as the service/region argument for "
+            "any log or GitHub lookup tool you call.\n"
+            f"{repo_line}\n{age_line}"
+        )
     # tool_result_text: this turn is the follow-up after the model itself
     # called an Agora-native MCP tool (see chat_completions_endpoint) --
     # same "this directly answers the question" framing as the deploy
@@ -604,7 +646,7 @@ def _build_structuring_prompt(
     return f"""Incident state recorded so far (facts/hypotheses/decisions already
 confirmed in this call — use this to detect contradictions, not to repeat):
 {existing_state}
-{deploy_section}{tool_section}
+{incident_context_section}{deploy_section}{tool_section}
 Conversation so far:
 {conversation}
 
@@ -662,6 +704,8 @@ async def generate_structuring_update(
     service: Optional[str] = None,
     tools: Optional[List[dict]] = None,
     tool_result_text: Optional[str] = None,
+    region: Optional[str] = None,
+    incident_age_minutes: Optional[int] = None,
 ) -> StructuringResult:
     """
     One turn of live structuring: given the conversation and what's already
@@ -670,6 +714,15 @@ async def generate_structuring_update(
     should say. Degrades to a plain fallback reply (not an error) when no
     API key is configured, same reasoning as the original proxy-only version
     this replaces — prove the wiring survives even without a real key.
+
+    service/region are the incident's own, known-deterministic values --
+    used both for the existing GitHub-deploy-check heuristic below AND
+    (via _build_structuring_prompt's incident_context_section) surfaced
+    directly to the model so a native MCP tool call (get_recent_logs,
+    GitHub's commit tools) has the right arguments instead of only working
+    when a participant happened to say the service name out loud. Confirmed
+    live: a service with no such mention in conversation (e.g. "cdn-edge")
+    returned nothing from either tool before this was added.
 
     service is the incident's own service (a known, deterministic fact --
     not guessed from conversation) used to check GitHub for recent deploys
@@ -693,7 +746,10 @@ async def generate_structuring_update(
     gemini_tool = _convert_tools_to_gemini(tools)
 
     client = _get_client()
-    prompt = _build_structuring_prompt(messages, existing_state, deploy_check_result, tool_result_text)
+    prompt = _build_structuring_prompt(
+        messages, existing_state, deploy_check_result, tool_result_text,
+        service=service, region=region, incident_age_minutes=incident_age_minutes,
+    )
     config = types.GenerateContentConfig(
         system_instruction=STRUCTURING_SYSTEM_INSTRUCTION,
         response_mime_type="application/json",
@@ -1108,6 +1164,7 @@ def build_health_recap(structured_state: dict) -> str:
 ROLE_CATEGORIES = [
     "backend_engineer",
     "frontend_engineer",
+    "ai_engineer",
     "devops",
     "team_lead",
     "manager",
@@ -1393,6 +1450,129 @@ async def summarize_unresolved_risks(structured_state: dict) -> UnresolvedRisksS
     except Exception as exc:
         print(f"[iCall] Unresolved-risks response didn't match schema, leaving risks empty: {exc}")
         return UnresolvedRisksSummary()
+
+
+# -----------------------------------------------------------------------------
+# Pre-Jira-ticket content review -- confirmed live (incident-101, a solo
+# test call): the room's raw recorded state can carry test artifacts
+# ("wait for the teammate to join"), and repeated/garbled restatements of
+# the same guess across turns (STT noise -- "reverse east" for "US East"),
+# that read fine as a live coordination aid but badly as an external ticket
+# someone outside the call has to act on. This is a one-time, read-only
+# cleanup applied ONLY when building the ticket body -- never written back
+# to IncidentCall.structured_state, so it can never affect the live call's
+# own system-of-record (corrects_fact matching, health scoring, the stale-
+# action-item nudge) the way editing the real state in place would.
+# -----------------------------------------------------------------------------
+
+TICKET_CONTENT_REVIEW_SYSTEM_INSTRUCTION = """You are cleaning up a live
+incident call's recorded notes before they become a Jira ticket description
+that someone outside the call will read and act on. Your job is to make it
+read like a real ticket, not to change what actually happened.
+
+Rules:
+- Remove an item only when it's clearly not about the incident itself --
+  call logistics or filler like "wait for the teammate to join," a greeting
+  that got recorded as a fact, or an obvious test/placeholder statement.
+  When in doubt, keep it: don't remove anything that could plausibly matter
+  to someone investigating this incident later.
+- Merge hypotheses that are just restatements of the same underlying guess
+  worded differently across turns (common with live speech-to-text noise,
+  e.g. "the network is down in a specific region" / "the region is US
+  East" / a mis-transcribed variant of the same word) into ONE clearly
+  phrased version. Do not merge hypotheses that are actually different
+  theories, even if they sound related.
+- Fix awkward, garbled, or run-on phrasing into clear, professional
+  English -- without changing what was actually asked, decided, or
+  observed, and without resolving a question that was never actually
+  answered on the call. A still-open conflict must stay phrased as an open
+  question, just a clearly worded one.
+- Never invent information that wasn't recorded, and never drop a
+  genuinely distinct fact, decision, missing-info gap, conflict, or risk --
+  only remove true noise and merge true duplicates.
+- Output must strictly match the response schema below.
+"""
+
+
+def _build_ticket_content_review_prompt(structured_state: dict) -> str:
+    return f"""Recorded state for this incident call, to be cleaned up for
+a Jira ticket:
+{structured_state}
+
+Produce the cleaned version per the rules above.
+"""
+
+
+def _passthrough_reviewed_ticket_content(structured_state: dict) -> ReviewedTicketContent:
+    """
+    Safe degrade for review_ticket_content: unlike summarize_unresolved_
+    risks (where "no risks" is a valid answer), an empty result here would
+    mean a Jira ticket gets created with its description silently wiped --
+    much worse than the pre-review, slightly messy text. On any failure,
+    fall back to the ORIGINAL unedited lists rather than an empty review.
+    """
+    state = structured_state or {}
+    return ReviewedTicketContent(
+        facts=list(state.get("facts", [])),
+        hypotheses=list(state.get("hypotheses", [])),
+        decisions=list(state.get("decisions", [])),
+        missing_info=list(state.get("missing_info", [])),
+        conflicts=list(state.get("conflicts", [])),
+        unresolved_risks=list(state.get("unresolved_risks", [])),
+    )
+
+
+async def review_ticket_content(structured_state: dict) -> ReviewedTicketContent:
+    """
+    One pass, run only when a Jira ticket is actually about to be created
+    (see iOrchestrate_api._handle_jira_decision) -- never on the live call
+    path. Falls back to the unedited original content (not an empty
+    result) whenever there's nothing to review or the model call fails.
+    """
+    fallback = _passthrough_reviewed_ticket_content(structured_state)
+    if not structured_state or not get_settings().gemini_api_key:
+        return fallback
+
+    client = _get_client()
+    prompt = _build_ticket_content_review_prompt(structured_state)
+    config = types.GenerateContentConfig(
+        system_instruction=TICKET_CONTENT_REVIEW_SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=ReviewedTicketContent,
+    )
+
+    async with _gemini_semaphore:
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=PRIMARY_MODEL,
+                    contents=prompt,
+                    config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            print(f"[iCall] Ticket-content review primary call failed/timed out, trying fallback: {exc}")
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=FALLBACK_MODEL,
+                        contents=prompt,
+                        config=config,
+                    ),
+                    timeout=GEMINI_CALL_TIMEOUT_S,
+                )
+            except Exception as exc2:
+                print(f"[iCall] Ticket-content review failed on both attempts, using unedited content: {exc2}")
+                return fallback
+
+    try:
+        return ReviewedTicketContent.model_validate_json(response.text)
+    except Exception as exc:
+        print(f"[iCall] Ticket-content review response didn't match schema, using unedited content: {exc}")
+        return fallback
 
 
 # -----------------------------------------------------------------------------
