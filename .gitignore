@@ -40,6 +40,9 @@ htmlcov/
 *.log
 logs/
 
+# scripts/start.sh's PID/log state dir
+.dev/
+
 # OS
 .DS_Store
 Thumbs.db
