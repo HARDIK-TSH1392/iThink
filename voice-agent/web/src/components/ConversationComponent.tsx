@@ -19,6 +19,7 @@ import {
 import { QuickstartTranscriptPanel } from "@/components/QuickstartTranscriptPanel";
 import { McpResponseTile } from "@/components/McpResponseTile";
 import { DEFAULT_AGENT_UID } from "@/lib/agora";
+import { playJoinChime } from "@/lib/joinChime";
 import {
 	type ChatNote,
 	type SharedScreen,
@@ -554,6 +555,7 @@ export default function ConversationComponent({
 
 	useClientEvent(client, "user-joined", (user) => {
 		if (user.uid.toString() === agentUID) setIsAgentConnected(true);
+		playJoinChime();
 	});
 
 	useClientEvent(client, "user-left", (user) => {
