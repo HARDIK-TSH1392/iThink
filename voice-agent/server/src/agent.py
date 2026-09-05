@@ -168,6 +168,28 @@ class Agent:
         # generate_channel_name) and doubles as the lookup key here.
         # STT/TTS stay on managed defaults — only the LLM step is ours.
         ithink_base = os.getenv("ITHINK_BACKEND_BASE_URL", "http://127.0.0.1:8123/api/v1")
+
+        # Native MCP tool-calling -- Agora's platform calls these MCP
+        # servers directly and forwards real OpenAI-style `tools`/
+        # `tool_choice` to our custom LLM endpoint (confirmed live: only
+        # works with advanced_features.enable_tools=True below, silently
+        # ignored otherwise). GitHub's is the real, official remote MCP
+        # server; iLogs' is our own thin MCP wrapper around this backend's
+        # GET /ilogs/ (see backend/ilogs_mcp_service/) -- both need a
+        # publicly reachable endpoint since Agora's cloud calls them, not
+        # this local process.
+        mcp_servers = []
+        github_token = os.getenv("GITHUB_TOKEN")
+        if github_token:
+            mcp_servers.append({
+                "name": "github",
+                "endpoint": "https://api.githubcopilot.com/mcp/",
+                "headers": {"Authorization": f"Bearer {github_token}"},
+            })
+        ilogs_mcp_url = os.getenv("ILOGS_MCP_URL")
+        if ilogs_mcp_url:
+            mcp_servers.append({"name": "ilogs", "endpoint": ilogs_mcp_url})
+
         llm = CustomLLM(
             base_url=os.getenv(
                 "ITHINK_LLM_URL",
@@ -180,23 +202,31 @@ class Agent:
             max_history=15,
             max_tokens=1024,
             temperature=0.7,
+            mcp_servers=mcp_servers or None,
         )
-        # Reverted keyterm/smart_format/punctuation -- confirmed live
-        # (incident-33/34/35, three consecutive real calls, zero
-        # exceptions): every one produced real, non-silence turns hitting
-        # the backend (Agora's own VAD/turn detection kept working) but
-        # zero usable transcript content -- no call_utterances, no
-        # extracted facts across 10+ turns each, flat 100 health score the
-        # entire call. incident-31, run before this block was added, had
-        # 13 real transcribed utterances on the same setup otherwise. This
-        # is the only change since then that touches the actual Deepgram
-        # wire config, so it's the prime suspect -- reverting to the
-        # known-good minimal config while that's investigated properly
-        # (in particular: whether keyterm needs to be pre-URL-encoded
-        # before reaching Agora's join API, per its own documented
-        # example format "term1%20term2", which the vendor call in
-        # iCall_utils.build_keyterms does not do).
-        stt = DeepgramSTT(model="nova-3", language="en")
+        # en-IN is a real, separately-documented Deepgram nova-3 language
+        # code (confirmed against Deepgram's own docs, not just "en" with
+        # an accent guess) -- tunes the acoustic model for Indian-accented
+        # English instead of defaulting toward US English. Per-call keyterm
+        # fetch already boosts the agent's own name via build_keyterms.
+        #
+        # keyterm/smart_format/punctuation were reverted earlier this
+        # session after incident-33/34/35 each produced real, non-silence
+        # turns but zero usable transcript content -- correlated, never
+        # actually root-caused. Reinstated here alongside the en-IN locale
+        # change (a genuinely distinct, separately-verified fix) on the
+        # team's decision to re-test properly rather than assume the old
+        # correlation still holds with the locale now correct. If
+        # transcription goes silent again on live audio, re-open the
+        # en-IN vs keyterm/smart_format/punctuation question -- don't
+        # assume it's settled just because this merge kept both.
+        stt = DeepgramSTT(
+            model="nova-3",
+            language="en-IN",
+            keyterm=await _fetch_keyterms(ithink_base, channel_name),
+            smart_format=True,
+            punctuation=True,
+        )
         tts = MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_captivating_female1")
 
         # Optional BYOK example: replace the STT block above and set DEEPGRAM_API_KEY.

@@ -75,12 +75,21 @@ class ChatMessage(BaseModel):
     turn_id/timestamp per message on top of the standard OpenAI role/content
     shape — accepted here but not required, since this is a proxy-only
     first version (see iCall_utils.generate_chat_reply).
+
+    tool_calls/tool_call_id/name support native MCP tool-calling (see
+    chat_completions_endpoint): an assistant message that called a tool
+    has tool_calls and often no content; the tool's result comes back as
+    its own role="tool" message with tool_call_id (and sometimes name)
+    set, content holding the tool's return value.
     """
 
     role: str
-    content: str
+    content: Optional[str] = None
     turn_id: Optional[int] = None
     timestamp: Optional[int] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
 
 
 class AgoraWebhookEvent(BaseModel):
@@ -243,6 +252,13 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
     stream: Optional[bool] = True
+    # Native MCP tool-calling (see voice-agent/server/src/agent.py's
+    # mcp_servers config) -- present only when Agora registered MCP
+    # server(s) on this agent's LLM. Declared as plain dicts (not typed
+    # further) since we only need to hand them to Gemini's function-
+    # calling config, not validate their shape ourselves.
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None
 
     class Config:
         extra = "allow"

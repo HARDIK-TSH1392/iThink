@@ -90,7 +90,9 @@ export type GithubCommit = {
 }
 
 export type LogEntry = {
-  id: number
+  // Absent for logs returned via the native MCP tool call (get_recent_logs
+  // doesn't fetch the DB row id) -- only ever used as a React list key.
+  id?: number
   severity: string
   message: string
   timestamp: string
@@ -103,6 +105,10 @@ export type LogEntry = {
 export type SharedScreen =
   | { type: 'github_commits'; title: string; commits: GithubCommit[]; timestamp: string }
   | { type: 'logs'; title: string; logs: LogEntry[]; timestamp: string }
+  // Result of any native MCP tool call that isn't get_recent_logs (see
+  // backend's _maybe_push_tool_result_screen) -- shown as raw text since
+  // GitHub's ~30 MCP tools each return a different shape.
+  | { type: 'tool_result'; title: string; text: string; timestamp: string }
 
 export async function setName(
   channelName: string,

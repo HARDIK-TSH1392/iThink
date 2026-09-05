@@ -3,7 +3,7 @@ import hashlib
 import hmac
 import re
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Set
 
 import httpx
 from google import genai
@@ -580,19 +580,31 @@ async def broadcast_shared_screen(channel_name: str, screen: dict) -> bool:
 
 
 def _build_structuring_prompt(
-    messages: List[ChatMessage], existing_state: dict, deploy_check_result: Optional[dict] = None
+    messages: List[ChatMessage],
+    existing_state: dict,
+    deploy_check_result: Optional[dict] = None,
+    tool_result_text: Optional[str] = None,
 ) -> str:
-    conversation = "\n".join(f"{m.role}: {m.content}" for m in messages)
+    conversation = "\n".join(f"{m.role}: {m.content or ''}" for m in messages)
     deploy_summary = deploy_check_result.get("summary") if deploy_check_result else None
     deploy_section = (
         f"\nGitHub lookup result (only mention this if it's actually relevant to what was just asked):\n{deploy_summary}\n"
         if deploy_summary
         else ""
     )
+    # tool_result_text: this turn is the follow-up after the model itself
+    # called an Agora-native MCP tool (see chat_completions_endpoint) --
+    # same "this directly answers the question" framing as the deploy
+    # lookup above, just for whichever tool was actually called.
+    tool_section = (
+        f"\nTool result (this DIRECTLY ANSWERS what you just asked to look up -- state it as fact, don't say \"checking\"):\n{tool_result_text}\n"
+        if tool_result_text
+        else ""
+    )
     return f"""Incident state recorded so far (facts/hypotheses/decisions already
 confirmed in this call — use this to detect contradictions, not to repeat):
 {existing_state}
-{deploy_section}
+{deploy_section}{tool_section}
 Conversation so far:
 {conversation}
 
@@ -605,9 +617,52 @@ def _fallback_structuring_update(reply: str = FALLBACK_REPLY) -> StructuringUpda
     return StructuringUpdate(spoken_reply=reply)
 
 
+class StructuringResult(NamedTuple):
+    """
+    update is None exactly when tool_call is set -- the model decided to
+    call an Agora-native MCP tool instead of answering this turn, so
+    there's nothing to structure yet (see chat_completions_endpoint: the
+    real structuring happens on the follow-up request once the tool's
+    result comes back).
+    """
+    update: Optional[StructuringUpdate]
+    deploy_check_result: Optional[dict]
+    tool_call: Optional[Any]
+
+
+def _convert_tools_to_gemini(tools: Optional[List[dict]]) -> Optional[types.Tool]:
+    """
+    Converts Agora's OpenAI-format `tools` (forwarded from its native MCP
+    server registration, see voice-agent/server/src/agent.py's mcp_servers
+    config) into a Gemini Tool. OpenAI's function.parameters is already
+    JSON schema, same shape Gemini's parameters_json_schema expects, so
+    this is a straight field remap, not a real format conversion.
+    """
+    if not tools:
+        return None
+    declarations = []
+    for entry in tools:
+        fn = entry.get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        declarations.append(
+            types.FunctionDeclaration(
+                name=name,
+                description=fn.get("description") or "",
+                parameters_json_schema=fn.get("parameters") or {"type": "object", "properties": {}},
+            )
+        )
+    return types.Tool(function_declarations=declarations) if declarations else None
+
+
 async def generate_structuring_update(
-    messages: List[ChatMessage], existing_state: dict, service: Optional[str] = None
-) -> Tuple[StructuringUpdate, Optional[dict]]:
+    messages: List[ChatMessage],
+    existing_state: dict,
+    service: Optional[str] = None,
+    tools: Optional[List[dict]] = None,
+    tool_result_text: Optional[str] = None,
+) -> StructuringResult:
     """
     One turn of live structuring: given the conversation and what's already
     recorded for this call, extract new facts/hypotheses/decisions/action
@@ -619,24 +674,31 @@ async def generate_structuring_update(
     service is the incident's own service (a known, deterministic fact --
     not guessed from conversation) used to check GitHub for recent deploys
     when this turn sounds like it's asking about one. See
-    _maybe_check_recent_deploys.
+    _maybe_check_recent_deploys -- this deterministic path stays in place
+    alongside native tool-calling below, not replaced by it: it's proven
+    and adds no extra round-trip, whereas tools are only used when the
+    model itself decides a turn needs one.
 
-    Returns (update, deploy_check_result) -- the second element is the raw
-    {"summary", "commits", "repo"} dict when a deploy lookup actually ran
-    this turn (None otherwise), so the caller can push a GitHub shared
-    screen with real per-commit data instead of re-running the same lookup.
+    tools, when Agora registered MCP server(s) on this agent (see
+    voice-agent/server/src/agent.py's mcp_servers), lets the model call
+    them directly (confirmed live: Gemini supports tools + response_schema
+    in the same call -- it either returns a function_call part, in which
+    case result.update is None and result.tool_call is set, or normal
+    structured JSON matching StructuringUpdate).
     """
     if not get_settings().gemini_api_key:
-        return _fallback_structuring_update(), None
+        return StructuringResult(_fallback_structuring_update(), None, None)
 
     deploy_check_result = await _maybe_check_recent_deploys(messages, service)
+    gemini_tool = _convert_tools_to_gemini(tools)
 
     client = _get_client()
-    prompt = _build_structuring_prompt(messages, existing_state, deploy_check_result)
+    prompt = _build_structuring_prompt(messages, existing_state, deploy_check_result, tool_result_text)
     config = types.GenerateContentConfig(
         system_instruction=STRUCTURING_SYSTEM_INSTRUCTION,
         response_mime_type="application/json",
         response_schema=StructuringUpdate,
+        tools=[gemini_tool] if gemini_tool else None,
     )
 
     async with _gemini_semaphore:
@@ -668,15 +730,21 @@ async def generate_structuring_update(
                 # conversation (Agora's Custom LLM hook has nothing to send
                 # back to the room until this returns).
                 print(f"[iCall] Structuring failed on both attempts, falling back: {exc2}")
-                return _fallback_structuring_update(MODEL_UNAVAILABLE_REPLY), None
+                return StructuringResult(_fallback_structuring_update(MODEL_UNAVAILABLE_REPLY), None, None)
+
+    parts = response.candidates[0].content.parts if response.candidates else []
+    function_call = next((p.function_call for p in parts if p.function_call), None)
+    if function_call:
+        return StructuringResult(None, deploy_check_result, function_call)
 
     try:
-        return StructuringUpdate.model_validate_json(response.text), deploy_check_result
+        update = StructuringUpdate.model_validate_json(response.text)
     except Exception:
         # Model returned something that didn't match the schema — don't crash
         # the live call over a malformed extraction, just say something safe
         # and record nothing rather than guessing at a partial parse.
-        return StructuringUpdate(spoken_reply=MALFORMED_RESPONSE_FALLBACK), None
+        update = StructuringUpdate(spoken_reply=MALFORMED_RESPONSE_FALLBACK)
+    return StructuringResult(update, deploy_check_result, None)
 
 
 # -----------------------------------------------------------------------------

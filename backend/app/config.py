@@ -49,7 +49,10 @@ class Settings(BaseSettings):
     # before nudging an empty room. Reverse direction of the usual call
     # (voice-agent calls this backend, not the other way around), but same
     # "separate local service, plain HTTP" pattern.
-    voice_agent_server_url: str = "http://localhost:8002"
+    # Matches voice-agent/server/.env.example's documented PORT=8000
+    # default -- not 8002 (an earlier, environment-specific workaround on
+    # one machine where 8000 was taken by an unrelated project).
+    voice_agent_server_url: str = "http://localhost:8000"
 
     # Agora's project App ID (same value as voice-agent/server's
     # AGORA_APP_ID) -- this backend needs it too to build the Signaling
