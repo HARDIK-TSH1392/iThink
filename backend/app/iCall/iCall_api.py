@@ -756,7 +756,15 @@ async def agora_webhook_endpoint(request: Request, db: AsyncSession = Depends(ge
     try:
         event = AgoraWebhookEvent.model_validate_json(raw_body)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=f"Malformed webhook payload: {exc}")
+        # Confirmed live: Agora Console's own registration health check
+        # POSTs a body that doesn't match this schema, and previously got
+        # rejected with 422 -- which would fail the health check and block
+        # registration outright. A malformed/unrecognized body is never
+        # worth a 4xx here: Agora already expects 200 or it retries the
+        # (real) event forever, and the console's own probe isn't a real
+        # event to act on anyway.
+        print(f"[iCall webhook] payload didn't match AgoraWebhookEvent, acking anyway: {exc}")
+        return {"status": "ignored", "reason": "unrecognized payload shape"}
 
     print(
         f"[iCall webhook] {describe_event_type(event.eventType)} "
