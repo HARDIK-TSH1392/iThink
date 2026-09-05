@@ -181,13 +181,22 @@ class Agent:
             max_tokens=1024,
             temperature=0.7,
         )
-        stt = DeepgramSTT(
-            model="nova-3",
-            language="en",
-            keyterm=await _fetch_keyterms(ithink_base, channel_name),
-            smart_format=True,
-            punctuation=True,
-        )
+        # Reverted keyterm/smart_format/punctuation -- confirmed live
+        # (incident-33/34/35, three consecutive real calls, zero
+        # exceptions): every one produced real, non-silence turns hitting
+        # the backend (Agora's own VAD/turn detection kept working) but
+        # zero usable transcript content -- no call_utterances, no
+        # extracted facts across 10+ turns each, flat 100 health score the
+        # entire call. incident-31, run before this block was added, had
+        # 13 real transcribed utterances on the same setup otherwise. This
+        # is the only change since then that touches the actual Deepgram
+        # wire config, so it's the prime suspect -- reverting to the
+        # known-good minimal config while that's investigated properly
+        # (in particular: whether keyterm needs to be pre-URL-encoded
+        # before reaching Agora's join API, per its own documented
+        # example format "term1%20term2", which the vendor call in
+        # iCall_utils.build_keyterms does not do).
+        stt = DeepgramSTT(model="nova-3", language="en")
         tts = MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_captivating_female1")
 
         # Optional BYOK example: replace the STT block above and set DEEPGRAM_API_KEY.
