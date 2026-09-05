@@ -282,7 +282,27 @@ export default function ConversationComponent({
 		isReady,
 	);
 
-	const { localMicrophoneTrack } = useLocalMicrophoneTrack(isReady);
+	// Agora's SDK defaults an unconfigured mic track to "music_standard"
+	// (48kHz, 32Kbps) -- a music-fidelity target, not a voice one. Confirmed
+	// live across every call this session (incident-14/16/17/19/20/21):
+	// SEND_AUDIO_BITRATE_TOO_LOW fired constantly for whichever participant
+	// was on a phone, which matches -- phones/cellular routinely can't
+	// sustain that target consistently, while a human ear tolerates the dip
+	// fine but Deepgram's STT doesn't, silently producing nothing usable.
+	// "speech_standard" only needs 24Kbps (25% less) and is Agora's own
+	// documented recommendation for voice calls specifically -- real
+	// population here is always a laptop-plus-phone mix, so the track
+	// needs to be built for the weaker device's network, not the default.
+	// { ANS: true, AEC: true } is the hook's own default, but only when no
+	// config object is passed at all -- passing one here to add
+	// encoderConfig replaces that default outright (it's a plain JS default
+	// parameter, not a merge), so both are restated explicitly to avoid
+	// silently losing echo cancellation and noise suppression.
+	const { localMicrophoneTrack } = useLocalMicrophoneTrack(isReady, {
+		ANS: true,
+		AEC: true,
+		encoderConfig: "speech_standard",
+	});
 
 	useEffect(() => {
 		if (!client) return;
@@ -614,6 +634,47 @@ export default function ConversationComponent({
 	useClientEvent(client, "connection-state-change", (curState) => {
 		setConnectionState(curState);
 	});
+
+	// Confirmed live (incident-20): a signaling-layer hiccup ("ws request
+	// timeout" on the RTC client, not the audio media path) can leave
+	// transcript delivery permanently stalled even after the RTC client's
+	// own connection-state cycles back to CONNECTED and audio keeps working
+	// fine -- the only thing that fixed it was a full manual page rejoin.
+	// AgoraVoiceAI's stream-message handling (how transcripts actually
+	// arrive -- see agora-agent-client-toolkit's useTranscript) only resets
+	// its internal state (chunked-message reassembly cache, its own raw
+	// event bindings) on unsubscribe()/destroy(), never automatically on a
+	// mid-session reconnect. unsubscribe() then subscribeMessage() again is
+	// the toolkit's own public, documented pair for exactly this -- it
+	// explicitly preserves the ai.on(...) consumer callbacks registered
+	// above (destroy() would remove those instead) and doesn't touch the
+	// live RTC/RTM connection, so this is much lower-risk than forcing an
+	// actual leave+rejoin of the call.
+	const prevConnectionStateRef = useRef(connectionState);
+	const lastResubscribeAtRef = useRef(0);
+	useEffect(() => {
+		const prevState = prevConnectionStateRef.current;
+		prevConnectionStateRef.current = connectionState;
+
+		const wasInterrupted = prevState === "RECONNECTING" || prevState === "DISCONNECTED";
+		if (connectionState !== "CONNECTED" || !wasInterrupted) return;
+
+		// Guards against re-triggering on rapid reconnect/connect flapping --
+		// one resubscribe per interruption is enough, and doing it too often
+		// risks racing a message that arrives in the brief unsubscribed gap.
+		const RESUBSCRIBE_COOLDOWN_MS = 5_000;
+		if (Date.now() - lastResubscribeAtRef.current < RESUBSCRIBE_COOLDOWN_MS) return;
+		lastResubscribeAtRef.current = Date.now();
+
+		const ai = AgoraVoiceAI.getInstance();
+		if (!ai) return;
+		try {
+			ai.unsubscribe();
+			ai.subscribeMessage(agoraData.channel);
+		} catch (error) {
+			console.error("[AgoraVoiceAI] Failed to resubscribe after reconnect:", error);
+		}
+	}, [connectionState, agoraData.channel]);
 
 	// Agora's own uplink/downlink quality signal (0=unknown, 1=excellent,
 	// ..., 6=disconnected), fired ~every 2s once joined. Surfaced so a poor
