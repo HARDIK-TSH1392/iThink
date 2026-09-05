@@ -15,15 +15,39 @@ from .iTriage_schema import TriageVerdict
 # suited to fast structured-output tasks rather than long-form generation.
 
 
-# Both verified directly against this project's API key on 2026-09-03 --
-# gemini-3.7-flash and gemini-2.5-flash (the previous values here) were
+# gemini-3.7-flash and gemini-2.5-flash (an earlier value here) were
 # retired/unavailable and caused a real, hard-to-diagnose outage: primary
 # failed silently, fell through to a dead fallback name, and the whole
 # triage pipeline stalled at "triage" status with the failure hidden below
-# an unlogged except. Using the same verified model for both isn't ideal
-# redundancy, but a guessed second name reintroduces exactly this bug.
-PRIMARY_MODEL = "gemini-3.5-flash-lite"
-FALLBACK_MODEL = "gemini-3.5-flash-lite"
+# an unlogged except. For a while after that this file used the same
+# model for both tiers -- deliberately, to avoid guessing a second
+# unverified name -- but that meant zero real redundancy: when Gemini's
+# own "high demand" instability hit gemini-3.5-flash-lite live (a plain
+# "say OK" call took 69s to eventually succeed), retrying the identical
+# model failed identically both times.
+#
+# Both verified directly against this project's API key on 2026-09-04,
+# during that live instability, specifically to confirm they're actually
+# distinct models with independent capacity rather than aliases of each
+# other: gemini-flash-latest answered in ~8s, gemini-3.5-flash in ~24s,
+# while gemini-3.5-flash-lite itself was the slow one that day. Note
+# gemini-flash-latest is an alias Google can repoint over time -- fine for
+# the verification window this was tested in, worth re-checking if this
+# starts misbehaving again later.
+PRIMARY_MODEL = "gemini-flash-latest"
+FALLBACK_MODEL = "gemini-3.5-flash"
+
+# Neither Gemini call below had a timeout before this -- found live, not
+# hypothetically: a plain "say OK" call to this same model hung past 20s
+# with zero response while diagnosing incidents stuck at "triage" status.
+# Without a ceiling, that hang holds the per-(source_id, service, region)
+# key lock in run_triage_for_log open indefinitely, blocking any further
+# ingest for that same key too, not just the one incident. Matches the
+# fix already applied to iCall's four Gemini call sites for the identical
+# underlying issue (Gemini's own "high demand" instability, not a bug
+# here). Bumped from 25s to 30s after observing the verified fallback
+# model itself take ~24s under load -- 25s was cutting that too close.
+GEMINI_CALL_TIMEOUT_S = 30
 
 # Caps concurrent Gemini calls so a burst of correlated log events can't fire
 # off unbounded parallel API calls (cost + rate-limit protection).
@@ -79,18 +103,25 @@ async def call_gemini_for_verdict(prompt: str) -> TriageVerdict:
 
     async with _gemini_semaphore:
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=PRIMARY_MODEL,
-                contents=prompt,
-                config=config,
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=PRIMARY_MODEL,
+                    contents=prompt,
+                    config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
             )
-        except Exception:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=FALLBACK_MODEL,
-                contents=prompt,
-                config=config,
+        except Exception as exc:
+            print(f"[iTriage] Verdict primary call failed/timed out, trying fallback: {exc}")
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=FALLBACK_MODEL,
+                    contents=prompt,
+                    config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
             )
 
     return TriageVerdict.model_validate_json(response.text)
