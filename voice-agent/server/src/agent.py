@@ -304,7 +304,27 @@ class Agent:
                     "start_of_speech": {
                         "mode": "vad",
                         "vad_config": {
-                            "interrupt_duration_ms": 160,
+                            # Reported live: toggling a participant's own
+                            # mic off/on while the agent is talking cuts
+                            # the agent's voice off mid-sentence. Likely
+                            # mechanism, not yet confirmed audibly (can't
+                            # hear it from here): re-enabling a mic track
+                            # is a known source of a brief hardware
+                            # pop/noise burst as the capture pipeline
+                            # restarts -- combined with speech_threshold
+                            # already lowered to 0.3 (deliberately more
+                            # sensitive to quiet sound, see above) and a
+                            # 160ms interrupt window, that transient burst
+                            # plausibly reads as "start of speech" and
+                            # correctly-per-its-own-logic barges in on the
+                            # agent, which sounds identical to a broken/cut
+                            # voice. Bumped to 350ms -- long enough that a
+                            # short click/pop shouldn't cross it, still
+                            # short enough that a genuine interruption
+                            # (which naturally sustains) barges in quickly.
+                            # Needs live re-testing to confirm; this is a
+                            # reasoned adjustment, not a verified fix.
+                            "interrupt_duration_ms": 350,
                             "prefix_padding_ms": 300,
                         },
                     },
