@@ -55,6 +55,7 @@ from .iCall_utils import (
     detect_health_score_drop,
     build_health_recap,
     build_correction_callout,
+    build_keyterms,
     CALL_STATUS_COMPLETED,
     CLOSING_LINE,
     FALLBACK_REPLY,
@@ -252,6 +253,27 @@ async def get_live_recap_endpoint(
     recap = format_live_recap(state)
     shared_screens = state.get("shared_screens", [])
     return {"code": 0, "data": {"recap": recap, "shared_screens": shared_screens}, "msg": "success"}
+
+
+@router.get("/channel/{channel_name}/keyterms")
+async def get_keyterms_endpoint(
+    channel_name: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Deepgram keyterm-prompting string for this call (see
+    iCall_utils.build_keyterms). Called by the voice-agent service right
+    before it starts the STT vendor for a call -- channel-keyed for the
+    same reason as recap/chat-notes, the caller only knows the channel
+    name at that point, not the incident id.
+    """
+    call = await get_call_by_channel_name(db, channel_name)
+    if not call:
+        raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
+
+    incident = await get_incident(db, call.incident_id)
+    service = incident.service if incident else None
+    return {"code": 0, "data": {"keyterm": build_keyterms(service)}, "msg": "success"}
 
 
 @router.get("/{call_id}/utterances", response_model=List[CallUtteranceRead])

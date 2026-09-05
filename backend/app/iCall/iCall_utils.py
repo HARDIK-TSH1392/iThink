@@ -194,6 +194,51 @@ def _is_silence_trigger(messages: List[ChatMessage]) -> bool:
     return bool(messages) and messages[-1].content.strip() == SILENCE_TRIGGER_MARKER
 
 
+# Generic incident-call vocabulary Deepgram has no particular reason to get
+# right on its own -- proper nouns, jargon, and hyphenated compounds, not
+# ordinary English words it already transcribes fine. Deliberately excludes
+# plain phrases like "root cause" or "incident commander": common English
+# any general model already handles, and (since Agora's keyterm field is
+# one space-separated string, not a list) a multi-word phrase here would
+# get split into separate single-word terms anyway, not kept intact. Kept
+# small and general (not tied to any one incident) since it applies to
+# every call; the service name (the actual per-call variable) is appended
+# separately in build_keyterms.
+BASE_KEYTERMS = [
+    AGENT_NAME,
+    "rollback",
+    "postmortem",
+    "on-call",
+    "Jira",
+    "Slack",
+    "PagerDuty",
+]
+
+
+def build_keyterms(service: Optional[str]) -> str:
+    """
+    Deepgram keyterm-prompting string for this call -- boosts recognition of
+    words STT has no reason to get right on its own (see Deepgram's own
+    keyterm docs: brand names, jargon, anything outside common English).
+    Confirmed live this session: "auth-api" came back as "OT API" with no
+    boosting at all.
+
+    A pure function of what's already known deterministically about the
+    call (the incident's own service name), same discipline as everywhere
+    else in this file that avoids inventing content -- no LLM call, no
+    guessing, just the one real per-call variable appended to a fixed base
+    list. Agora's Deepgram integration takes this as a single
+    space-separated string (its own documented format), not a list --
+    fine here since none of these terms need internal spaces preserved as
+    one token (service names in this system are hyphenated, e.g.
+    "auth-api", never multi-word).
+    """
+    terms = list(BASE_KEYTERMS)
+    if service:
+        terms.append(service)
+    return " ".join(terms)
+
+
 def build_silence_prompt(structured_state: dict) -> str:
     """
     Deterministic, transcript-aware line for when the room's gone quiet --
