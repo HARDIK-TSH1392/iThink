@@ -898,7 +898,7 @@ export default function ConversationComponent({
 									...remoteUsers.map((user) => {
 										const isAgent = String(user.uid) === String(agentUID);
 										const remoteLabel = isAgent
-											? "iThink Agent"
+											? "Watcher"
 											: (participantNames[String(user.uid)] ??
 												`Participant ${user.uid}`);
 										return {

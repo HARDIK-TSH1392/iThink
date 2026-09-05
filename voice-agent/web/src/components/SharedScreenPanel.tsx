@@ -104,7 +104,7 @@ export function SharedScreenPanel({ screens }: SharedScreenPanelProps) {
 			{ordered.length === 0 ? (
 				<div className="flex h-full flex-col items-center justify-center gap-3 text-center text-sm text-muted-foreground">
 					<ScreenShareOff className="h-9 w-9 text-muted-foreground/40" aria-hidden="true" />
-					<span>Nothing shared yet -- ask iThink to show commits or logs.</span>
+					<span>Nothing shared yet -- ask Watcher to show commits or logs.</span>
 				</div>
 			) : (
 				<div className="flex min-h-0 flex-1 flex-col">

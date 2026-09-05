@@ -101,7 +101,7 @@ export function QuickstartTranscriptPanel({
 						const isAgent = uidStr === agentUID;
 						const isLocal = uidStr === localUid;
 						const label = isAgent
-							? "iThink Agent"
+							? "Watcher"
 							: isLocal
 								? "You"
 								: (participantNames[uidStr] ?? `Participant ${uidStr}`);

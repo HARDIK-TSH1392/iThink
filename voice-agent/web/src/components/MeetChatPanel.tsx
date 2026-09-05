@@ -39,7 +39,7 @@ export function MeetChatPanel({ channel, localUid, localName, lateJoinRecap }: M
 	// survives every poll tick untouched.
 	const [recap] = useState<MeetChatMessage | null>(() =>
 		lateJoinRecap
-			? { uid: AGENT_CHAT_UID, name: "iThink Agent", text: lateJoinRecap, timestamp: Date.now() }
+			? { uid: AGENT_CHAT_UID, name: "Watcher", text: lateJoinRecap, timestamp: Date.now() }
 			: null,
 	);
 	const displayMessages = recap ? [recap, ...messages] : messages;

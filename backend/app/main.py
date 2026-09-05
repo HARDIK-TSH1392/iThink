@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="iThink Backend",
-    description="Backend for iThink – EchoSphere 2026",
+    title="Watcher Backend",
+    description="Backend for Watcher – EchoSphere 2026",
     version="0.1.0",
     lifespan=lifespan,
 )

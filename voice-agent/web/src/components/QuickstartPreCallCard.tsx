@@ -69,7 +69,7 @@ export function QuickstartPreCallCard({
 			    the detail that reads as "glass" rather than just "blurred". */}
 			<div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/40 to-transparent" />
 			<h1 className="text-[28px] font-medium leading-[1.2] text-white">
-				{label ? `Join ${label}` : "iThink Incident Room"}
+				{label ? `Join ${label}` : "Watcher Incident Room"}
 			</h1>
 			<p className="mt-[14px] text-sm font-medium leading-6 text-muted-foreground">
 				{label ? (
@@ -81,7 +81,7 @@ export function QuickstartPreCallCard({
 						`${participantCount} participant${participantCount === 1 ? "" : "s"} already on the call`
 					)
 				) : (
-					"iThink's AI incident commander, powered by Agora Conversational AI."
+					"Watcher's AI incident commander, powered by Agora Conversational AI."
 				)}
 			</p>
 
