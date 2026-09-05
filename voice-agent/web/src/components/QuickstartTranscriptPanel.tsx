@@ -43,6 +43,22 @@ export function QuickstartTranscriptPanel({
 	chatNotes,
 }: QuickstartTranscriptPanelProps) {
 	const scrollRef = useRef<HTMLDivElement>(null);
+	// Sticky-scroll, not force-scroll: without tracking this, the effect
+	// below re-ran on every render (new turns, streaming token updates) and
+	// unconditionally snapped scrollTop back to the bottom, fighting any
+	// attempt to scroll up to read earlier turns. Threshold-based "was the
+	// user already at the bottom" check, same pattern as any chat UI --
+	// only auto-follow new messages when they hadn't scrolled away.
+	const isAtBottomRef = useRef(true);
+	const NEAR_BOTTOM_THRESHOLD_PX = 80;
+
+	const handleScroll = () => {
+		const node = scrollRef.current;
+		if (!node) return;
+		const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+		isAtBottomRef.current = distanceFromBottom < NEAR_BOTTOM_THRESHOLD_PX;
+	};
+
 	const messages = useMemo(
 		() =>
 			currentInProgressMessage
@@ -53,7 +69,7 @@ export function QuickstartTranscriptPanel({
 
 	useEffect(() => {
 		const node = scrollRef.current;
-		if (!node) return;
+		if (!node || !isAtBottomRef.current) return;
 		node.scrollTop = node.scrollHeight;
 	});
 
@@ -88,6 +104,7 @@ export function QuickstartTranscriptPanel({
 
 			<div
 				ref={scrollRef}
+				onScroll={handleScroll}
 				className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 py-4"
 			>
 				{messages.length === 0 ? (
