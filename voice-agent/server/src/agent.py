@@ -204,9 +204,14 @@ class Agent:
             temperature=0.7,
             mcp_servers=mcp_servers or None,
         )
+        # en-IN is a real, separately-documented Deepgram nova-3 language
+        # code (confirmed against Deepgram's own docs, not just "en" with
+        # an accent guess) -- tunes the acoustic model for Indian-accented
+        # English instead of defaulting toward US English. Per-call keyterm
+        # fetch already boosts the agent's own name via build_keyterms.
         stt = DeepgramSTT(
             model="nova-3",
-            language="en",
+            language="en-IN",
             keyterm=await _fetch_keyterms(ithink_base, channel_name),
             smart_format=True,
             punctuation=True,
