@@ -7,7 +7,6 @@ import {
 } from 'agora-agent-client-toolkit'
 import {
   type AgentVisualizerState,
-  EMessageStatus,
   type IMessageListItem,
 } from 'agora-agent-uikit'
 
@@ -116,18 +115,6 @@ export function getMessageList(
   return transcript
     .filter((item) => item.status !== TurnStatus.IN_PROGRESS)
     .map(toMessageListItem)
-}
-
-// TurnStatus has three values, not two: IN_PROGRESS, END, and INTERRUPTED
-// (agora-agent-client-toolkit's TranscriptionBase). getMessageList only
-// filters out IN_PROGRESS, so INTERRUPTED turns -- a turn the VAD cut off
-// before the speaker actually finished -- still reach the caller. Once the
-// speaker continues, that continuation lands in a *new* turn_id, so an
-// INTERRUPTED turn and the END turn that follows it can carry overlapping
-// or duplicate-looking text for what was really one sentence. Only an END
-// turn is genuinely finished and safe to persist as a distinct utterance.
-export function isFinishedTurn(item: IMessageListItem): boolean {
-  return item.status === EMessageStatus.END
 }
 
 export function getCurrentInProgressMessage(

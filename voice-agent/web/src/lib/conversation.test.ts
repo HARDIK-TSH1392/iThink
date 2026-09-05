@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 
-import { isFinishedTurn, normalizeTranscript, normalizeTranscriptSpacing } from './conversation'
+import { normalizeTranscript, normalizeTranscriptSpacing } from './conversation'
 
 test('normalizeTranscriptSpacing inserts spaces and collapses whitespace', () => {
   expect(normalizeTranscriptSpacing('Hello.World,now  ok')).toBe('Hello. World, now ok')
@@ -32,13 +32,4 @@ test('normalizeTranscript drops the silence-check control marker', () => {
   )
   expect(out).toHaveLength(1)
   expect(out[0].text).toBe('real speech')
-})
-
-test('isFinishedTurn only accepts END (1), not IN_PROGRESS (0) or INTERRUPTED (2)', () => {
-  const item = (status: number) =>
-    // biome-ignore lint/suspicious/noExplicitAny: minimal test fixture
-    ({ turn_id: 1, uid: 9, text: 'hi', status, createdAt: 0 }) as any
-  expect(isFinishedTurn(item(0))).toBe(false)
-  expect(isFinishedTurn(item(1))).toBe(true)
-  expect(isFinishedTurn(item(2))).toBe(false)
 })

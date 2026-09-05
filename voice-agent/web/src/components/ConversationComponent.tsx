@@ -29,7 +29,6 @@ import {
 	getCurrentInProgressMessage,
 	getInitial,
 	getMessageList,
-	isFinishedTurn,
 	mapAgentVisualizerState,
 	normalizeTimestampMs,
 	normalizeTranscript,
@@ -467,6 +466,17 @@ export default function ConversationComponent({
 	// ref, not state, since this is a side effect with nothing to render).
 	// Agent lines are skipped -- role inference is about the humans on the
 	// call, not the agent itself.
+	//
+	// Does NOT filter on turn status beyond what getMessageList already
+	// excludes (IN_PROGRESS) -- a prior version also skipped INTERRUPTED
+	// turns on the theory that they were superseded duplicates, but real
+	// call data (incident-17) showed the opposite: INTERRUPTED turns often
+	// carry real speech that's never repeated in any later turn, and
+	// excluding them was silently dropping content, not just duplicates.
+	// The actual duplicate-post race (two independent mounts of this same
+	// effect both passing the check below) is handled server-side instead,
+	// by a unique constraint on (call_id, turn_index) in record_utterance --
+	// a guarantee that holds regardless of what status a turn carries.
 	const postedTurnIds = useRef<Set<string | number>>(new Set());
 	useEffect(() => {
 		for (const message of messageList) {
@@ -474,10 +484,6 @@ export default function ConversationComponent({
 			if (postedTurnIds.current.has(key)) continue;
 			if (String(message.uid) === agentUID) continue;
 			if (!message.text?.trim()) continue;
-			// Skip turns the VAD cut off before the speaker actually finished --
-			// see isFinishedTurn. Posting these too double-records the sentence
-			// once the continuation lands in its own END turn.
-			if (!isFinishedTurn(message)) continue;
 
 			postedTurnIds.current.add(key);
 			recordUtterance(
