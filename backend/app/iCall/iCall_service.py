@@ -171,6 +171,13 @@ async def apply_structuring_update(
         "identified_speakers": list(old.get("identified_speakers", [])),
         "timeline": list(old.get("timeline", [])),
         "chat_notes": list(old.get("chat_notes", [])),
+        # This function only ever runs for a real turn (the silence-trigger
+        # branch skips it entirely -- see iCall_api._process_turn), so
+        # reaching here means the room actually said something. Resets the
+        # silence-escalation counter every time, matching
+        # detect_health_score_drop's own "only re-fire on genuinely new
+        # information" discipline.
+        "silence_streak": 0,
     })
 
     now = datetime.now(timezone.utc).isoformat()
@@ -268,6 +275,60 @@ async def record_missing_info_nudge(db: AsyncSession, call: IncidentCall) -> Inc
     old = call.structured_state or {}
     new_state = dict(old)
     new_state["last_missing_info_nudge_at"] = datetime.now(timezone.utc).isoformat()
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def record_direct_address_reply(db: AsyncSession, call: IncidentCall) -> IncidentCall:
+    """
+    Stamps when a direct-address reply was last actually spoken --
+    iCall_utils._direct_address_off_cooldown reads this to stop two STT
+    fragments of the same utterance (confirmed live, incident-38: "Watcher."
+    / "you tell me the current status?") from each independently answering.
+    """
+    old = call.structured_state or {}
+    new_state = dict(old)
+    new_state["last_direct_address_reply_at"] = datetime.now(timezone.utc).isoformat()
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def record_silence_streak(db: AsyncSession, call: IncidentCall, streak: int) -> IncidentCall:
+    """
+    Tracks consecutive silence-trigger turns with no real speech in
+    between -- iCall_api._process_turn uses this to escalate from a brief
+    nudge (1st) to an actual status recap (2nd) to staying silent (3rd+),
+    instead of repeating the identical content-free nudge forever.
+    Confirmed live (incident-38): the same nudge line fired 10 times
+    verbatim over 5.5 minutes with nothing else said -- not "spoken status
+    summaries at appropriate moments," just a loop. Reset to 0 by
+    apply_structuring_update on any real turn.
+    """
+    old = call.structured_state or {}
+    new_state = dict(old)
+    new_state["silence_streak"] = streak
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def record_wrapped_up(db: AsyncSession, call: IncidentCall) -> IncidentCall:
+    """
+    Marks that the call has already spoken its wrap-up recap --
+    iCall_api._process_turn's silence-trigger branch checks this to stay
+    silent afterward instead of continuing to nudge/recap into a call
+    that already said its goodbyes. Confirmed live (incident-39): without
+    this, a silence_check and then a silence_recap both fired 43s and 77s
+    after the closing line, into dead air.
+    """
+    old = call.structured_state or {}
+    new_state = dict(old)
+    new_state["wrapped_up"] = True
     call.structured_state = new_state
     await db.commit()
     await db.refresh(call)

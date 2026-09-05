@@ -1,16 +1,24 @@
 "use client";
 
-import { FileText, MessageSquare, PhoneOff } from "lucide-react";
+import { ClipboardList, FileText, MessageSquare, PhoneOff } from "lucide-react";
 import Image from "next/image";
 import { useState, type ReactNode } from "react";
 
-type SidePanel = "transcript" | "chat" | null;
+type SidePanel = "transcript" | "chat" | "timeline" | null;
 
 type QuickstartConversationLayoutProps = {
 	statusPanel: ReactNode;
 	pipelineMetrics: ReactNode;
 	transcriptPanel: ReactNode;
 	chatPanel: ReactNode;
+	// The brief's "a continuously updated incident timeline" -- previously
+	// only queryable server-side, never shown to anyone actually on the
+	// call. A third tab alongside transcript/chat, since it's a different
+	// kind of content (derived/structured state, not a message log). The
+	// old fourth "screens" tab is gone -- superseded by McpResponseTile's
+	// always-visible grid tile (see ConversationComponent), not folded
+	// into this one.
+	timelinePanel: ReactNode;
 	visualizer: ReactNode;
 	controls: ReactNode;
 	onEndConversation: () => void;
@@ -27,6 +35,7 @@ export function QuickstartConversationLayout({
 	pipelineMetrics: _pipelineMetrics,
 	transcriptPanel,
 	chatPanel,
+	timelinePanel,
 	visualizer,
 	controls,
 	onEndConversation,
@@ -69,7 +78,11 @@ export function QuickstartConversationLayout({
 			<div className="flex min-h-0 w-full flex-1 flex-col gap-4 px-4 pb-4 pt-4 md:px-6 lg:flex-row lg:gap-0">
 				{activePanel ? (
 					<aside className="order-2 h-64 min-h-0 w-full shrink-0 lg:order-1 lg:h-full lg:w-[26rem]">
-						{activePanel === "transcript" ? transcriptPanel : chatPanel}
+						{activePanel === "transcript"
+							? transcriptPanel
+							: activePanel === "chat"
+								? chatPanel
+								: timelinePanel}
 					</aside>
 				) : null}
 
@@ -127,6 +140,21 @@ export function QuickstartConversationLayout({
 										aria-hidden="true"
 									/>
 								) : null}
+							</button>
+
+							<button
+								type="button"
+								onClick={() => togglePanel("timeline")}
+								aria-pressed={activePanel === "timeline"}
+								aria-label={activePanel === "timeline" ? "Hide incident timeline" : "Show incident timeline"}
+								title={activePanel === "timeline" ? "Hide incident timeline" : "Show incident timeline"}
+								className={`flex h-10 w-10 items-center justify-center rounded-full transition-colors ${
+									activePanel === "timeline"
+										? "bg-primary/15 text-primary"
+										: "text-muted-foreground hover:bg-muted hover:text-foreground"
+								}`}
+							>
+								<ClipboardList className="h-[18px] w-[18px]" />
 							</button>
 
 							<div className="mx-1 h-6 w-px bg-border" aria-hidden="true" />

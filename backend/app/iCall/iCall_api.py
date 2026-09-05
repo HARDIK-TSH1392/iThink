@@ -35,6 +35,9 @@ from .iCall_service import (
     record_agent_utterance,
     list_agent_utterances,
     record_missing_info_nudge,
+    record_direct_address_reply,
+    record_silence_streak,
+    record_wrapped_up,
     get_call_turn_lock,
     infer_and_store_participant_roles,
     IncidentNotFoundError,
@@ -45,6 +48,7 @@ from .iCall_utils import (
     verify_agora_signature,
     format_live_recap,
     build_silence_prompt,
+    _call_needs_check_in,
     get_live_participant_count,
     broadcast_shared_screen,
     _is_silence_trigger,
@@ -398,7 +402,16 @@ async def _decide_spoken_reply(
     # meta-signals about the system itself, not ordinary conversational
     # content the gate is meant to quiet down.
     if update.is_wrapping_up:
-        spoken_reply = CLOSING_LINE
+        # The actually appropriate moment for a real content recap is right
+        # here, not 30-60s of post-goodbye silence later (see the
+        # silence-trigger branch above) -- this IS both "spoken status
+        # summaries at appropriate moments" and "a final incident summary"
+        # from the brief, landing in the one moment that's unambiguously
+        # right for it. CLOSING_LINE's own promise about Slack/Jira stays
+        # exactly as accurate as before; this just says what actually
+        # happened before promising where the fuller version goes.
+        spoken_reply = f"{build_health_recap(call.structured_state)} {CLOSING_LINE}"
+        call = await record_wrapped_up(db, call)
         await record_agent_utterance(db, call.id, spoken_reply, "is_wrapping_up")
         return spoken_reply
 
@@ -430,6 +443,8 @@ async def _decide_spoken_reply(
         reason = describe_speak_reason(update, latest_user_message, call.structured_state)
         if reason == "missing_info":
             call = await record_missing_info_nudge(db, call)
+        elif reason == "direct_address":
+            call = await record_direct_address_reply(db, call)
         await record_agent_utterance(db, call.id, spoken_reply, reason)
         return spoken_reply
 
@@ -574,15 +589,58 @@ async def _process_turn(
         return await _process_tool_result_turn(db, call, channel_name, payload, last_message)
 
     if _is_silence_trigger(payload.messages):
+        # Confirmed live (incident-39): the room's silence timer doesn't
+        # know the call already ended. A closing-line spoken 77 seconds
+        # earlier didn't stop the room-wide 30s silence timer from firing
+        # anyway, so a nudge and then a recap both fired into a call
+        # nobody was listening to anymore -- worse than saying nothing,
+        # since it looked like the "summary" was random and disconnected
+        # rather than the actual wrap-up moment. Once wrapped_up is set
+        # (see _decide_spoken_reply's is_wrapping_up branch), there's
+        # nothing left to nudge about -- the room's already had its
+        # recap, right when it actually mattered.
+        if (call.structured_state or {}).get("wrapped_up"):
+            return "", None
+
         # The room's gone quiet -- this isn't real speech to extract facts
         # from, so skip generate_structuring_update entirely. Stay silent
         # when there's nobody to nudge (a lone participant), otherwise say
-        # something shaped by how far the call has actually gotten.
+        # something shaped by how far the call has actually gotten and by
+        # how long it's STAYED quiet through previous nudges.
+        #
+        # Event-driven, not clock-driven: a call that's already in good
+        # shape gets no proactive silence nudge at all, no matter how long
+        # the room's been quiet -- see _call_needs_check_in. Silence in a
+        # healthy, resolved call is fine; silence in a stuck one (nothing
+        # figured out yet, or a genuinely open conflict/gap) is the thing
+        # worth flagging.
+        #
+        # Escalates rather than repeating: confirmed live (incident-38) the
+        # brief nudge fired 10 times verbatim over 5.5 minutes with nothing
+        # else said -- not "spoken status summaries at appropriate moments"
+        # from the brief, just a loop. 1st trigger in a quiet streak: the
+        # existing brief nudge. 2nd: an actual status recap -- this IS the
+        # "appropriate moment" for one, the room's had two chances to speak
+        # up and hasn't. 3rd+: stay silent -- by then more nagging doesn't
+        # help, and repeating a full recap every 30s would be just as
+        # inappropriate as repeating the nudge was.
         participant_count = await get_live_participant_count(channel_name)
         if participant_count is not None and participant_count <= 1:
             return "", None
-        spoken_reply = build_silence_prompt(call.structured_state or {})
-        await record_agent_utterance(db, call.id, spoken_reply, "silence_check")
+        if not _call_needs_check_in(call.structured_state or {}):
+            return "", None
+        streak = (call.structured_state or {}).get("silence_streak", 0) + 1
+        if streak == 1:
+            spoken_reply = build_silence_prompt(call.structured_state or {})
+            reason = "silence_check"
+        elif streak == 2:
+            spoken_reply = build_health_recap(call.structured_state or {})
+            reason = "silence_recap"
+        else:
+            await record_silence_streak(db, call, streak)
+            return "", None
+        await record_silence_streak(db, call, streak)
+        await record_agent_utterance(db, call.id, spoken_reply, reason)
         return spoken_reply, None
 
     incident = await get_incident(db, call.incident_id)

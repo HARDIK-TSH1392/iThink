@@ -209,6 +209,17 @@ class Agent:
         # an accent guess) -- tunes the acoustic model for Indian-accented
         # English instead of defaulting toward US English. Per-call keyterm
         # fetch already boosts the agent's own name via build_keyterms.
+        #
+        # keyterm/smart_format/punctuation were reverted earlier this
+        # session after incident-33/34/35 each produced real, non-silence
+        # turns but zero usable transcript content -- correlated, never
+        # actually root-caused. Reinstated here alongside the en-IN locale
+        # change (a genuinely distinct, separately-verified fix) on the
+        # team's decision to re-test properly rather than assume the old
+        # correlation still holds with the locale now correct. If
+        # transcription goes silent again on live audio, re-open the
+        # en-IN vs keyterm/smart_format/punctuation question -- don't
+        # assume it's settled just because this merge kept both.
         stt = DeepgramSTT(
             model="nova-3",
             language="en-IN",
@@ -278,7 +289,18 @@ class Agent:
             max_history=50,
             turn_detection={
                 "config": {
-                    "speech_threshold": 0.5,
+                    # 0.5 is the SDK's own mid-range default. Flagged early
+                    # this session as an open question (does a quieter
+                    # speaker register as "speaking" at all) and never
+                    # actually revisited until now. The SDK's own docs are
+                    # explicit: lower values make it easier to detect
+                    # speech, higher values ignore weak sounds. Lowered
+                    # deliberately -- a missed quiet speaker (never
+                    # transcribed at all) is a worse failure than a little
+                    # extra background noise picked up, same asymmetry as
+                    # the direct-address wake-word decision earlier this
+                    # session.
+                    "speech_threshold": 0.3,
                     "start_of_speech": {
                         "mode": "vad",
                         "vad_config": {

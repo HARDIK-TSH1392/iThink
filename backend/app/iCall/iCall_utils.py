@@ -65,7 +65,19 @@ def generate_channel_name(incident_id: int) -> str:
 # times. Re-verified on 2026-09-04 during that same instability that
 # these two are genuinely distinct models with independent capacity, not
 # just different names for the same thing.
-PRIMARY_MODEL = "gemini-flash-latest"
+#
+# PRIMARY moved to a lite tier on 2026-09-05 for latency, not carelessly
+# repeating the incident above: measured against the actual production
+# prompt/schema (not guessed), gemini-flash-lite-latest ran the identical
+# structuring call in 1.27s vs 2.69s for gemini-flash-latest -- a 53% cut
+# on the single biggest piece of the ~5s turn-to-speech latency -- and it
+# correctly handled the hardest live-failing case this session hit (the
+# hypothesis-contradiction conflict check) with equivalent output. FALLBACK
+# deliberately stays a full-tier model, not another lite one: if the lite
+# primary hits the same kind of capacity instability that caused the
+# history above, the fallback path needs to actually be different capacity,
+# not just a different name for the same risk.
+PRIMARY_MODEL = "gemini-flash-lite-latest"
 FALLBACK_MODEL = "gemini-3.5-flash"
 
 # None of the four Gemini call sites below had a timeout before this --
@@ -239,6 +251,30 @@ def build_keyterms(service: Optional[str]) -> str:
     return " ".join(terms)
 
 
+def _call_needs_check_in(structured_state: dict) -> bool:
+    """
+    Whether room-wide silence is actually worth interrupting -- the
+    event-driven counterpart to detect_health_score_drop's own philosophy,
+    applied to the silence-trigger path too. 30 seconds of quiet during a
+    real incident call is often the room *working*: reading a dashboard,
+    checking a rotation tool, messaging another team. That's not a
+    stalled conversation, and interrupting it isn't "keeping the team
+    aligned" -- it's noise during focused work. A call that's already in
+    good shape (real progress recorded, nothing open) shouldn't get any
+    proactive silence nudge at all; one that's stuck (no progress yet, or
+    a genuinely open conflict/gap) still should.
+    """
+    has_progress = bool(
+        structured_state.get("facts")
+        or structured_state.get("hypotheses")
+        or structured_state.get("decisions")
+    )
+    if not has_progress:
+        return True
+    has_open_issue = bool(structured_state.get("conflicts") or structured_state.get("missing_info"))
+    return has_open_issue
+
+
 def build_silence_prompt(structured_state: dict) -> str:
     """
     Deterministic, transcript-aware line for when the room's gone quiet --
@@ -311,10 +347,19 @@ Hard constraints:
   to carry it out, record both: the decision, and a matching action item
   with that owner. Don't record a decision for someone merely floating an
   option or asking what to do — only once the room actually settles on one.
-- Set "conflict" only when something said in this turn contradicts a fact
-  or hypothesis already recorded in the state you were given below. Phrase
-  it as one short, targeted clarifying question you would ask out loud —
-  not a statement, not an accusation.
+- Set "conflict" whenever something said in this turn contradicts a fact
+  OR a hypothesis already recorded in the state you were given below --
+  hypotheses count just as much as facts here, not only direct fact-vs-fact
+  contradictions. For example: someone floats "might be a database
+  connection issue" (a hypothesis) and a later turn says "the database team
+  confirmed everything is fine on their side" -- that directly contradicts
+  the hypothesis and must be flagged as a conflict, phrased as a clarifying
+  question ("so is the database ruled out, or still a possibility?"), even
+  though the later statement also stands on its own as a new fact worth
+  recording. Recording the new fact is not a substitute for flagging the
+  conflict -- do both when both apply. Phrase the conflict itself as one
+  short, targeted clarifying question you would ask out loud -- not a
+  statement, not an accusation.
 - corrects_fact (optional): set this to the EXACT text of an existing fact
   from the state given below, only when something said in THIS turn
   directly resolves a contradiction as the room's now-confirmed answer
@@ -737,6 +782,20 @@ async def generate_structuring_update(
 # regardless of cooldown -- this only throttles re-asking the SAME open item.
 MISSING_INFO_NUDGE_COOLDOWN_S = 20
 
+# Confirmed live (incident-38): STT fragmenting one continuous utterance
+# ("Watcher." / "you tell me the current status?") into two turns can make
+# BOTH independently trip the direct_address gate -- each fragment is
+# processed sequentially under the per-call turn lock (no lost-update race
+# here, unlike the earlier Bob/rollback bug), and each one's own
+# latest_user_message check is individually valid, so the lock alone can't
+# catch this. Same class of problem as missing_info's repeat-nudging, same
+# fix shape: a short cooldown after actually speaking a direct-address
+# reply. Deliberately shorter than MISSING_INFO_NUDGE_COOLDOWN_S -- long
+# enough to bridge a fragmentation gap (observed live: 2.2s between the two
+# duplicate replies), short enough that a genuinely fast follow-up question
+# addressed to the agent still gets answered.
+DIRECT_ADDRESS_REPLY_COOLDOWN_S = 8
+
 
 def _has_speakable_missing_info(update_missing_info: List[str], structured_state: dict) -> bool:
     if not update_missing_info:
@@ -749,6 +808,14 @@ def _has_speakable_missing_info(update_missing_info: List[str], structured_state
         return True
     elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_nudge_at)).total_seconds()
     return elapsed >= MISSING_INFO_NUDGE_COOLDOWN_S
+
+
+def _direct_address_off_cooldown(structured_state: dict) -> bool:
+    last_reply_at = structured_state.get("last_direct_address_reply_at")
+    if not last_reply_at:
+        return True
+    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_reply_at)).total_seconds()
+    return elapsed >= DIRECT_ADDRESS_REPLY_COOLDOWN_S
 
 
 def should_speak_aloud(
@@ -776,7 +843,11 @@ def should_speak_aloud(
         return True
     if any(item.owner for item in update.action_items):
         return True
-    if latest_user_message and _is_direct_address(latest_user_message):
+    if (
+        latest_user_message
+        and _is_direct_address(latest_user_message)
+        and _direct_address_off_cooldown(structured_state)
+    ):
         return True
     return False
 
@@ -826,7 +897,6 @@ HYPOTHESIS_CLUSTER_WINDOW_MINUTES = 5
 STALE_ACTION_ITEM_MINUTES = 5
 
 HEALTH_SCORE_DROP_THRESHOLD = 20
-HEALTH_SCORE_HISTORY_LOOKBACK = 5
 HEALTH_SCORE_HISTORY_MAX_LEN = 20
 
 
@@ -951,26 +1021,55 @@ def compute_coordination_health_score(structured_state: dict) -> int:
 
 def detect_health_score_drop(structured_state: dict) -> bool:
     """
-    A SHARP DROP, not a static low value -- a call that's held steady at
-    60 all along isn't an emergency; one that just fell from 90 to 55 in a
-    few turns is. Needs history (see iCall_service.record_health_score),
-    since a single snapshot can't tell a drop from a call that started low.
+    A SHARP DROP OR A SLOW BLEED, not a static low value -- a call that's
+    held steady at 60 all along isn't an emergency; one that fell from 90
+    to 55 is, whether that happened in one turn or over ten. Needs history
+    (see iCall_service.record_health_score), since a single snapshot can't
+    tell a drop from a call that started low.
+
+    Compares against the call's own peak so far (bounded by
+    HEALTH_SCORE_HISTORY_MAX_LEN, not literally unbounded), not just a
+    short recent window -- confirmed live (incident-39): a real 25-point
+    gradual decline (100 -> 75 over ~2 minutes, each individual step only
+    5-10 points) never crossed HEALTH_SCORE_DROP_THRESHOLD under the old
+    5-entry lookback, because no single 5-entry window ever showed more
+    than a 10-15 point swing. Comparing against the whole stored history's
+    peak catches both shapes of decline with one check.
+
+    Also fires on ANY currently-open conflict alone, regardless of the
+    aggregate score threshold -- a real logical gap found by reasoning
+    through the scoring weights (compute_coordination_health_score: -15
+    per conflict, -10 per missing_info, -15 stale-decision, -5 unowned
+    item): a single open conflict only costs 15 points, so it could never
+    cross a 20-point threshold on its own. That's backwards -- an
+    unresolved contradiction is arguably the single clearest signal
+    something's wrong, and this mechanism (built specifically to catch
+    "things have gotten bad") shouldn't require a SECOND problem to also
+    be true before it can fire. Deliberately not achieved by just
+    lowering HEALTH_SCORE_DROP_THRESHOLD instead -- that would also make
+    unrelated combinations (e.g. two unowned items early in a call) newly
+    qualify, which isn't the same thing as "there's an unresolved
+    conflict" and would be a new false positive, not a fix.
 
     Re-nudges only if things have gotten WORSE since the last nudge, not
-    on every turn the score merely stays below some historical peak.
-    Confirmed live (incident-26): with no such check, this fired on 2-3
-    consecutive qualifying turns with nothing new to report, repeating
-    the identical recap -- the opposite of "at appropriate moments" from
-    the brief. last_health_score_drop_nudge_score is set by
-    iCall_service.record_pattern_nudge each time this actually speaks.
+    on every turn the score merely stays below some historical peak (and,
+    for the conflict-alone path, not on every turn a conflict merely
+    remains open with nothing else changed -- the score staying flat is
+    exactly that case). Confirmed live (incident-26): with no such check,
+    this fired on 2-3 consecutive qualifying turns with nothing new to
+    report, repeating the identical recap -- the opposite of "at
+    appropriate moments" from the brief. last_health_score_drop_nudge_score
+    is set by iCall_service.record_pattern_nudge each time this actually
+    speaks.
     """
     history = structured_state.get("health_score_history", [])
     if len(history) < 2:
         return False
-    recent = history[-HEALTH_SCORE_HISTORY_LOOKBACK:]
-    peak = max(h["score"] for h in recent[:-1])
-    current = recent[-1]["score"]
-    if (peak - current) < HEALTH_SCORE_DROP_THRESHOLD:
+    current = history[-1]["score"]
+    peak = max(h["score"] for h in history[:-1])
+    score_dropped_enough = (peak - current) >= HEALTH_SCORE_DROP_THRESHOLD
+    has_open_conflict = bool(structured_state.get("conflicts"))
+    if not score_dropped_enough and not has_open_conflict:
         return False
     last_nudge_score = structured_state.get("last_health_score_drop_nudge_score")
     if last_nudge_score is not None and current >= last_nudge_score:
