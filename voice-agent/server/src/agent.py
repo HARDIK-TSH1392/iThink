@@ -259,7 +259,18 @@ class Agent:
             max_history=50,
             turn_detection={
                 "config": {
-                    "speech_threshold": 0.5,
+                    # 0.5 is the SDK's own mid-range default. Flagged early
+                    # this session as an open question (does a quieter
+                    # speaker register as "speaking" at all) and never
+                    # actually revisited until now. The SDK's own docs are
+                    # explicit: lower values make it easier to detect
+                    # speech, higher values ignore weak sounds. Lowered
+                    # deliberately -- a missed quiet speaker (never
+                    # transcribed at all) is a worse failure than a little
+                    # extra background noise picked up, same asymmetry as
+                    # the direct-address wake-word decision earlier this
+                    # session.
+                    "speech_threshold": 0.3,
                     "start_of_speech": {
                         "mode": "vad",
                         "vad_config": {

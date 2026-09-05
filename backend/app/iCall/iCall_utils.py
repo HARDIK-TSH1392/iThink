@@ -251,6 +251,30 @@ def build_keyterms(service: Optional[str]) -> str:
     return " ".join(terms)
 
 
+def _call_needs_check_in(structured_state: dict) -> bool:
+    """
+    Whether room-wide silence is actually worth interrupting -- the
+    event-driven counterpart to detect_health_score_drop's own philosophy,
+    applied to the silence-trigger path too. 30 seconds of quiet during a
+    real incident call is often the room *working*: reading a dashboard,
+    checking a rotation tool, messaging another team. That's not a
+    stalled conversation, and interrupting it isn't "keeping the team
+    aligned" -- it's noise during focused work. A call that's already in
+    good shape (real progress recorded, nothing open) shouldn't get any
+    proactive silence nudge at all; one that's stuck (no progress yet, or
+    a genuinely open conflict/gap) still should.
+    """
+    has_progress = bool(
+        structured_state.get("facts")
+        or structured_state.get("hypotheses")
+        or structured_state.get("decisions")
+    )
+    if not has_progress:
+        return True
+    has_open_issue = bool(structured_state.get("conflicts") or structured_state.get("missing_info"))
+    return has_open_issue
+
+
 def build_silence_prompt(structured_state: dict) -> str:
     """
     Deterministic, transcript-aware line for when the room's gone quiet --
@@ -944,20 +968,40 @@ def detect_health_score_drop(structured_state: dict) -> bool:
     than a 10-15 point swing. Comparing against the whole stored history's
     peak catches both shapes of decline with one check.
 
+    Also fires on ANY currently-open conflict alone, regardless of the
+    aggregate score threshold -- a real logical gap found by reasoning
+    through the scoring weights (compute_coordination_health_score: -15
+    per conflict, -10 per missing_info, -15 stale-decision, -5 unowned
+    item): a single open conflict only costs 15 points, so it could never
+    cross a 20-point threshold on its own. That's backwards -- an
+    unresolved contradiction is arguably the single clearest signal
+    something's wrong, and this mechanism (built specifically to catch
+    "things have gotten bad") shouldn't require a SECOND problem to also
+    be true before it can fire. Deliberately not achieved by just
+    lowering HEALTH_SCORE_DROP_THRESHOLD instead -- that would also make
+    unrelated combinations (e.g. two unowned items early in a call) newly
+    qualify, which isn't the same thing as "there's an unresolved
+    conflict" and would be a new false positive, not a fix.
+
     Re-nudges only if things have gotten WORSE since the last nudge, not
-    on every turn the score merely stays below some historical peak.
-    Confirmed live (incident-26): with no such check, this fired on 2-3
-    consecutive qualifying turns with nothing new to report, repeating
-    the identical recap -- the opposite of "at appropriate moments" from
-    the brief. last_health_score_drop_nudge_score is set by
-    iCall_service.record_pattern_nudge each time this actually speaks.
+    on every turn the score merely stays below some historical peak (and,
+    for the conflict-alone path, not on every turn a conflict merely
+    remains open with nothing else changed -- the score staying flat is
+    exactly that case). Confirmed live (incident-26): with no such check,
+    this fired on 2-3 consecutive qualifying turns with nothing new to
+    report, repeating the identical recap -- the opposite of "at
+    appropriate moments" from the brief. last_health_score_drop_nudge_score
+    is set by iCall_service.record_pattern_nudge each time this actually
+    speaks.
     """
     history = structured_state.get("health_score_history", [])
     if len(history) < 2:
         return False
     current = history[-1]["score"]
     peak = max(h["score"] for h in history[:-1])
-    if (peak - current) < HEALTH_SCORE_DROP_THRESHOLD:
+    score_dropped_enough = (peak - current) >= HEALTH_SCORE_DROP_THRESHOLD
+    has_open_conflict = bool(structured_state.get("conflicts"))
+    if not score_dropped_enough and not has_open_conflict:
         return False
     last_nudge_score = structured_state.get("last_health_score_drop_nudge_score")
     if last_nudge_score is not None and current >= last_nudge_score:

@@ -48,6 +48,7 @@ from .iCall_utils import (
     verify_agora_signature,
     format_live_recap,
     build_silence_prompt,
+    _call_needs_check_in,
     get_live_participant_count,
     broadcast_shared_screen,
     _is_silence_trigger,
@@ -410,6 +411,13 @@ async def _process_turn(
         # something shaped by how far the call has actually gotten and by
         # how long it's STAYED quiet through previous nudges.
         #
+        # Event-driven, not clock-driven: a call that's already in good
+        # shape gets no proactive silence nudge at all, no matter how long
+        # the room's been quiet -- see _call_needs_check_in. Silence in a
+        # healthy, resolved call is fine; silence in a stuck one (nothing
+        # figured out yet, or a genuinely open conflict/gap) is the thing
+        # worth flagging.
+        #
         # Escalates rather than repeating: confirmed live (incident-38) the
         # brief nudge fired 10 times verbatim over 5.5 minutes with nothing
         # else said -- not "spoken status summaries at appropriate moments"
@@ -421,6 +429,8 @@ async def _process_turn(
         # inappropriate as repeating the nudge was.
         participant_count = await get_live_participant_count(channel_name)
         if participant_count is not None and participant_count <= 1:
+            return ""
+        if not _call_needs_check_in(call.structured_state or {}):
             return ""
         streak = (call.structured_state or {}).get("silence_streak", 0) + 1
         if streak == 1:
