@@ -256,6 +256,24 @@ async def record_health_score(db: AsyncSession, call: IncidentCall, score: int) 
     return call
 
 
+async def record_missing_info_nudge(db: AsyncSession, call: IncidentCall) -> IncidentCall:
+    """
+    Stamps when a missing_info gap was last actually spoken about --
+    iCall_utils._has_speakable_missing_info reads this to throttle
+    re-asking the SAME still-open gap on every qualifying turn. Same
+    cooldown-marker pattern as record_pattern_nudge's score param for
+    detect_health_score_drop, just for a turn-level gate instead of a CEP
+    pattern.
+    """
+    old = call.structured_state or {}
+    new_state = dict(old)
+    new_state["last_missing_info_nudge_at"] = datetime.now(timezone.utc).isoformat()
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
 async def record_pattern_nudge(
     db: AsyncSession, call: IncidentCall, pattern: str, message: str, score: Optional[int] = None
 ) -> IncidentCall:

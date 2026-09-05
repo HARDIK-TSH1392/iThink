@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -113,35 +114,36 @@ MODEL_UNAVAILABLE_REPLY = (
 # below can recognize and always pass it through, the same as FALLBACK_REPLY.
 MALFORMED_RESPONSE_FALLBACK = "Sorry, could you say that again?"
 
-# Matches the "ithink" entry in voice-agent's own interruption.keywords_config
-# (agent.py) -- same literal, so a listener addressing the agent by name
-# both interrupts its TTS *and* counts as a direct address for the speak
-# gate below. Kept as one source of truth in spirit even though it can't
-# literally be shared across the two services.
-WAKE_WORD = "ithink"
+# The agent's own name, in one place -- everything that needs to recognize
+# or say it (direct-address detection here, the structuring/triage prompts,
+# the voice-agent's greeting) reads from this constant instead of a
+# hardcoded literal, so a future rename touches one line, not a scattered
+# grep-and-hope. Previously "iThink" -- a compound word Deepgram had no
+# reason to transcribe distinctly from the hedge phrase "I think", which is
+# why direct-address detection used to require "hey" alongside it just to
+# stay rare enough not to fire on ordinary sentences ("I think the DB is
+# fine"). "Watcher" is an ordinary, distinct English word STT transcribes
+# reliably on its own, so that workaround is gone -- addressing it by name,
+# alone, is now enough.
+AGENT_NAME = "Watcher"
+
+# Case-insensitive, whole-word match: also answers to "agent" (the generic,
+# obvious way to address an AI assistant on a call -- confirmed live,
+# incident-31: "Agent, can you tell me the status?" got zero response
+# because neither this nor a bare "hey"/"i think" combo covered it). A
+# missed direct address (silently ignoring someone who's genuinely talking
+# to it) is a worse failure than an occasional false accept from ordinary
+# use of the word "agent" -- see the wake-word FRR/FAR tradeoff this is
+# modeled on: in a live incident room, being ignored erodes trust faster
+# than an extra reply does.
+_ADDRESS_PATTERN = re.compile(
+    r"\b(" + re.escape(AGENT_NAME.lower()) + r"|agent)\b", re.IGNORECASE
+)
 
 
 def _is_direct_address(text: str) -> bool:
-    """
-    True if this turn looks like someone deliberately addressing the agent
-    by name, not just using it as ordinary conversation.
-
-    "iThink" isn't a real word, so live speech-to-text has no reason to
-    transcribe it as the literal unspaced "ithink" -- Deepgram will most
-    naturally write two spoken syllables as "I think", indistinguishable
-    from the extremely common hedge phrase ("I think the DB is fine", "I
-    think we should roll back") that shows up constantly in incident calls
-    without addressing anyone. Matching bare "i think" here would make the
-    agent interrupt on nearly every other sentence, which defeats the
-    entire point of this gate. Requiring "hey" alongside "i think" keeps a
-    natural way to say the wake word out loud ("Hey iThink, ...") while
-    staying rare in ordinary speech; "ithink" with no space is kept too in
-    case STT (or a text/chat caller) ever does produce it as one token.
-    """
-    lowered = text.lower()
-    if WAKE_WORD in lowered:
-        return True
-    return "hey" in lowered and "i think" in lowered
+    """True if this turn looks like someone deliberately addressing the agent by name."""
+    return bool(_ADDRESS_PATTERN.search(text))
 
 # Spoken when StructuringUpdate.is_wrapping_up is true. Deliberately a fixed
 # string, not LLM-generated -- see StructuringUpdate.is_wrapping_up's
@@ -153,6 +155,30 @@ CLOSING_LINE = (
     "call. With your approval, I'll share a full summary on Slack and open "
     "tracking tickets on Jira."
 )
+
+
+def build_correction_callout(update: StructuringUpdate) -> str:
+    """
+    Deterministic, non-LLM-authored line for when a previously recorded
+    fact just got superseded (see apply_structuring_update's corrects_fact
+    handling) -- same "don't let the model freely narrate a state change"
+    discipline as CLOSING_LINE. Confirmed live (incident-31): the region
+    correction (US East -> US West) got applied to structured_state
+    entirely silently, with nothing said to the room -- a real gap against
+    the brief's "detection of... conflicting information," since updating
+    the record without announcing it doesn't actually keep the team's
+    shared understanding aligned.
+
+    update.facts is this turn's newly-extracted facts, not the full running
+    list -- per the corrects_fact prompt guidance, the turn that resolves a
+    contradiction is expected to also state the corrected fact itself, so
+    it's normally present here. Falls back to a plainer phrasing on the
+    rare turn where the model flagged corrects_fact without a matching new
+    fact.
+    """
+    if update.facts:
+        return f'Correction: {update.facts[0]} — earlier we had "{update.corrects_fact}."'
+    return f'Correction: "{update.corrects_fact}" is no longer accurate.'
 
 # Matches SILENCE_TRIGGER_MARKER in voice-agent/server/src/agent.py, set as
 # parameters.silence_config.content there with action="think" -- Agora
@@ -216,7 +242,7 @@ async def get_live_participant_count(channel_name: str) -> Optional[int]:
     return len(names) if isinstance(names, dict) else None
 
 
-STRUCTURING_SYSTEM_INSTRUCTION = """You are iThink, a voice participant in a live
+STRUCTURING_SYSTEM_INSTRUCTION = f"""You are {AGENT_NAME}, a voice participant in a live
 incident call. Your job is narrow, the same way it is for a human note-taker
 who also happens to be allowed to ask one question: keep the room's shared
 understanding straight, don't investigate or diagnose.
@@ -589,7 +615,32 @@ async def generate_structuring_update(
 # -----------------------------------------------------------------------------
 
 
-def should_speak_aloud(update: StructuringUpdate, latest_user_message: Optional[str]) -> bool:
+# A gap that's still genuinely open doesn't need re-announcing every turn
+# just because the model re-extracts it -- confirmed live (incident-31):
+# "which model is affected?" got asked 4 times in 17 seconds while the room
+# was mid-explanation, the same class of problem detect_health_score_drop's
+# cooldown already exists to prevent for a different signal. A genuinely
+# NEW gap (not already in structured_state) always still speaks immediately
+# regardless of cooldown -- this only throttles re-asking the SAME open item.
+MISSING_INFO_NUDGE_COOLDOWN_S = 20
+
+
+def _has_speakable_missing_info(update_missing_info: List[str], structured_state: dict) -> bool:
+    if not update_missing_info:
+        return False
+    already_known = set(structured_state.get("missing_info", []))
+    if any(gap not in already_known for gap in update_missing_info):
+        return True
+    last_nudge_at = structured_state.get("last_missing_info_nudge_at")
+    if not last_nudge_at:
+        return True
+    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_nudge_at)).total_seconds()
+    return elapsed >= MISSING_INFO_NUDGE_COOLDOWN_S
+
+
+def should_speak_aloud(
+    update: StructuringUpdate, latest_user_message: Optional[str], structured_state: dict
+) -> bool:
     """
     True if this turn's spoken_reply should actually reach the room's
     speakers. False means the caller sends empty content to Agora's TTS
@@ -599,13 +650,16 @@ def should_speak_aloud(update: StructuringUpdate, latest_user_message: Optional[
     keeping on a quiet turn belongs in agent_chat_note, which the model
     sets independently of this gate.
 
-    is_wrapping_up is NOT checked here -- that path always speaks (the
-    caller substitutes CLOSING_LINE, unconditionally, unchanged from
-    before this gate existed).
+    is_wrapping_up and corrects_fact are NOT checked here -- both always
+    speak via their own dedicated, deterministic paths in
+    iCall_api._process_turn (a fixed closing line, and a fixed correction
+    callout respectively), same reasoning both times: what gets said in
+    those two moments must be guaranteed-accurate, not left to
+    update.spoken_reply's free-text phrasing.
     """
     if update.conflict:
         return True
-    if update.missing_info:
+    if _has_speakable_missing_info(update.missing_info, structured_state):
         return True
     if any(item.owner for item in update.action_items):
         return True
@@ -614,7 +668,9 @@ def should_speak_aloud(update: StructuringUpdate, latest_user_message: Optional[
     return False
 
 
-def describe_speak_reason(update: StructuringUpdate, latest_user_message: Optional[str]) -> str:
+def describe_speak_reason(
+    update: StructuringUpdate, latest_user_message: Optional[str], structured_state: dict
+) -> str:
     """
     Same branch order as should_speak_aloud, but names which check fired
     instead of returning a bare bool -- only for AgentUtterance.reason
@@ -625,7 +681,7 @@ def describe_speak_reason(update: StructuringUpdate, latest_user_message: Option
     """
     if update.conflict:
         return "conflict"
-    if update.missing_info:
+    if _has_speakable_missing_info(update.missing_info, structured_state):
         return "missing_info"
     if any(item.owner for item in update.action_items):
         return "action_item_owner"

@@ -34,6 +34,7 @@ from .iCall_service import (
     record_shared_screen,
     record_agent_utterance,
     list_agent_utterances,
+    record_missing_info_nudge,
     get_call_turn_lock,
     infer_and_store_participant_roles,
     IncidentNotFoundError,
@@ -53,6 +54,7 @@ from .iCall_utils import (
     compute_coordination_health_score,
     detect_health_score_drop,
     build_health_recap,
+    build_correction_callout,
     CALL_STATUS_COMPLETED,
     CLOSING_LINE,
     FALLBACK_REPLY,
@@ -378,6 +380,13 @@ async def _process_turn(
     incident = await get_incident(db, call.incident_id)
     service = incident.service if incident else None
 
+    # Captured before apply_structuring_update mutates structured_state --
+    # need the PRE-merge facts list to know whether corrects_fact actually
+    # matched and applied (vs. a hallucinated/non-matching reference that
+    # apply_structuring_update silently no-ops on), so the spoken callout
+    # below never claims a correction happened when nothing was updated.
+    old_facts = list((call.structured_state or {}).get("facts", []))
+
     update, deploy_check_result = await generate_structuring_update(
         payload.messages, call.structured_state or {}, service
     )
@@ -418,11 +427,23 @@ async def _process_turn(
         )
         return spoken_reply
 
-    if should_speak_aloud(update, latest_user_message):
+    # Fixed, deterministic callout, checked ahead of the generic gate the
+    # same way is_wrapping_up/the fallbacks above are -- a state change this
+    # significant (the room's shared understanding just flipped) can't be
+    # left to update.spoken_reply's free-text phrasing. Only fires when the
+    # correction actually applied (old_facts contained the exact text) --
+    # see apply_structuring_update's fail-safe exact-match requirement.
+    if update.corrects_fact and update.corrects_fact in old_facts:
+        spoken_reply = build_correction_callout(update)
+        await record_agent_utterance(db, call.id, spoken_reply, "correction")
+        return spoken_reply
+
+    if should_speak_aloud(update, latest_user_message, call.structured_state):
         spoken_reply = update.spoken_reply
-        await record_agent_utterance(
-            db, call.id, spoken_reply, describe_speak_reason(update, latest_user_message)
-        )
+        reason = describe_speak_reason(update, latest_user_message, call.structured_state)
+        if reason == "missing_info":
+            call = await record_missing_info_nudge(db, call)
+        await record_agent_utterance(db, call.id, spoken_reply, reason)
         return spoken_reply
 
     # Nothing about THIS turn was urgent -- but the accumulated state
