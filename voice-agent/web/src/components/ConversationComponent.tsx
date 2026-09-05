@@ -343,6 +343,12 @@ export default function ConversationComponent({
 			return updated;
 		});
 
+		// RTM never echoes a client's own published message back to itself --
+		// the receive handler below (which plays this same chime) only ever
+		// fires for OTHER participants, so raising your own hand needs its
+		// own explicit play call or the person who just clicked hears nothing.
+		if (next) playHandRaiseChime();
+
 		try {
 			await rtmClient.publish(
 				agoraData.channel,
