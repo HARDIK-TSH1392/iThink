@@ -1,4 +1,4 @@
-from sqlalchemy import String, DateTime, ForeignKey, Integer, JSON, Index, func
+from sqlalchemy import String, DateTime, ForeignKey, Integer, JSON, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 from datetime import datetime
 from typing import Optional
@@ -83,6 +83,15 @@ class CallUtterance(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime, index=True)
 
     __table_args__ = (
-        # Common access pattern: "give me this call's transcript in order."
-        Index("ix_call_utterances_call_turn", "call_id", "turn_index"),
+        # Also the lookup index for "give me this call's transcript in
+        # order" -- a UNIQUE constraint creates one same as a plain Index
+        # would. Enforces that a given turn_id (Agora's per-call turn
+        # counter, see TranscriptHelperItem.turn_id) is recorded at most
+        # once: the browser's own de-dupe (postedTurnIds, a useRef) isn't
+        # atomic across two independent mounts of the same component (React
+        # StrictMode's double-invoke in dev, or a retried request), so two
+        # concurrent posts of the same turn both racing past that check is
+        # a real, observed failure mode, not hypothetical -- see
+        # record_utterance's IntegrityError handling below.
+        UniqueConstraint("call_id", "turn_index", name="uq_call_utterances_call_turn"),
     )

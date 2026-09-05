@@ -45,7 +45,7 @@ import {
 	type UserTranscription,
 } from "agora-agent-client-toolkit";
 import { MicButtonWithVisualizer } from "agora-agent-uikit/rtc";
-import {
+import AgoraRTC, {
 	RemoteUser,
 	type UID,
 	useClientEvent,
@@ -466,6 +466,17 @@ export default function ConversationComponent({
 	// ref, not state, since this is a side effect with nothing to render).
 	// Agent lines are skipped -- role inference is about the humans on the
 	// call, not the agent itself.
+	//
+	// Does NOT filter on turn status beyond what getMessageList already
+	// excludes (IN_PROGRESS) -- a prior version also skipped INTERRUPTED
+	// turns on the theory that they were superseded duplicates, but real
+	// call data (incident-17) showed the opposite: INTERRUPTED turns often
+	// carry real speech that's never repeated in any later turn, and
+	// excluding them was silently dropping content, not just duplicates.
+	// The actual duplicate-post race (two independent mounts of this same
+	// effect both passing the check below) is handled server-side instead,
+	// by a unique constraint on (call_id, turn_index) in record_utterance --
+	// a guarantee that holds regardless of what status a turn carries.
 	const postedTurnIds = useRef<Set<string | number>>(new Set());
 	useEffect(() => {
 		for (const message of messageList) {
@@ -511,14 +522,59 @@ export default function ConversationComponent({
 		client.enableAudioVolumeIndicator();
 	}, [client]);
 
+	// Detects a mic that's gone silent while still "on" -- observed live on
+	// mobile (incident-14, incident-16): a participant's audio stops
+	// reaching the pipeline entirely partway through the call (OS/browser
+	// suspending the mic on backgrounding, a permission getting revoked,
+	// etc.) with nothing in the UI showing it. Tracked from the same
+	// volume-indicator ticks already used for the speaking-ring indicator,
+	// so this adds no extra polling.
+	const MIC_SILENCE_WARNING_MS = 45_000;
+	const lastLocalAudioAtRef = useRef<number>(Date.now());
+	const [micSilenceWarning, setMicSilenceWarning] = useState(false);
+
 	useClientEvent(client, "volume-indicator", (volumes) => {
 		const SPEAKING_THRESHOLD = 15;
 		const next = new Set<string>();
+		const localUidStr = String(agoraData.uid);
 		for (const v of volumes) {
 			if (v.level > SPEAKING_THRESHOLD) next.add(String(v.uid));
+			// Any non-trivial level counts as "the mic is producing audio" --
+			// this is about total silence, not about whether they're speaking
+			// loud enough to show the speaking ring.
+			if (String(v.uid) === localUidStr && v.level > 2) {
+				lastLocalAudioAtRef.current = Date.now();
+			}
 		}
 		setSpeakingUids(next);
 	});
+
+	useEffect(() => {
+		if (!isEnabled) {
+			setMicSilenceWarning(false);
+			return;
+		}
+		const interval = setInterval(() => {
+			setMicSilenceWarning(Date.now() - lastLocalAudioAtRef.current > MIC_SILENCE_WARNING_MS);
+		}, 5_000);
+		return () => clearInterval(interval);
+	}, [isEnabled]);
+
+	// Best-effort recovery for the same failure: some mobile browsers
+	// silently suspend an active mic track while the tab is backgrounded
+	// (screen lock, app switch) without ever erroring or firing a "muted"
+	// event -- re-asserting enabled state on return at least gives Agora a
+	// chance to resume a track that's still alive but stalled.
+	useEffect(() => {
+		const handleVisibilityChange = () => {
+			if (document.visibilityState === "visible" && localMicrophoneTrack && isEnabled) {
+				localMicrophoneTrack.setEnabled(true).catch(() => {});
+				lastLocalAudioAtRef.current = Date.now();
+			}
+		};
+		document.addEventListener("visibilitychange", handleVisibilityChange);
+		return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+	}, [localMicrophoneTrack, isEnabled]);
 
 	useEffect(() => {
 		const isAgentInRemoteUsers = remoteUsers.some(
@@ -529,6 +585,22 @@ export default function ConversationComponent({
 
 	useClientEvent(client, "connection-state-change", (curState) => {
 		setConnectionState(curState);
+	});
+
+	// Agora's own uplink/downlink quality signal (0=unknown, 1=excellent,
+	// ..., 6=disconnected), fired ~every 2s once joined. Surfaced so a poor
+	// connection (weak wifi/cellular) shows up as a visible warning instead
+	// of silently degrading STT/transcription with no indication to anyone
+	// on the call that they might not be getting through -- see incident-14's
+	// call, where SEND_AUDIO_BITRATE_TOO_LOW cycled the whole call with no
+	// visible signal of it anywhere in the UI.
+	const [networkQuality, setNetworkQuality] = useState({ uplink: 0, downlink: 0 });
+
+	useClientEvent(client, "network-quality", (stats) => {
+		setNetworkQuality({
+			uplink: stats.uplinkNetworkQuality,
+			downlink: stats.downlinkNetworkQuality,
+		});
 	});
 
 	const connectionSeverity = useMemo<"normal" | "warning" | "error">(() => {
@@ -544,15 +616,23 @@ export default function ConversationComponent({
 		) {
 			return "warning";
 		}
-		if (connectionIssues.length === 0) {
-			return "normal";
-		}
-		return connectionIssues.some(
-			(issue) => getConversationIssueSeverity(issue) === "error",
-		)
-			? "error"
-			: "warning";
-	}, [connectionState, connectionIssues]);
+		const issueSeverity =
+			connectionIssues.length === 0
+				? "normal"
+				: connectionIssues.some(
+							(issue) => getConversationIssueSeverity(issue) === "error",
+						)
+					? "error"
+					: "warning";
+
+		const worstNetworkQuality = Math.max(networkQuality.uplink, networkQuality.downlink);
+		const networkSeverity =
+			worstNetworkQuality >= 4 ? "error" : worstNetworkQuality === 3 ? "warning" : "normal";
+
+		if (issueSeverity === "error" || networkSeverity === "error") return "error";
+		if (issueSeverity === "warning" || networkSeverity === "warning") return "warning";
+		return "normal";
+	}, [connectionState, connectionIssues, networkQuality]);
 
 	const visualizerState = useMemo(
 		() =>
@@ -590,6 +670,27 @@ export default function ConversationComponent({
 
 	useClientEvent(client, "token-privilege-will-expire", handleTokenWillExpire);
 
+	// Chrome/Safari block audio playback that isn't triggered by a user
+	// gesture -- RemoteUser's automatic play() can silently lose this race
+	// (observed live: agent TTS never audible, only a console warning).
+	// onAutoplayFailed is a single global hook (fires once even if several
+	// tracks failed at once), not a per-client event -- registering it here
+	// is safe since only one ConversationComponent is ever mounted at a time.
+	const [audioPlaybackBlocked, setAudioPlaybackBlocked] = useState(false);
+
+	useEffect(() => {
+		AgoraRTC.onAutoplayFailed = () => setAudioPlaybackBlocked(true);
+	}, []);
+
+	const handleResumeAudio = useCallback(() => {
+		for (const user of remoteUsers) {
+			if (user.audioTrack && !user.audioTrack.isPlaying) {
+				user.audioTrack.play();
+			}
+		}
+		setAudioPlaybackBlocked(false);
+	}, [remoteUsers]);
+
 	const handleEndConversation = useCallback(async () => {
 		const track = localMicrophoneTrack;
 		if (track) {
@@ -611,130 +712,151 @@ export default function ConversationComponent({
 	}, [client, localMicrophoneTrack, onEndConversation]);
 
 	return (
-		<QuickstartConversationLayout
-			statusPanel={
-				<ConnectionStatusPanel
-					connectionState={connectionState}
-					connectionSeverity={connectionSeverity}
-					connectionIssues={connectionIssues}
-					isOpen={isConnectionDetailsOpen}
-					onToggle={() => setIsConnectionDetailsOpen((open) => !open)}
-				/>
-			}
-			pipelineMetrics={<QuickstartPipelineMetrics metrics={agentMetrics} />}
-			transcriptPanel={
-				<QuickstartTranscriptPanel
-					messageList={messageList}
-					currentInProgressMessage={currentInProgressMessage}
-					agentUID={agentUID}
-					localUid={agoraData.uid}
-					participantNames={participantNames}
-					chatNotes={chatNotes}
-				/>
-			}
-			visualizer={
-				<section
-					className="relative flex h-full min-h-[20rem] w-full max-w-4xl flex-col items-center justify-center gap-6"
-					aria-label="AI agent status visualization"
-				>
-					{remoteUsers.map((user) => (
-						<div key={user.uid} className="hidden">
-							<RemoteUser user={user} />
+		<>
+			{(audioPlaybackBlocked || micSilenceWarning) && (
+				<div className="fixed inset-x-0 top-0 z-50 flex flex-col items-center gap-2 p-3">
+					{audioPlaybackBlocked && (
+						<button
+							type="button"
+							onClick={handleResumeAudio}
+							className="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-lg"
+						>
+							Click to enable audio playback
+						</button>
+					)}
+					{micSilenceWarning && (
+						<div className="rounded-full bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground shadow-lg">
+							No audio detected from your microphone -- check it's not muted or blocked
 						</div>
-					))}
-
-					{/* Meet/Zoom-style participant grid. No video (audio-only call) --
-					    each tile is an avatar circle + label, with a pulsing ring while
-					    that participant's volume level is above the speaking threshold
-					    (see the volume-indicator listener above). Names come from RTM
-					    presence state (participantNames); falls back to a bare UID
-					    label if a participant hasn't published a name yet. */}
-					<div
-						className="grid w-full max-w-4xl grid-cols-2 gap-6 sm:grid-cols-3"
-						aria-label="Call participants"
+					)}
+				</div>
+			)}
+			<QuickstartConversationLayout
+				statusPanel={
+					<ConnectionStatusPanel
+						connectionState={connectionState}
+						connectionSeverity={connectionSeverity}
+						connectionIssues={connectionIssues}
+						networkQuality={networkQuality}
+						isOpen={isConnectionDetailsOpen}
+						onToggle={() => setIsConnectionDetailsOpen((open) => !open)}
+					/>
+				}
+				pipelineMetrics={<QuickstartPipelineMetrics metrics={agentMetrics} />}
+				transcriptPanel={
+					<QuickstartTranscriptPanel
+						messageList={messageList}
+						currentInProgressMessage={currentInProgressMessage}
+						agentUID={agentUID}
+						localUid={agoraData.uid}
+						participantNames={participantNames}
+						chatNotes={chatNotes}
+					/>
+				}
+				visualizer={
+					<section
+						className="relative flex h-full min-h-[20rem] w-full max-w-4xl flex-col items-center justify-center gap-6"
+						aria-label="AI agent status visualization"
 					>
-						{(() => {
-							const localUid = agoraData.uid;
-							const tiles = [
-								{
-									uid: localUid,
-									label: "You",
-									avatarName: localName || "You",
-									isAgent: false,
-									speaking: speakingUids.has(String(localUid)) && isEnabled,
-								},
-								...remoteUsers.map((user) => {
-									const isAgent = String(user.uid) === String(agentUID);
-									const remoteLabel = isAgent
-										? "iThink Agent"
-										: (participantNames[String(user.uid)] ??
-											`Participant ${user.uid}`);
-									return {
-										uid: user.uid,
-										label: remoteLabel,
-										avatarName: remoteLabel,
-										isAgent,
-										speaking: isAgent
-											? visualizerState === "talking"
-											: speakingUids.has(String(user.uid)),
-									};
-								}),
-							];
+						{remoteUsers.map((user) => (
+							<div key={user.uid} className="hidden">
+								<RemoteUser user={user} />
+							</div>
+						))}
 
-							return tiles.map((tile) => (
-								<div
-									key={tile.uid}
-									className="flex flex-col items-center gap-3 rounded-2xl border border-border bg-card/60 px-5 py-8"
-								>
+						{/* Meet/Zoom-style participant grid. No video (audio-only call) --
+						    each tile is an avatar circle + label, with a pulsing ring while
+						    that participant's volume level is above the speaking threshold
+						    (see the volume-indicator listener above). Names come from RTM
+						    presence state (participantNames); falls back to a bare UID
+						    label if a participant hasn't published a name yet. */}
+						<div
+							className="grid w-full max-w-4xl grid-cols-2 gap-6 sm:grid-cols-3"
+							aria-label="Call participants"
+						>
+							{(() => {
+								const localUid = agoraData.uid;
+								const tiles = [
+									{
+										uid: localUid,
+										label: "You",
+										avatarName: localName || "You",
+										isAgent: false,
+										speaking: speakingUids.has(String(localUid)) && isEnabled,
+									},
+									...remoteUsers.map((user) => {
+										const isAgent = String(user.uid) === String(agentUID);
+										const remoteLabel = isAgent
+											? "iThink Agent"
+											: (participantNames[String(user.uid)] ??
+												`Participant ${user.uid}`);
+										return {
+											uid: user.uid,
+											label: remoteLabel,
+											avatarName: remoteLabel,
+											isAgent,
+											speaking: isAgent
+												? visualizerState === "talking"
+												: speakingUids.has(String(user.uid)),
+										};
+									}),
+								];
+
+								return tiles.map((tile) => (
 									<div
-										className={`flex h-24 w-24 items-center justify-center rounded-full font-medium transition-shadow ${
-											tile.isAgent ? "bg-primary/15 text-primary" : "bg-muted text-foreground"
-										} ${tile.speaking ? "ring-4 ring-primary/70 animate-pulse" : ""}`}
-										aria-hidden="true"
+										key={tile.uid}
+										className="flex flex-col items-center gap-3 rounded-2xl border border-border bg-card/60 px-5 py-8"
 									>
-										{tile.isAgent ? (
-											<Sparkles className="h-9 w-9" strokeWidth={1.75} />
-										) : (
-											<span className="text-3xl">{getInitial(tile.avatarName)}</span>
-										)}
+										<div
+											className={`flex h-24 w-24 items-center justify-center rounded-full font-medium transition-shadow ${
+												tile.isAgent ? "bg-primary/15 text-primary" : "bg-muted text-foreground"
+											} ${tile.speaking ? "ring-4 ring-primary/70 animate-pulse" : ""}`}
+											aria-hidden="true"
+										>
+											{tile.isAgent ? (
+												<Sparkles className="h-9 w-9" strokeWidth={1.75} />
+											) : (
+												<span className="text-3xl">{getInitial(tile.avatarName)}</span>
+											)}
+										</div>
+										<span className="max-w-full truncate text-sm font-medium text-foreground">
+											{tile.label}
+										</span>
 									</div>
-									<span className="max-w-full truncate text-sm font-medium text-foreground">
-										{tile.label}
-									</span>
-								</div>
-							));
-						})()}
-					</div>
-				</section>
-			}
-			controls={
-				<fieldset className="flex items-center gap-3" aria-label="Audio controls">
-					<div className="conversation-mic-host flex items-center justify-center">
-						<MicButtonWithVisualizer
-							isEnabled={isEnabled}
-							setIsEnabled={setIsEnabled}
-							track={localMicrophoneTrack}
-							onToggle={handleMicToggle}
-							className="overflow-visible"
-							aria-label={isEnabled ? "Mute microphone" : "Unmute microphone"}
-							enabledColor="hsl(var(--primary))"
-							disabledColor="hsl(var(--destructive))"
-						/>
-					</div>
-					<MicrophoneSelector localMicrophoneTrack={localMicrophoneTrack} />
-				</fieldset>
-			}
-			chatPanel={
-				<MeetChatPanel
-					channel={agoraData.channel}
-					localUid={agoraData.uid}
-					localName={localName}
-					lateJoinRecap={lateJoinRecap}
-				/>
-			}
-			screensPanel={<SharedScreenPanel screens={sharedScreens} />}
-			autoOpenScreensSignal={screenBroadcastSignal}
-			onEndConversation={handleEndConversation}
-		/>
+								));
+							})()}
+						</div>
+					</section>
+				}
+				controls={
+					<fieldset className="flex items-center gap-3" aria-label="Audio controls">
+						<div className="conversation-mic-host flex items-center justify-center">
+							<MicButtonWithVisualizer
+								isEnabled={isEnabled}
+								setIsEnabled={setIsEnabled}
+								track={localMicrophoneTrack}
+								onToggle={handleMicToggle}
+								className="overflow-visible"
+								aria-label={isEnabled ? "Mute microphone" : "Unmute microphone"}
+								enabledColor="hsl(var(--primary))"
+								disabledColor="hsl(var(--destructive))"
+							/>
+						</div>
+						<MicrophoneSelector localMicrophoneTrack={localMicrophoneTrack} />
+					</fieldset>
+				}
+				chatPanel={
+					<MeetChatPanel
+						channel={agoraData.channel}
+						localUid={agoraData.uid}
+						localName={localName}
+						lateJoinRecap={lateJoinRecap}
+					/>
+				}
+				screensPanel={<SharedScreenPanel screens={sharedScreens} />}
+				autoOpenScreensSignal={screenBroadcastSignal}
+				onEndConversation={handleEndConversation}
+			/>
+		</>
 	);
 }

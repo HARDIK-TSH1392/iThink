@@ -94,6 +94,7 @@ export function QuickstartPreCallCard({
 				maxLength={40}
 				aria-label="Your name"
 				className="mt-8 h-10 w-full rounded-lg border border-[#3a3a3a] bg-transparent px-3 text-sm text-white placeholder:text-muted-foreground focus:border-primary focus:outline-none"
+				suppressHydrationWarning
 			/>
 
 			<Button

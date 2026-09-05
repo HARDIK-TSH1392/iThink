@@ -198,7 +198,13 @@ class Agent:
             # been figured out -- rather than always repeating the same
             # canned line. See SILENCE_TRIGGER_MARKER above.
             "silence_config": {
-                "timeout_ms": 15000,
+                # 15s was firing mid-investigation, while someone was still
+                # reading logs/dashboards rather than actually done talking
+                # -- bumped to 30s so the check-in matches a room that's
+                # genuinely gone quiet, not just mid-pause. Safe to lengthen
+                # now that get_live_participant_count already suppresses
+                # this entirely for a lone participant.
+                "timeout_ms": 30000,
                 "action": "think",
                 "content": SILENCE_TRIGGER_MARKER,
             },
@@ -225,7 +231,13 @@ class Agent:
                     "end_of_speech": {
                         "mode": "vad",
                         "vad_config": {
-                            "silence_duration_ms": 480,
+                            # 480ms was cutting real speech into fragments on
+                            # ordinary mid-sentence pauses, producing choppy
+                            # STT output and premature turn-ends. Bumped
+                            # toward the middle of Agora's suggested range to
+                            # give a speaker room to pause without ending
+                            # their turn early.
+                            "silence_duration_ms": 800,
                         },
                     },
                 },
@@ -246,10 +258,18 @@ class Agent:
                 "disabled_config": {"strategy": "append"},
             },
             # Fills dead air while Gemini is generating a structuring
-            # response -- a plain wait can be a second or more.
+            # response -- a plain wait can be a second or more. 1200ms was
+            # firing on essentially every turn, not just genuinely slow
+            # ones, since a fast/healthy call still often takes close to a
+            # second -- heard live as the agent constantly cutting in with
+            # a filler phrase regardless of what was actually said. Bumped
+            # above the common case so it only fires when a call is
+            # actually running slow (Gemini backpressure, not a fixed
+            # cost), while still masking dead air well under
+            # GEMINI_CALL_TIMEOUT_S's 25-30s ceiling.
             filler_words={
                 "enable": True,
-                "trigger": {"mode": "fixed_time", "fixed_time_config": {"response_wait_ms": 1200}},
+                "trigger": {"mode": "fixed_time", "fixed_time_config": {"response_wait_ms": 2500}},
                 "content": {
                     "mode": "static",
                     "static_config": {

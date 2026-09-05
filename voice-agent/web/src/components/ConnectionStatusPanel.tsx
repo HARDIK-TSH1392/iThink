@@ -5,10 +5,16 @@ import {
   type ConnectionIssue,
 } from '@/components/ConversationErrorCard';
 
+type NetworkQuality = {
+  uplink: number;
+  downlink: number;
+};
+
 type ConnectionStatusPanelProps = {
   connectionState: string;
   connectionSeverity: 'normal' | 'warning' | 'error';
   connectionIssues: ConnectionIssue[];
+  networkQuality?: NetworkQuality;
   isOpen: boolean;
   onToggle: () => void;
 };
@@ -27,10 +33,27 @@ function getConnectionLabel(
   return 'Disconnected';
 }
 
+// Agora's network-quality scale: 0=unknown, 1=excellent, 2=good, 3=poor,
+// 4=bad, 5=very bad, 6=disconnected.
+const NETWORK_QUALITY_LABELS = [
+  'Unknown',
+  'Excellent',
+  'Good',
+  'Poor',
+  'Bad',
+  'Very bad',
+  'Disconnected',
+];
+
+function getNetworkQualityLabel(value: number): string {
+  return NETWORK_QUALITY_LABELS[value] ?? 'Unknown';
+}
+
 export function ConnectionStatusPanel({
   connectionState,
   connectionSeverity,
   connectionIssues,
+  networkQuality,
   isOpen,
   onToggle,
 }: ConnectionStatusPanelProps) {
@@ -88,6 +111,13 @@ export function ConnectionStatusPanel({
             RTC {connectionState.toLowerCase()}
           </div>
         </div>
+
+        {networkQuality && (networkQuality.uplink > 0 || networkQuality.downlink > 0) && (
+          <div className="text-[11px] text-muted-foreground">
+            Network: {getNetworkQualityLabel(networkQuality.uplink)} (up) /{' '}
+            {getNetworkQualityLabel(networkQuality.downlink)} (down)
+          </div>
+        )}
 
         {connectionIssues.length === 0 ? (
           <div className="text-xs text-muted-foreground">

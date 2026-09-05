@@ -19,3 +19,17 @@ test("normalizeTranscript remaps uid '0' to the local uid and normalizes text", 
   expect(out[0].text).toBe('Hi. There')
   expect(out[1].uid).toBe('42')
 })
+
+test('normalizeTranscript drops the silence-check control marker', () => {
+  const out = normalizeTranscript(
+    [
+      { uid: '42', text: '[[ithink-silence-check]]', turn_id: '1', status: 1 },
+      { uid: '42', text: '  [[ithink-silence-check]]  ', turn_id: '2', status: 1 },
+      { uid: '42', text: 'real speech', turn_id: '3', status: 1 },
+      // biome-ignore lint/suspicious/noExplicitAny: minimal test fixtures
+    ] as any,
+    'local-9',
+  )
+  expect(out).toHaveLength(1)
+  expect(out[0].text).toBe('real speech')
+})

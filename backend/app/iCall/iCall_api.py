@@ -51,6 +51,7 @@ from .iCall_utils import (
     CALL_STATUS_COMPLETED,
     CLOSING_LINE,
     FALLBACK_REPLY,
+    MODEL_UNAVAILABLE_REPLY,
     MALFORMED_RESPONSE_FALLBACK,
 )
 from app.iNcidents.iNcidents_crudl import get_incident
@@ -413,7 +414,7 @@ async def chat_completions_endpoint(
         # content the gate is meant to quiet down.
         if update.is_wrapping_up:
             spoken_reply = CLOSING_LINE
-        elif update.spoken_reply in (FALLBACK_REPLY, MALFORMED_RESPONSE_FALLBACK):
+        elif update.spoken_reply in (FALLBACK_REPLY, MODEL_UNAVAILABLE_REPLY, MALFORMED_RESPONSE_FALLBACK):
             spoken_reply = update.spoken_reply
         elif should_speak_aloud(update, latest_user_message):
             spoken_reply = update.spoken_reply
