@@ -34,6 +34,7 @@ from .iCall_service import (
     record_shared_screen,
     record_agent_utterance,
     list_agent_utterances,
+    get_call_turn_lock,
     infer_and_store_participant_roles,
     IncidentNotFoundError,
 )
@@ -350,6 +351,105 @@ async def _maybe_push_shared_screens(
     return call
 
 
+async def _process_turn(
+    db: AsyncSession, call: IncidentCall, channel_name: str, payload: ChatCompletionRequest
+) -> str:
+    """
+    One turn's worth of chat_completions_endpoint's work -- generate (or
+    skip) a structuring update, merge it into structured_state, and decide
+    what (if anything) gets said. Pulled out of the endpoint so it can run
+    entirely inside get_call_turn_lock's per-call lock (see that function's
+    docstring for why: overlapping turns racing on the same call's
+    structured_state is a real, observed lost-update bug, not
+    hypothetical). Returns the text to speak, "" for silence.
+    """
+    if _is_silence_trigger(payload.messages):
+        # The room's gone quiet -- this isn't real speech to extract facts
+        # from, so skip generate_structuring_update entirely. Stay silent
+        # when there's nobody to nudge (a lone participant), otherwise say
+        # something shaped by how far the call has actually gotten.
+        participant_count = await get_live_participant_count(channel_name)
+        if participant_count is not None and participant_count <= 1:
+            return ""
+        spoken_reply = build_silence_prompt(call.structured_state or {})
+        await record_agent_utterance(db, call.id, spoken_reply, "silence_check")
+        return spoken_reply
+
+    incident = await get_incident(db, call.incident_id)
+    service = incident.service if incident else None
+
+    update, deploy_check_result = await generate_structuring_update(
+        payload.messages, call.structured_state or {}, service
+    )
+    call = await apply_structuring_update(db, call, update)
+    call = await _maybe_push_shared_screens(db, call, channel_name, incident, update, deploy_check_result)
+
+    # Coordination-health score: a rough, code-computed aggregate over the
+    # call's own state (open conflicts, missing info, unowned items, time
+    # since the last decision) -- recorded every turn, cheaply, regardless
+    # of whether anything below actually speaks. See detect_health_score_drop.
+    health_score = compute_coordination_health_score(call.structured_state)
+    call = await record_health_score(db, call, health_score)
+
+    latest_user_message = next(
+        (m.content for m in reversed(payload.messages) if m.role == "user"), None
+    )
+
+    # The LLM only detects *that* the room sounds like it's wrapping up;
+    # the actual words are ours, not a paraphrase, so what's promised about
+    # Slack/Jira is always accurate. Diagnostic fallbacks (no API key
+    # configured, or a malformed model response) always speak too -- they're
+    # meta-signals about the system itself, not ordinary conversational
+    # content the gate is meant to quiet down.
+    if update.is_wrapping_up:
+        spoken_reply = CLOSING_LINE
+        await record_agent_utterance(db, call.id, spoken_reply, "is_wrapping_up")
+        return spoken_reply
+
+    if update.spoken_reply in (FALLBACK_REPLY, MODEL_UNAVAILABLE_REPLY, MALFORMED_RESPONSE_FALLBACK):
+        spoken_reply = update.spoken_reply
+        fallback_names = {
+            FALLBACK_REPLY: "FALLBACK_REPLY",
+            MODEL_UNAVAILABLE_REPLY: "MODEL_UNAVAILABLE_REPLY",
+            MALFORMED_RESPONSE_FALLBACK: "MALFORMED_RESPONSE_FALLBACK",
+        }
+        await record_agent_utterance(
+            db, call.id, spoken_reply, f"fallback:{fallback_names[spoken_reply]}"
+        )
+        return spoken_reply
+
+    if should_speak_aloud(update, latest_user_message):
+        spoken_reply = update.spoken_reply
+        await record_agent_utterance(
+            db, call.id, spoken_reply, describe_speak_reason(update, latest_user_message)
+        )
+        return spoken_reply
+
+    # Nothing about THIS turn was urgent -- but the accumulated state
+    # might still be worth flagging (a pattern across recorded events, or
+    # a sharp drop in coordination health). Checked only here, below the
+    # turn-level gate, so a pattern nudge never competes with something
+    # more directly relevant to what was just said.
+    pattern = evaluate_call_patterns(call.structured_state)
+    if pattern:
+        spoken_reply = pattern["message"]
+        call = await record_pattern_nudge(db, call, pattern["pattern"], pattern["message"])
+        await record_agent_utterance(db, call.id, spoken_reply, f"pattern:{pattern['pattern']}")
+        return spoken_reply
+
+    if detect_health_score_drop(call.structured_state):
+        spoken_reply = build_health_recap(call.structured_state)
+        await record_pattern_nudge(db, call, "health_score_drop", spoken_reply, score=health_score)
+        await record_agent_utterance(db, call.id, spoken_reply, "health_score_drop")
+        return spoken_reply
+
+    # Ordinary turn, nothing urgent -- stay silent. The prompt already
+    # asks the model to keep these to "a brief acknowledgment," but that
+    # was never enforced; this makes it deterministic. Nothing recorded
+    # is affected (spoken_reply was never persisted -- see docstring).
+    return ""
+
+
 def _sse_chunk(completion_id: str, created: int, model: str, delta: dict, finish_reason) -> str:
     payload = {
         "id": completion_id,
@@ -398,86 +498,15 @@ async def chat_completions_endpoint(
     if call is None:
         raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
 
-    if _is_silence_trigger(payload.messages):
-        # The room's gone quiet -- this isn't real speech to extract facts
-        # from, so skip generate_structuring_update entirely. Stay silent
-        # when there's nobody to nudge (a lone participant), otherwise say
-        # something shaped by how far the call has actually gotten.
-        participant_count = await get_live_participant_count(channel_name)
-        if participant_count is not None and participant_count <= 1:
-            spoken_reply = ""
-        else:
-            spoken_reply = build_silence_prompt(call.structured_state or {})
-            await record_agent_utterance(db, call.id, spoken_reply, "silence_check")
-    else:
-        incident = await get_incident(db, call.incident_id)
-        service = incident.service if incident else None
-
-        update, deploy_check_result = await generate_structuring_update(
-            payload.messages, call.structured_state or {}, service
-        )
-        call = await apply_structuring_update(db, call, update)
-        call = await _maybe_push_shared_screens(db, call, channel_name, incident, update, deploy_check_result)
-
-        # Coordination-health score: a rough, code-computed aggregate over the
-        # call's own state (open conflicts, missing info, unowned items, time
-        # since the last decision) -- recorded every turn, cheaply, regardless
-        # of whether anything below actually speaks. See detect_health_score_drop.
-        health_score = compute_coordination_health_score(call.structured_state)
-        call = await record_health_score(db, call, health_score)
-
-        latest_user_message = next(
-            (m.content for m in reversed(payload.messages) if m.role == "user"), None
-        )
-
-        # The LLM only detects *that* the room sounds like it's wrapping up;
-        # the actual words are ours, not a paraphrase, so what's promised about
-        # Slack/Jira is always accurate. Diagnostic fallbacks (no API key
-        # configured, or a malformed model response) always speak too -- they're
-        # meta-signals about the system itself, not ordinary conversational
-        # content the gate is meant to quiet down.
-        if update.is_wrapping_up:
-            spoken_reply = CLOSING_LINE
-            await record_agent_utterance(db, call.id, spoken_reply, "is_wrapping_up")
-        elif update.spoken_reply in (FALLBACK_REPLY, MODEL_UNAVAILABLE_REPLY, MALFORMED_RESPONSE_FALLBACK):
-            spoken_reply = update.spoken_reply
-            fallback_names = {
-                FALLBACK_REPLY: "FALLBACK_REPLY",
-                MODEL_UNAVAILABLE_REPLY: "MODEL_UNAVAILABLE_REPLY",
-                MALFORMED_RESPONSE_FALLBACK: "MALFORMED_RESPONSE_FALLBACK",
-            }
-            await record_agent_utterance(
-                db, call.id, spoken_reply, f"fallback:{fallback_names[spoken_reply]}"
-            )
-        elif should_speak_aloud(update, latest_user_message):
-            spoken_reply = update.spoken_reply
-            await record_agent_utterance(
-                db, call.id, spoken_reply, describe_speak_reason(update, latest_user_message)
-            )
-        else:
-            # Nothing about THIS turn was urgent -- but the accumulated state
-            # might still be worth flagging (a pattern across recorded events,
-            # or a sharp drop in coordination health). Checked only here, below
-            # the turn-level gate, so a pattern nudge never competes with
-            # something more directly relevant to what was just said.
-            pattern = evaluate_call_patterns(call.structured_state)
-            if pattern:
-                spoken_reply = pattern["message"]
-                call = await record_pattern_nudge(db, call, pattern["pattern"], pattern["message"])
-                await record_agent_utterance(db, call.id, spoken_reply, f"pattern:{pattern['pattern']}")
-            elif detect_health_score_drop(call.structured_state):
-                spoken_reply = build_health_recap(call.structured_state)
-                call = await record_pattern_nudge(
-                    db, call, "health_score_drop", spoken_reply, score=health_score
-                )
-                await record_agent_utterance(db, call.id, spoken_reply, "health_score_drop")
-            else:
-                # Ordinary turn, nothing urgent -- stay silent. The prompt
-                # already asks the model to keep these to "a brief
-                # acknowledgment," but that was never enforced; this makes it
-                # deterministic. Nothing recorded is affected (spoken_reply was
-                # never persisted -- see docstring).
-                spoken_reply = ""
+    # Serializes per-call turn processing -- see get_call_turn_lock's
+    # docstring for the lost-update race this closes. Re-fetch after
+    # acquiring the lock: `call` above was read before waiting on it, and
+    # a turn that queued ahead of this one may have just committed a
+    # newer structured_state.
+    lock = await get_call_turn_lock(call.id)
+    async with lock:
+        call = await get_call(db, call.id)
+        spoken_reply = await _process_turn(db, call, channel_name, payload)
 
     async def event_stream():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"

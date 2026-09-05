@@ -37,6 +37,31 @@ async def _get_incident_lock(incident_id: int) -> asyncio.Lock:
         return _incident_call_locks[incident_id]
 
 
+# Same race as above, different trigger: Agora's Custom LLM webhook fires
+# once per completed STT turn, and fragmented speech (a sentence split
+# across two turns by a mid-sentence pause) can produce two overlapping
+# chat_completions_endpoint requests for the same call. Each reads
+# call.structured_state, spends several seconds in a Gemini call, then
+# writes back -- without serializing that per call_id, the second commit
+# silently clobbers the first's changes (a real lost-update, not
+# hypothetical: confirmed live, incident-29 -- an owned action item both
+# turns extracted and spoke about ended up recorded only once, from
+# whichever request committed last). Locking also gives the second turn
+# an accurate existing_state to extract against (see
+# _build_structuring_prompt's "use this to detect contradictions, not to
+# repeat"), since it now only starts after the first turn's update has
+# actually landed, instead of both racing off the same stale snapshot.
+_call_turn_locks: Dict[int, asyncio.Lock] = {}
+_call_turn_locks_guard = asyncio.Lock()
+
+
+async def get_call_turn_lock(call_id: int) -> asyncio.Lock:
+    async with _call_turn_locks_guard:
+        if call_id not in _call_turn_locks:
+            _call_turn_locks[call_id] = asyncio.Lock()
+        return _call_turn_locks[call_id]
+
+
 class IncidentNotFoundError(Exception):
     pass
 
