@@ -260,27 +260,24 @@ class Agent:
                 "enable": True,
                 "mode": "start_of_speech",
             },
-            # Fills dead air while Gemini is generating a structuring
-            # response -- a plain wait can be a second or more. 1200ms was
-            # firing on essentially every turn, not just genuinely slow
-            # ones, since a fast/healthy call still often takes close to a
-            # second -- heard live as the agent constantly cutting in with
-            # a filler phrase regardless of what was actually said. Bumped
-            # above the common case so it only fires when a call is
-            # actually running slow (Gemini backpressure, not a fixed
-            # cost), while still masking dead air well under
-            # GEMINI_CALL_TIMEOUT_S's 25-30s ceiling.
-            filler_words={
-                "enable": True,
-                "trigger": {"mode": "fixed_time", "fixed_time_config": {"response_wait_ms": 2500}},
-                "content": {
-                    "mode": "static",
-                    "static_config": {
-                        "phrases": ["Let me note that.", "One sec.", "Got it, noting that down."],
-                        "selection_rule": "shuffle",
-                    },
-                },
-            },
+            # Removed filler_words entirely -- it's an Agora engine feature
+            # that speaks a canned phrase from a static list on a fixed
+            # timer, completely independent of chat_completions_endpoint's
+            # gate: it fires whenever Gemini's real round trip exceeds
+            # response_wait_ms, which for live structuring calls is often
+            # every single turn. Confirmed live: the transcript showed
+            # "Let me note that." / "Got it, noting that down." / "One sec."
+            # firing constantly, indistinguishable to a listener from the
+            # agent "speaking every time" -- the exact generic-acknowledgment
+            # pattern the problem-statement audit (see the commit removing
+            # spoken_reply's own "brief natural acknowledgment" guidance)
+            # already decided to eliminate, just at the wrong layer: that
+            # fix only touched the LLM's own reply content, not this
+            # separate, content-blind engine feature. There's no
+            # requirement in the brief for latency-masking chatter, and it
+            # actively defeats should_speak_aloud's whole point (stay
+            # silent unless there's a real reason) -- dead air while
+            # Gemini thinks is fine, humans keep talking through it.
             advanced_features={"enable_rtm": True, "enable_tools": True},
             parameters=parameters,
         )
