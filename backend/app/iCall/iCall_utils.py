@@ -232,6 +232,14 @@ Hard constraints:
   being floated, not yet confirmed. Keep them separate — conflating a guess
   with a confirmed fact is exactly the failure mode this system exists to
   prevent.
+- A "decision" is the room explicitly choosing a course of action or
+  agreeing on next steps ("let's roll back the deploy", "we'll page the
+  on-call DBA", "agreed, we hold off until QA confirms") — not a fact
+  (something already true) and not by itself an action item (a task with
+  an owner). If the same turn both decides something and assigns someone
+  to carry it out, record both: the decision, and a matching action item
+  with that owner. Don't record a decision for someone merely floating an
+  option or asking what to do — only once the room actually settles on one.
 - Set "conflict" only when something said in this turn contradicts a fact
   or hypothesis already recorded in the state you were given below. Phrase
   it as one short, targeted clarifying question you would ask out loud —
