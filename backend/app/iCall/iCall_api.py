@@ -37,6 +37,7 @@ from .iCall_service import (
     record_missing_info_nudge,
     record_direct_address_reply,
     record_silence_streak,
+    record_wrapped_up,
     get_call_turn_lock,
     infer_and_store_participant_roles,
     IncidentNotFoundError,
@@ -390,6 +391,19 @@ async def _process_turn(
     hypothetical). Returns the text to speak, "" for silence.
     """
     if _is_silence_trigger(payload.messages):
+        # Confirmed live (incident-39): the room's silence timer doesn't
+        # know the call already ended. A closing-line spoken 77 seconds
+        # earlier didn't stop the room-wide 30s silence timer from firing
+        # anyway, so a nudge and then a recap both fired into a call
+        # nobody was listening to anymore -- worse than saying nothing,
+        # since it looked like the "summary" was random and disconnected
+        # rather than the actual wrap-up moment. Once wrapped_up is set
+        # (see the is_wrapping_up branch below), there's nothing left to
+        # nudge about -- the room's already had its recap, right when it
+        # actually mattered.
+        if (call.structured_state or {}).get("wrapped_up"):
+            return ""
+
         # The room's gone quiet -- this isn't real speech to extract facts
         # from, so skip generate_structuring_update entirely. Stay silent
         # when there's nobody to nudge (a lone participant), otherwise say
@@ -456,7 +470,16 @@ async def _process_turn(
     # meta-signals about the system itself, not ordinary conversational
     # content the gate is meant to quiet down.
     if update.is_wrapping_up:
-        spoken_reply = CLOSING_LINE
+        # The actually appropriate moment for a real content recap is right
+        # here, not 30-60s of post-goodbye silence later (see the
+        # silence-trigger branch above) -- this IS both "spoken status
+        # summaries at appropriate moments" and "a final incident summary"
+        # from the brief, landing in the one moment that's unambiguously
+        # right for it. CLOSING_LINE's own promise about Slack/Jira stays
+        # exactly as accurate as before; this just says what actually
+        # happened before promising where the fuller version goes.
+        spoken_reply = f"{build_health_recap(call.structured_state)} {CLOSING_LINE}"
+        call = await record_wrapped_up(db, call)
         await record_agent_utterance(db, call.id, spoken_reply, "is_wrapping_up")
         return spoken_reply
 

@@ -65,7 +65,19 @@ def generate_channel_name(incident_id: int) -> str:
 # times. Re-verified on 2026-09-04 during that same instability that
 # these two are genuinely distinct models with independent capacity, not
 # just different names for the same thing.
-PRIMARY_MODEL = "gemini-flash-latest"
+#
+# PRIMARY moved to a lite tier on 2026-09-05 for latency, not carelessly
+# repeating the incident above: measured against the actual production
+# prompt/schema (not guessed), gemini-flash-lite-latest ran the identical
+# structuring call in 1.27s vs 2.69s for gemini-flash-latest -- a 53% cut
+# on the single biggest piece of the ~5s turn-to-speech latency -- and it
+# correctly handled the hardest live-failing case this session hit (the
+# hypothesis-contradiction conflict check) with equivalent output. FALLBACK
+# deliberately stays a full-tier model, not another lite one: if the lite
+# primary hits the same kind of capacity instability that caused the
+# history above, the fallback path needs to actually be different capacity,
+# not just a different name for the same risk.
+PRIMARY_MODEL = "gemini-flash-lite-latest"
 FALLBACK_MODEL = "gemini-3.5-flash"
 
 # None of the four Gemini call sites below had a timeout before this --
@@ -793,7 +805,6 @@ HYPOTHESIS_CLUSTER_WINDOW_MINUTES = 5
 STALE_ACTION_ITEM_MINUTES = 5
 
 HEALTH_SCORE_DROP_THRESHOLD = 20
-HEALTH_SCORE_HISTORY_LOOKBACK = 5
 HEALTH_SCORE_HISTORY_MAX_LEN = 20
 
 
@@ -918,10 +929,20 @@ def compute_coordination_health_score(structured_state: dict) -> int:
 
 def detect_health_score_drop(structured_state: dict) -> bool:
     """
-    A SHARP DROP, not a static low value -- a call that's held steady at
-    60 all along isn't an emergency; one that just fell from 90 to 55 in a
-    few turns is. Needs history (see iCall_service.record_health_score),
-    since a single snapshot can't tell a drop from a call that started low.
+    A SHARP DROP OR A SLOW BLEED, not a static low value -- a call that's
+    held steady at 60 all along isn't an emergency; one that fell from 90
+    to 55 is, whether that happened in one turn or over ten. Needs history
+    (see iCall_service.record_health_score), since a single snapshot can't
+    tell a drop from a call that started low.
+
+    Compares against the call's own peak so far (bounded by
+    HEALTH_SCORE_HISTORY_MAX_LEN, not literally unbounded), not just a
+    short recent window -- confirmed live (incident-39): a real 25-point
+    gradual decline (100 -> 75 over ~2 minutes, each individual step only
+    5-10 points) never crossed HEALTH_SCORE_DROP_THRESHOLD under the old
+    5-entry lookback, because no single 5-entry window ever showed more
+    than a 10-15 point swing. Comparing against the whole stored history's
+    peak catches both shapes of decline with one check.
 
     Re-nudges only if things have gotten WORSE since the last nudge, not
     on every turn the score merely stays below some historical peak.
@@ -934,9 +955,8 @@ def detect_health_score_drop(structured_state: dict) -> bool:
     history = structured_state.get("health_score_history", [])
     if len(history) < 2:
         return False
-    recent = history[-HEALTH_SCORE_HISTORY_LOOKBACK:]
-    peak = max(h["score"] for h in recent[:-1])
-    current = recent[-1]["score"]
+    current = history[-1]["score"]
+    peak = max(h["score"] for h in history[:-1])
     if (peak - current) < HEALTH_SCORE_DROP_THRESHOLD:
         return False
     last_nudge_score = structured_state.get("last_health_score_drop_nudge_score")

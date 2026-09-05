@@ -317,6 +317,24 @@ async def record_silence_streak(db: AsyncSession, call: IncidentCall, streak: in
     return call
 
 
+async def record_wrapped_up(db: AsyncSession, call: IncidentCall) -> IncidentCall:
+    """
+    Marks that the call has already spoken its wrap-up recap --
+    iCall_api._process_turn's silence-trigger branch checks this to stay
+    silent afterward instead of continuing to nudge/recap into a call
+    that already said its goodbyes. Confirmed live (incident-39): without
+    this, a silence_check and then a silence_recap both fired 43s and 77s
+    after the closing line, into dead air.
+    """
+    old = call.structured_state or {}
+    new_state = dict(old)
+    new_state["wrapped_up"] = True
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
 async def record_pattern_nudge(
     db: AsyncSession, call: IncidentCall, pattern: str, message: str, score: Optional[int] = None
 ) -> IncidentCall:
