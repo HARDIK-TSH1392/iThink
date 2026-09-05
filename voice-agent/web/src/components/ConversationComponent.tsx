@@ -8,6 +8,7 @@ import {
 	type ConnectionIssue,
 	getConversationIssueSeverity,
 } from "@/components/ConversationErrorCard";
+import { LiveRecapPanel } from "@/components/LiveRecapPanel";
 import { MeetChatPanel } from "@/components/MeetChatPanel";
 import { MicrophoneSelector } from "@/components/MicrophoneSelector";
 import { QuickstartConversationLayout } from "@/components/QuickstartConversationLayout";
@@ -1032,6 +1033,7 @@ export default function ConversationComponent({
 					/>
 				}
 				screensPanel={<SharedScreenPanel screens={sharedScreens} />}
+				timelinePanel={<LiveRecapPanel channelName={agoraData.channel} />}
 				autoOpenScreensSignal={screenBroadcastSignal}
 				onEndConversation={handleEndConversation}
 			/>

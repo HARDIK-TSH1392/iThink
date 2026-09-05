@@ -254,3 +254,28 @@ export async function getChatNotes(channelName: string): Promise<ChatNote[]> {
   const result = await response.json()
   return result.data ?? []
 }
+
+export interface LiveRecap {
+  recap: string | null
+  sharedScreens: unknown[]
+}
+
+// Backs the live timeline panel -- the brief's "a continuously updated
+// incident timeline" was only ever visible server-side before this
+// (queryable via curl, never shown to anyone on the actual call). Polled,
+// not pushed -- this is a plain-text recap of already-extracted state
+// (see iCall_utils.format_live_recap), cheap enough that a poll interval
+// is simpler than wiring another RTM message type for it.
+export async function getRecap(channelName: string): Promise<LiveRecap> {
+  const response = await fetch(`/api/recap/${encodeURIComponent(channelName)}`)
+
+  if (!response.ok) {
+    return { recap: null, sharedScreens: [] }
+  }
+
+  const result = await response.json()
+  return {
+    recap: result.data?.recap ?? null,
+    sharedScreens: result.data?.shared_screens ?? [],
+  }
+}

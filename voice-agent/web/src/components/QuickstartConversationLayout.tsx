@@ -1,10 +1,10 @@
 "use client";
 
-import { FileText, GitCommitHorizontal, MessageSquare, PhoneOff } from "lucide-react";
+import { ClipboardList, FileText, GitCommitHorizontal, MessageSquare, PhoneOff } from "lucide-react";
 import Image from "next/image";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
-type SidePanel = "transcript" | "chat" | "screens" | null;
+type SidePanel = "transcript" | "chat" | "screens" | "timeline" | null;
 
 type QuickstartConversationLayoutProps = {
 	statusPanel: ReactNode;
@@ -12,6 +12,12 @@ type QuickstartConversationLayoutProps = {
 	transcriptPanel: ReactNode;
 	chatPanel: ReactNode;
 	screensPanel: ReactNode;
+	// The brief's "a continuously updated incident timeline" -- previously
+	// only queryable server-side, never shown to anyone actually on the
+	// call. A fourth tab alongside transcript/chat/screens rather than
+	// folded into one of those, since it's a different kind of content
+	// (derived/structured state, not a message log).
+	timelinePanel: ReactNode;
 	visualizer: ReactNode;
 	controls: ReactNode;
 	onEndConversation: () => void;
@@ -29,6 +35,7 @@ export function QuickstartConversationLayout({
 	transcriptPanel,
 	chatPanel,
 	screensPanel,
+	timelinePanel,
 	visualizer,
 	controls,
 	onEndConversation,
@@ -82,7 +89,9 @@ export function QuickstartConversationLayout({
 							? transcriptPanel
 							: activePanel === "chat"
 								? chatPanel
-								: screensPanel}
+								: activePanel === "screens"
+									? screensPanel
+									: timelinePanel}
 					</aside>
 				) : null}
 
@@ -143,6 +152,21 @@ export function QuickstartConversationLayout({
 								}`}
 							>
 								<GitCommitHorizontal className="h-[18px] w-[18px]" />
+							</button>
+
+							<button
+								type="button"
+								onClick={() => togglePanel("timeline")}
+								aria-pressed={activePanel === "timeline"}
+								aria-label={activePanel === "timeline" ? "Hide incident timeline" : "Show incident timeline"}
+								title={activePanel === "timeline" ? "Hide incident timeline" : "Show incident timeline"}
+								className={`flex h-10 w-10 items-center justify-center rounded-full transition-colors ${
+									activePanel === "timeline"
+										? "bg-primary/15 text-primary"
+										: "text-muted-foreground hover:bg-muted hover:text-foreground"
+								}`}
+							>
+								<ClipboardList className="h-[18px] w-[18px]" />
 							</button>
 
 							<div className="mx-1 h-6 w-px bg-border" aria-hidden="true" />

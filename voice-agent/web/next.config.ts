@@ -52,6 +52,10 @@ const nextConfig: NextConfig = {
           source: '/api/chatNotes/:channel',
           destination: `${ithinkUrl}/icall/channel/:channel/chat-notes`,
         },
+        {
+          source: '/api/recap/:channel',
+          destination: `${ithinkUrl}/icall/channel/:channel/recap`,
+        },
       )
     }
 
