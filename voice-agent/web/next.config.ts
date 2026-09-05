@@ -12,7 +12,7 @@ const nextConfig: NextConfig = {
   // is machine- and network-specific (DHCP can reassign it) -- update it
   // locally to whatever `ipconfig`/`hostname -I` reports for your own
   // machine's LAN adapter rather than relying on this committed value.
-  allowedDevOrigins: ['192.168.1.8'],
+  allowedDevOrigins: ['172.25.231.35', 'campbell-casino-quilt-smooth.trycloudflare.com'],
 
   // Optimize images
   images: {
