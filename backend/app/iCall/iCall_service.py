@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 from app.iNcidents.iNcidents_crudl import get_incident
 from app.iDirectory.iDirectory_crudl import find_employee_by_name
 
-from .iCall_model import IncidentCall, CallUtterance
+from .iCall_model import IncidentCall, CallUtterance, AgentUtterance
 from .iCall_schema import CallUtteranceCreate, StructuringUpdate
 from .iCall_utils import (
     generate_channel_name,
@@ -348,6 +348,37 @@ async def list_utterances(db: AsyncSession, call_id: int) -> List[CallUtterance]
         select(CallUtterance)
         .where(CallUtterance.call_id == call_id)
         .order_by(CallUtterance.turn_index.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def record_agent_utterance(
+    db: AsyncSession, call_id: int, text: str, reason: str
+) -> AgentUtterance:
+    """
+    Persists one line the agent actually spoke. Call this only when
+    spoken_reply ended up non-empty -- a turn the gate decided to stay
+    silent on has nothing to record. See AgentUtterance's docstring for
+    why this is a separate table from CallUtterance rather than a
+    special speaker_uid on it.
+    """
+    utterance = AgentUtterance(
+        call_id=call_id,
+        text=text,
+        reason=reason,
+        timestamp=datetime.now(timezone.utc),
+    )
+    db.add(utterance)
+    await db.commit()
+    await db.refresh(utterance)
+    return utterance
+
+
+async def list_agent_utterances(db: AsyncSession, call_id: int) -> List[AgentUtterance]:
+    result = await db.execute(
+        select(AgentUtterance)
+        .where(AgentUtterance.call_id == call_id)
+        .order_by(AgentUtterance.timestamp.asc())
     )
     return list(result.scalars().all())
 

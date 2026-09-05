@@ -17,6 +17,7 @@ from .iCall_schema import (
     CallStatusUpdate,
     CallUtteranceCreate,
     CallUtteranceRead,
+    AgentUtteranceRead,
     ChatCompletionRequest,
     AgoraWebhookEvent,
 )
@@ -31,6 +32,8 @@ from .iCall_service import (
     record_health_score,
     record_pattern_nudge,
     record_shared_screen,
+    record_agent_utterance,
+    list_agent_utterances,
     infer_and_store_participant_roles,
     IncidentNotFoundError,
 )
@@ -44,6 +47,7 @@ from .iCall_utils import (
     broadcast_shared_screen,
     _is_silence_trigger,
     should_speak_aloud,
+    describe_speak_reason,
     evaluate_call_patterns,
     compute_coordination_health_score,
     detect_health_score_drop,
@@ -263,6 +267,25 @@ async def list_utterances_endpoint(
     return [CallUtteranceRead.model_validate(u) for u in utterances]
 
 
+@router.get("/{call_id}/agent-utterances", response_model=List[AgentUtteranceRead])
+async def list_agent_utterances_endpoint(
+    call_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> List[AgentUtteranceRead]:
+    """
+    List everything the agent actually said in a call, in order, with why
+    (see AgentUtterance.reason) -- the answer to "what did the agent
+    actually say" that didn't exist before this endpoint (see
+    record_agent_utterance).
+    """
+    call = await get_call(db, call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    utterances = await list_agent_utterances(db, call_id)
+    return [AgentUtteranceRead.model_validate(u) for u in utterances]
+
+
 async def _push_shared_screen(db: AsyncSession, call: IncidentCall, channel_name: str, screen: dict) -> IncidentCall:
     """Records + broadcasts one shared-screen event; returns the (possibly updated) call."""
     call = await record_shared_screen(db, call, screen)
@@ -385,6 +408,7 @@ async def chat_completions_endpoint(
             spoken_reply = ""
         else:
             spoken_reply = build_silence_prompt(call.structured_state or {})
+            await record_agent_utterance(db, call.id, spoken_reply, "silence_check")
     else:
         incident = await get_incident(db, call.incident_id)
         service = incident.service if incident else None
@@ -414,10 +438,22 @@ async def chat_completions_endpoint(
         # content the gate is meant to quiet down.
         if update.is_wrapping_up:
             spoken_reply = CLOSING_LINE
+            await record_agent_utterance(db, call.id, spoken_reply, "is_wrapping_up")
         elif update.spoken_reply in (FALLBACK_REPLY, MODEL_UNAVAILABLE_REPLY, MALFORMED_RESPONSE_FALLBACK):
             spoken_reply = update.spoken_reply
+            fallback_names = {
+                FALLBACK_REPLY: "FALLBACK_REPLY",
+                MODEL_UNAVAILABLE_REPLY: "MODEL_UNAVAILABLE_REPLY",
+                MALFORMED_RESPONSE_FALLBACK: "MALFORMED_RESPONSE_FALLBACK",
+            }
+            await record_agent_utterance(
+                db, call.id, spoken_reply, f"fallback:{fallback_names[spoken_reply]}"
+            )
         elif should_speak_aloud(update, latest_user_message):
             spoken_reply = update.spoken_reply
+            await record_agent_utterance(
+                db, call.id, spoken_reply, describe_speak_reason(update, latest_user_message)
+            )
         else:
             # Nothing about THIS turn was urgent -- but the accumulated state
             # might still be worth flagging (a pattern across recorded events,
@@ -428,11 +464,13 @@ async def chat_completions_endpoint(
             if pattern:
                 spoken_reply = pattern["message"]
                 call = await record_pattern_nudge(db, call, pattern["pattern"], pattern["message"])
+                await record_agent_utterance(db, call.id, spoken_reply, f"pattern:{pattern['pattern']}")
             elif detect_health_score_drop(call.structured_state):
                 spoken_reply = build_health_recap(call.structured_state)
                 call = await record_pattern_nudge(
                     db, call, "health_score_drop", spoken_reply, score=health_score
                 )
+                await record_agent_utterance(db, call.id, spoken_reply, "health_score_drop")
             else:
                 # Ordinary turn, nothing urgent -- stay silent. The prompt
                 # already asks the model to keep these to "a brief
