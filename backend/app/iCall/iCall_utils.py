@@ -182,27 +182,41 @@ def build_correction_callout(update: StructuringUpdate) -> str:
     the record without announcing it doesn't actually keep the team's
     shared understanding aligned.
 
-    Worded as "Update" / "previously noted as", not "Correction" / "earlier
-    we had" -- confirmed live (incident-101) that "Correction" reads as "the
-    old fact was WRONG," which is misleading whenever corrects_fact actually
-    fired on two facts that are compatible rather than contradictory (real
+    "Update: <current>. Earlier: <previous>." template, not a full sentence
+    -- confirmed live (incident-101) that natural-language phrasing here
+    reads with more ambiguity than a flat template needs to carry:
+    "Correction" outright implied the old fact was wrong (misleading when
+    the two facts were actually compatible, not contradictory -- real
     example: "Outage is not in the US" + "The outage is in the Africa
-    region" -- not a contradiction, just STT fragmenting one continuous
-    sentence into two turns; see the corrects_fact prompt guidance in
-    STRUCTURING_SYSTEM_INSTRUCTION for the detection-side half of this fix).
-    "Update ... previously noted as ..." states the same fact change without
-    asserting the earlier statement was false.
+    region", just STT fragmenting one sentence into two turns), and even
+    "previously noted as" still reads as prose that could be parsed
+    different ways under time pressure. "Update:" is kept as the lead word
+    deliberately -- it signals up front that a change is coming, unlike a
+    bare "Now:" -- but the two facts themselves are separated into their
+    own labeled clause ("Earlier: ...") rather than run together
+    mid-sentence, specifically so TTS doesn't blur them into one
+    continuous, seamless string with no audible break between "what's true
+    now" and "what was true before." Neither clause asserts the earlier
+    statement was false, doesn't editorialize, just states what was true
+    then and what's true now. Only reachable when corrects_fact actually
+    fired on a genuine change, not a restatement of the same fact in
+    different words -- see the corrects_fact prompt guidance in
+    STRUCTURING_SYSTEM_INSTRUCTION for that guard; this function only
+    controls the wording once a real update is confirmed, it doesn't
+    decide whether one happened.
 
     update.facts is this turn's newly-extracted facts, not the full running
     list -- per the corrects_fact prompt guidance, the turn that resolves a
     contradiction is expected to also state the corrected fact itself, so
     it's normally present here. Falls back to a plainer phrasing on the
     rare turn where the model flagged corrects_fact without a matching new
-    fact.
+    fact -- there's no "current" fact to put after "Update:" in that case,
+    so it says so directly rather than leaving the clause empty or
+    stacking two labels back to back ("Update: Earlier: ...").
     """
     if update.facts:
-        return f'Update: {update.facts[0]} — previously noted as "{update.corrects_fact}."'
-    return f'Update: "{update.corrects_fact}" has been superseded.'
+        return f'Update: {update.facts[0]}. Earlier: {update.corrects_fact}.'
+    return f"Update: that's no longer accurate. Earlier: {update.corrects_fact}."
 
 # Matches SILENCE_TRIGGER_MARKER in voice-agent/server/src/agent.py, set as
 # parameters.silence_config.content there with action="think" -- Agora
@@ -396,6 +410,17 @@ Hard constraints:
   given the new one) -- a negative statement ("not X") and a later
   positive statement about something other than X are compatible, not
   contradictory.
+  ALSO do not set corrects_fact when the new statement just RESTATES an
+  existing fact in different words -- that's not a correction either,
+  since nothing actually changed. Concretely: an existing fact "The
+  outage is not in the Africa region" followed by this turn saying
+  "Africa region is ruled out entirely" is the SAME claim, just reworded
+  -- not a correction, and there is no new fact worth recording from it.
+  Leave both facts and corrects_fact untouched on a turn like that. Only
+  use corrects_fact when the room's answer actually flips (an old fact
+  that said one thing is now confirmed false, replaced by a genuinely
+  different claim) -- not when someone just says the same confirmed
+  thing again in their own words.
 - action_items: when a specific person is named as responsible for a task
   in this turn ("Rahul, can you check the logs", "I'll get Priya to look
   at it"), set that item's owner to that name. Leave owner null when no

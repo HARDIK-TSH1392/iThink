@@ -1,7 +1,10 @@
 import json
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -603,6 +606,10 @@ async def _process_tool_result_turn(
     latest_user_message = next(
         (m.content for m in reversed(payload.messages) if m.role == "user"), None
     )
+    logger.warning(
+        "channel=%s tool-result turn latest_user_message=%r",
+        channel_name, latest_user_message,
+    )
     spoken_reply = await _decide_spoken_reply(db, call, update, old_facts, latest_user_message, health_score)
     return spoken_reply, None
 
@@ -718,6 +725,10 @@ async def _process_turn(
 
     latest_user_message = next(
         (m.content for m in reversed(payload.messages) if m.role == "user"), None
+    )
+    logger.warning(
+        "channel=%s real turn latest_user_message=%r facts_this_turn=%r",
+        channel_name, latest_user_message, update.facts,
     )
     spoken_reply = await _decide_spoken_reply(db, call, update, old_facts, latest_user_message, health_score)
     return spoken_reply, None
