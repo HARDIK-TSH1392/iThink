@@ -353,17 +353,27 @@ async def record_pattern_nudge(
     tell "already nudged for this drop" from "it's gotten worse since" --
     without this, that check fired repeatedly on consecutive turns with
     nothing new to report (confirmed live, incident-26).
+
+    Every call also stamps last_pattern_nudge_at[pattern] with now, which
+    is what evaluate_call_patterns._pattern_off_cooldown reads -- without
+    this, its window-threshold checks have zero memory of "did I just say
+    this" and re-fire identically on every subsequent turn (confirmed
+    live, incident-101: confusion_cluster x9, conflict_pileup x4 in ~20s).
     """
     old = call.structured_state or {}
     timeline = list(old.get("timeline", []))
+    now = datetime.now(timezone.utc)
     timeline.append({
         "type": "pattern_nudge",
         "text": f"[{pattern}] {message}",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now.isoformat(),
     })
 
     new_state = dict(old)
     new_state["timeline"] = timeline
+    last_pattern_nudge_at = dict(old.get("last_pattern_nudge_at", {}))
+    last_pattern_nudge_at[pattern] = now.isoformat()
+    new_state["last_pattern_nudge_at"] = last_pattern_nudge_at
     if score is not None:
         new_state["last_health_score_drop_nudge_score"] = score
     call.structured_state = new_state

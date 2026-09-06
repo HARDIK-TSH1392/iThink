@@ -54,6 +54,7 @@ from .iCall_utils import (
     _is_silence_trigger,
     should_speak_aloud,
     describe_speak_reason,
+    build_gated_spoken_reply,
     evaluate_call_patterns,
     compute_coordination_health_score,
     detect_health_score_drop,
@@ -402,6 +403,19 @@ async def _decide_spoken_reply(
     # meta-signals about the system itself, not ordinary conversational
     # content the gate is meant to quiet down.
     if update.is_wrapping_up:
+        # Guard against re-speaking the recap: confirmed live (incident-101,
+        # call_id=14) that separate low-content filler turns ("Okay. Nice.",
+        # "Okay. Thank you.") each independently get classified as
+        # is_wrapping_up by the model, which has no memory across turns of
+        # having already said the recap once -- fired 4x identically in one
+        # real call. wrapped_up is the durable, code-side memory of "already
+        # spoke it," same role record_wrapped_up already plays for the
+        # silence-trigger branch (see its wrapped_up check above). Once
+        # wrapped_up, later filler is genuinely nothing to say -- the recap
+        # already landed, and nudging/pattern logic below is about steering
+        # an ongoing incident, not a call that's already been summarized.
+        if (call.structured_state or {}).get("wrapped_up"):
+            return ""
         # The actually appropriate moment for a real content recap is right
         # here, not 30-60s of post-goodbye silence later (see the
         # silence-trigger branch above) -- this IS both "spoken status
@@ -439,8 +453,8 @@ async def _decide_spoken_reply(
         return spoken_reply
 
     if should_speak_aloud(update, latest_user_message, call.structured_state):
-        spoken_reply = update.spoken_reply
         reason = describe_speak_reason(update, latest_user_message, call.structured_state)
+        spoken_reply = build_gated_spoken_reply(update, reason)
         if reason == "missing_info":
             call = await record_missing_info_nudge(db, call)
         elif reason == "direct_address":

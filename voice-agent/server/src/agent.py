@@ -329,14 +329,65 @@ class Agent:
                         },
                     },
                     "end_of_speech": {
-                        "mode": "vad",
+                        # Fixed 800ms VAD silence was still the root cause
+                        # behind several distinct symptoms this session (the
+                        # duplicate Bob/rollback-owner replies, the duplicate
+                        # Watcher/status replies, and the "Outage is not in
+                        # the US" / "in Africa" false-contradiction) -- one
+                        # continuous sentence with a natural mid-thought
+                        # pause gets cut into two independent backend turns
+                        # whenever that pause happens to exceed a fixed
+                        # silence window. Confirmed via the installed SDK's
+                        # own type file (agora_agent's
+                        # start_agents_request_properties_turn_detection_config_end_of_speech_mode.py)
+                        # that end_of_speech.mode independently supports
+                        # "semantic" for our cascaded/custom-LLM pipeline
+                        # (this codebase is not mllm.enable=true, so the
+                        # "semantic has no effect under mllm" caveat found
+                        # during research doesn't apply here). Semantic mode
+                        # judges whether an utterance is grammatically/
+                        # semantically complete rather than only measuring
+                        # silence, which is what actually distinguishes "the
+                        # outage is not in the US" (complete thought, safe to
+                        # end the turn) from a genuine mid-word pause.
+                        "mode": "semantic",
+                        "semantic_config": {
+                            # Shorter than the old fixed 800ms: semantic mode
+                            # judging completeness (not just silence length)
+                            # is what makes a shorter base window safe here
+                            # -- 300-600ms is the range research on
+                            # combined semantic+acoustic VAD turn-taking
+                            # points to for reducing false end-of-turn
+                            # triggers, and 400ms sits in the middle of it.
+                            "silence_duration_ms": 400,
+                            # Bounded, not -1/unbounded -- caps the worst
+                            # case (an ambiguous utterance the semantic layer
+                            # can't confidently resolve) at 2s rather than
+                            # risking an indefinite hang waiting for a
+                            # determination that never firms up. After this
+                            # timeout the SDK falls back to ending the turn
+                            # based on current state, same failure mode as
+                            # the old fixed-silence behavior, just as a
+                            # bounded fallback instead of the default case.
+                            "max_wait_ms": 2000,
+                            # Catches "hold on" / "just a moment" as an
+                            # explicit pause rather than turn-end -- directly
+                            # relevant to an incident call, where someone
+                            # mid-command frequently says exactly that while
+                            # checking a terminal or dashboard.
+                            "pause_state_enabled": True,
+                        },
+                        # Kept as a documented fallback reference, not
+                        # deleted -- inert while mode is "semantic" (the SDK
+                        # only reads vad_config when mode is "vad"), but
+                        # switching mode back to "vad" is then a one-line
+                        # revert if live testing shows semantic mode
+                        # underperforms (e.g. the "English and Chinese only"
+                        # language-support claim found during research,
+                        # unverified against official Agora docs, turning out
+                        # to be real against this pipeline's en-IN STT
+                        # locale).
                         "vad_config": {
-                            # 480ms was cutting real speech into fragments on
-                            # ordinary mid-sentence pauses, producing choppy
-                            # STT output and premature turn-ends. Bumped
-                            # toward the middle of Agora's suggested range to
-                            # give a speaker room to pause without ending
-                            # their turn early.
                             "silence_duration_ms": 800,
                         },
                     },
