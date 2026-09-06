@@ -213,19 +213,21 @@ class Agent:
         # keyterm/smart_format/punctuation were reverted earlier this
         # session after incident-33/34/35 each produced real, non-silence
         # turns but zero usable transcript content -- correlated, never
-        # actually root-caused. Reinstated here alongside the en-IN locale
-        # change (a genuinely distinct, separately-verified fix) on the
-        # team's decision to re-test properly rather than assume the old
-        # correlation still holds with the locale now correct. If
-        # transcription goes silent again on live audio, re-open the
-        # en-IN vs keyterm/smart_format/punctuation question -- don't
-        # assume it's settled just because this merge kept both.
+        # actually root-caused. Reinstated alongside the en-IN locale
+        # change on the team's decision to re-test properly rather than
+        # assume the old correlation still holds with the locale now
+        # correct -- but it just reproduced live again (incident-43,
+        # 2026-09-06: 8 real, non-silence turns, latest_user_message=''
+        # every single time, confirmed via direct log inspection, not a
+        # guess). Reverting keyterm/smart_format/punctuation again, keeping
+        # en-IN (never implicated in either occurrence -- both times the
+        # empty-transcript symptom tracked keyterm/smart_format/
+        # punctuation being on, not the locale). If this combination is
+        # ever revisited, re-test it in isolation (one flag at a time)
+        # rather than reinstating all three together again.
         stt = DeepgramSTT(
             model="nova-3",
             language="en-IN",
-            keyterm=await _fetch_keyterms(ithink_base, channel_name),
-            smart_format=True,
-            punctuation=True,
         )
         tts = MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_captivating_female1")
 
