@@ -16,6 +16,7 @@ from .iOrchestrate_utils import (
     notify_incident_approved,
     format_call_summary,
     create_jira_ticket,
+    post_jira_ticket_created_notification,
 )
 
 router = APIRouter(prefix="/iorchestrate", tags=["iOrchestrate"])
@@ -83,6 +84,10 @@ async def _handle_jira_decision(db, action_id: str, call_id: int, user_name: str
         await update_slack_message(
             response_url,
             f"📋 *Jira ticket created* by {user_name}: {url}",
+        )
+        await post_jira_ticket_created_notification(
+            incident.id, incident.title, incident.priority, incident.service, incident.region,
+            user_name, url, summary_text,
         )
     else:
         await update_slack_message(

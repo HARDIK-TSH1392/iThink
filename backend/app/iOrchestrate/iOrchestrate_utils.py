@@ -187,31 +187,98 @@ async def create_jira_ticket(incident_id: int, title: str, summary_text: str) ->
         print("[iOrchestrate] Jira not configured, skipping ticket creation")
         return None
 
-    payload = {
-        "fields": {
-            "project": {"key": settings.jira_project_key},
-            "summary": f"Incident #{incident_id}: {title}",
-            "description": _summary_to_adf(summary_text),
-            "issuetype": {"name": "Task"},
-        }
-    }
+    site_url = settings.jira_site_url.rstrip("/")
+    auth = (settings.jira_email, settings.jira_api_token)
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
+            # Team-managed ("next-gen") Jira projects reject issue creation
+            # without an explicit reporter, even though the field metadata
+            # claims hasDefaultValue=true -- confirmed live via a 400 with
+            # no explanatory body beyond the status code. Resolved from the
+            # authenticated token's own identity rather than hardcoded, so
+            # this keeps working if JIRA_EMAIL ever points at a different
+            # account.
+            me_response = await client.get(f"{site_url}/rest/api/3/myself", auth=auth)
+            me_response.raise_for_status()
+            reporter_account_id = me_response.json()["accountId"]
+
+            # Jira's summary field has a hard 255-char cap -- confirmed live
+            # with a P1 incident title long enough to push "Incident #N: "
+            # plus the AI-generated title past it. The full title still
+            # reaches the ticket via the description, so truncating here
+            # only shortens the headline, not the actual content.
+            summary_field = f"Incident #{incident_id}: {title}"
+            if len(summary_field) > 255:
+                summary_field = summary_field[:254].rstrip() + "…"
+
+            payload = {
+                "fields": {
+                    "project": {"key": settings.jira_project_key},
+                    "summary": summary_field,
+                    "description": _summary_to_adf(summary_text),
+                    "issuetype": {"name": "Task"},
+                    "reporter": {"id": reporter_account_id},
+                }
+            }
             response = await client.post(
-                f"{settings.jira_site_url.rstrip('/')}/rest/api/3/issue",
-                auth=(settings.jira_email, settings.jira_api_token),
+                f"{site_url}/rest/api/3/issue",
+                auth=auth,
                 json=payload,
             )
             response.raise_for_status()
             data = response.json()
             issue_key = data["key"]
-            url = f"{settings.jira_site_url.rstrip('/')}/browse/{issue_key}"
+            url = f"{site_url}/browse/{issue_key}"
             print(f"[iOrchestrate] Jira ticket {issue_key} created for incident {incident_id}")
             return url
+    except httpx.HTTPStatusError as exc:
+        # str(exc) alone is just the status line -- Jira's actual rejection
+        # reason (e.g. errorMessages/errors) is in the response body, which
+        # is what actually explains a 400 instead of just confirming one
+        # happened.
+        print(f"[iOrchestrate] Jira ticket creation failed for incident {incident_id}: {exc}\nResponse body: {exc.response.text}")
+        return None
     except Exception as exc:
         print(f"[iOrchestrate] Jira ticket creation failed for incident {incident_id}: {exc}")
         return None
+
+
+async def post_jira_ticket_created_notification(
+    incident_id: int,
+    title: str,
+    priority: str,
+    service: str,
+    region: str,
+    approved_by: str,
+    url: str,
+    summary_text: str,
+) -> bool:
+    """
+    Every other outcome in this flow (incident approval, its result,
+    post-call summary, even the Jira-approval ask when no private approver
+    could be reached) gets echoed to the shared channel -- only the actual
+    Jira-ticket-created confirmation didn't, and stayed stuck in the
+    approver's own DM (via update_slack_message's response_url) with no
+    one else ever seeing it. Mirrors post_incident_approved_notification's
+    shape: the *ask* can be private, but the *outcome* is always shared.
+
+    summary_text is the same rendered breakdown that went into the ticket's
+    own Jira description (from format_call_summary) -- reused rather than
+    recomputed, so the channel post always matches what's actually in the
+    ticket, and matches the post-call summary message's level of detail.
+    """
+    text = (
+        f"*Jira ticket created for Incident #{incident_id}* :clipboard:\n"
+        f"{title}\n"
+        f"Priority: {priority}  |  Service: {service}  |  Region: {region}\n"
+        f"Created by: {approved_by}  |  {url}\n\n"
+        f"{summary_text}"
+    )
+    ok = await _post_to_slack(text)
+    if ok:
+        print(f"[iOrchestrate] Jira-ticket-created notification posted to channel for incident {incident_id}")
+    return ok
 
 
 async def _post_to_slack(text: str, blocks: Optional[list] = None) -> bool:
@@ -509,6 +576,14 @@ async def update_slack_message(response_url: str, text: str) -> bool:
                 json={"replace_original": True, "text": text, "blocks": []},
             )
             response.raise_for_status()
+            # Slack's response_url endpoint can return HTTP 200 with a
+            # non-"ok" body (e.g. an expired/already-used response_url) --
+            # raise_for_status alone would treat that as success. Confirmed
+            # worth checking after a ticket-creation success silently didn't
+            # show up as updated in Slack with no error in the logs.
+            if response.text.strip() != "ok":
+                print(f"[iOrchestrate] Slack message update returned non-ok body: {response.text}")
+                return False
         return True
     except Exception as exc:
         print(f"[iOrchestrate] Failed to update Slack message: {exc}")

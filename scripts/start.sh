@@ -85,10 +85,14 @@ if [ "$USE_TUNNELS" = true ]; then
   [ -z "$LAN_IP" ] && LAN_IP="192.168.1.8"
 
   echo "Wiring the new URLs into config files..."
-  sed -i "s#^VOICE_AGENT_WEB_BASE_URL=.*#VOICE_AGENT_WEB_BASE_URL=$FRONTEND_URL#" "$ROOT_DIR/backend/.env"
-  sed -i "s#^ITHINK_BACKEND_BASE_URL=.*#ITHINK_BACKEND_BASE_URL=$BACKEND_URL/api/v1#" "$ROOT_DIR/voice-agent/server/.env"
-  sed -i "s#const WEB_CLIENT_BASE = \".*\";#const WEB_CLIENT_BASE = \"$FRONTEND_URL\";#" "$ROOT_DIR/demo/dashboard.html"
-  sed -i "s#allowedDevOrigins: \[.*\],#allowedDevOrigins: ['$LAN_IP', '$FRONTEND_HOST'],#" "$ROOT_DIR/voice-agent/web/next.config.ts"
+  # -i.bak / rm is portable across BSD sed (macOS) and GNU sed (Linux) --
+  # bare `sed -i "..."` silently misparses on BSD sed, which requires an
+  # explicit backup-suffix argument after -i (confirmed live: it tried to
+  # compile the target file path itself as a sed script instead).
+  sed -i.bak "s#^VOICE_AGENT_WEB_BASE_URL=.*#VOICE_AGENT_WEB_BASE_URL=$FRONTEND_URL#" "$ROOT_DIR/backend/.env" && rm -f "$ROOT_DIR/backend/.env.bak"
+  sed -i.bak "s#^ITHINK_BACKEND_BASE_URL=.*#ITHINK_BACKEND_BASE_URL=$BACKEND_URL/api/v1#" "$ROOT_DIR/voice-agent/server/.env" && rm -f "$ROOT_DIR/voice-agent/server/.env.bak"
+  sed -i.bak "s#const WEB_CLIENT_BASE = \".*\";#const WEB_CLIENT_BASE = \"$FRONTEND_URL\";#" "$ROOT_DIR/demo/dashboard.html" && rm -f "$ROOT_DIR/demo/dashboard.html.bak"
+  sed -i.bak "s#allowedDevOrigins: \[.*\],#allowedDevOrigins: ['$LAN_IP', '$FRONTEND_HOST'],#" "$ROOT_DIR/voice-agent/web/next.config.ts" && rm -f "$ROOT_DIR/voice-agent/web/next.config.ts.bak"
   echo "  done (backend/.env, voice-agent/server/.env, demo/dashboard.html, voice-agent/web/next.config.ts)"
 fi
 
