@@ -182,6 +182,17 @@ def build_correction_callout(update: StructuringUpdate) -> str:
     the record without announcing it doesn't actually keep the team's
     shared understanding aligned.
 
+    Worded as "Update" / "previously noted as", not "Correction" / "earlier
+    we had" -- confirmed live (incident-101) that "Correction" reads as "the
+    old fact was WRONG," which is misleading whenever corrects_fact actually
+    fired on two facts that are compatible rather than contradictory (real
+    example: "Outage is not in the US" + "The outage is in the Africa
+    region" -- not a contradiction, just STT fragmenting one continuous
+    sentence into two turns; see the corrects_fact prompt guidance in
+    STRUCTURING_SYSTEM_INSTRUCTION for the detection-side half of this fix).
+    "Update ... previously noted as ..." states the same fact change without
+    asserting the earlier statement was false.
+
     update.facts is this turn's newly-extracted facts, not the full running
     list -- per the corrects_fact prompt guidance, the turn that resolves a
     contradiction is expected to also state the corrected fact itself, so
@@ -190,8 +201,8 @@ def build_correction_callout(update: StructuringUpdate) -> str:
     fact.
     """
     if update.facts:
-        return f'Correction: {update.facts[0]} — earlier we had "{update.corrects_fact}."'
-    return f'Correction: "{update.corrects_fact}" is no longer accurate.'
+        return f'Update: {update.facts[0]} — previously noted as "{update.corrects_fact}."'
+    return f'Update: "{update.corrects_fact}" has been superseded.'
 
 # Matches SILENCE_TRIGGER_MARKER in voice-agent/server/src/agent.py, set as
 # parameters.silence_config.content there with action="think" -- Agora
@@ -372,6 +383,19 @@ Hard constraints:
   question; corrects_fact is for the later turn where the room has
   actually settled it and the old fact is now simply wrong, not just
   disputed.
+  DO NOT set corrects_fact merely because a new fact is more specific than,
+  or adds detail to, an existing one -- that's a genuine completion, not a
+  contradiction, and the old fact was never wrong. Concretely: an existing
+  fact "Outage is not in the US" followed by this turn saying "the outage
+  is in the Africa region" is NOT a contradiction -- both are true at the
+  same time (ruling a place out, then naming the actual place, is one
+  continuous thought, often just split across two turns by the transcript).
+  Leave corrects_fact null there; record the Africa detail as a new fact
+  instead. Only use corrects_fact when the new statement is actually
+  incompatible with the old one (the old fact could not still be true
+  given the new one) -- a negative statement ("not X") and a later
+  positive statement about something other than X are compatible, not
+  contradictory.
 - action_items: when a specific person is named as responsible for a task
   in this turn ("Rahul, can you check the logs", "I'll get Priya to look
   at it"), set that item's owner to that name. Leave owner null when no
@@ -908,6 +932,44 @@ def should_speak_aloud(
     return False
 
 
+def build_gated_spoken_reply(update: StructuringUpdate, reason: str) -> str:
+    """
+    Deterministic spoken text for the three should_speak_aloud reasons that
+    have an already-extracted structured field to build from -- conflict,
+    missing_info, action_item_owner. direct_address has no such field (it's
+    open-ended conversational content), so that reason still uses
+    update.spoken_reply as-is.
+
+    Confirmed live (incident-101, after the gemini-flash-lite-latest swap):
+    update.spoken_reply produced generic acknowledgments ("Got it, noting
+    that a CDN Edge module failure...") for turns tagged reason=missing_info,
+    violating the system prompt's explicit anti-generic-acknowledgment rule
+    -- plausibly smaller/faster models degrading on nuanced instruction-
+    following (documented in the literature as up to a 61.8% drop in one
+    study), though not certain. Rather than keep tightening the prompt and
+    hoping the model complies, build the spoken text directly from the
+    fields the model already extracted correctly (conflict, missing_info,
+    action_items) -- same "wrap the non-deterministic model inside
+    deterministic software boundaries" discipline as CLOSING_LINE and
+    build_correction_callout. This removes an entire class of prompt-
+    compliance risk at zero added latency (no extra model call, just string
+    formatting on data already in hand).
+    """
+    if reason == "conflict":
+        # update.conflict is itself specified (see the corrects_fact/conflict
+        # prompt guidance) as "one short, targeted clarifying question you
+        # would ask out loud" -- already the exact text to speak, not a
+        # paraphrase target.
+        return update.conflict or ""
+    if reason == "missing_info":
+        gap = update.missing_info[0] if update.missing_info else ""
+        return f"Can you clarify: {gap}?" if gap else ""
+    if reason == "action_item_owner":
+        owner_item = next((item for item in update.action_items if item.owner), None)
+        return f"Got it, {owner_item.owner}'s on that." if owner_item else ""
+    return update.spoken_reply
+
+
 def describe_speak_reason(
     update: StructuringUpdate, latest_user_message: Optional[str], structured_state: dict
 ) -> str:
@@ -1000,6 +1062,31 @@ def _stale_unowned_action_item(structured_state: dict) -> Optional[dict]:
     return None
 
 
+# Confirmed live (incident-101/call_id=14): with no cooldown at all,
+# confusion_cluster fired 9x and conflict_pileup fired 4x, identically
+# worded, within ~20 seconds -- these are pure window-threshold checks over
+# the timeline with zero memory of "did I just say this," so once the
+# threshold is crossed every subsequent turn re-trips it again. Same bug
+# class already fixed for missing_info/direct_address/health_score_drop
+# (see MISSING_INFO_NUDGE_COOLDOWN_S, DIRECT_ADDRESS_REPLY_COOLDOWN_S), just
+# never applied here. Cooldown is per-pattern-name (not a single shared
+# timestamp), so a suppressed conflict_pileup doesn't also block a
+# genuinely separate stale_action_item from being spoken. 90s: long enough
+# to kill the observed rapid-fire spam (repeats every 2-20s in the wild),
+# short enough that a pattern which is still genuinely unresolved after
+# 90s of real conversation gets surfaced again rather than going silent
+# for the rest of the call.
+PATTERN_NUDGE_COOLDOWN_S = 90
+
+
+def _pattern_off_cooldown(structured_state: dict, pattern_name: str) -> bool:
+    last_at = (structured_state.get("last_pattern_nudge_at") or {}).get(pattern_name)
+    if not last_at:
+        return True
+    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_at)).total_seconds()
+    return elapsed >= PATTERN_NUDGE_COOLDOWN_S
+
+
 def evaluate_call_patterns(structured_state: dict) -> Optional[dict]:
     """
     Checked in priority order, first match wins -- returns None if nothing
@@ -1007,23 +1094,34 @@ def evaluate_call_patterns(structured_state: dict) -> Optional[dict]:
     explicit conflict/missing-info/wake-word this turn) already decided
     not to speak, so a pattern nudge never competes with something more
     directly relevant to what was just said.
+
+    A pattern whose condition is met but is still on its own cooldown
+    (see PATTERN_NUDGE_COOLDOWN_S) is skipped, not treated as a match --
+    the priority order then falls through to check the next pattern, so
+    one pattern being on cooldown never masks a genuinely different one.
     """
     timeline = structured_state.get("timeline", [])
 
-    if len(_recent_timeline_entries(timeline, "conflict", CONFLICT_PILEUP_WINDOW_MINUTES)) >= CONFLICT_PILEUP_THRESHOLD:
+    if (
+        len(_recent_timeline_entries(timeline, "conflict", CONFLICT_PILEUP_WINDOW_MINUTES)) >= CONFLICT_PILEUP_THRESHOLD
+        and _pattern_off_cooldown(structured_state, "conflict_pileup")
+    ):
         return {
             "pattern": "conflict_pileup",
             "message": "We've got a few open questions piling up -- want to pause and reconcile before moving on?",
         }
 
     stale_item = _stale_unowned_action_item(structured_state)
-    if stale_item:
+    if stale_item and _pattern_off_cooldown(structured_state, "stale_action_item"):
         return {
             "pattern": "stale_action_item",
             "message": f"Just checking in -- \"{stale_item['text']}\" still doesn't have an owner. Can someone take that?",
         }
 
-    if len(_recent_timeline_entries(timeline, "hypothesis", HYPOTHESIS_CLUSTER_WINDOW_MINUTES)) >= HYPOTHESIS_CLUSTER_THRESHOLD:
+    if (
+        len(_recent_timeline_entries(timeline, "hypothesis", HYPOTHESIS_CLUSTER_WINDOW_MINUTES)) >= HYPOTHESIS_CLUSTER_THRESHOLD
+        and _pattern_off_cooldown(structured_state, "confusion_cluster")
+    ):
         return {
             "pattern": "confusion_cluster",
             "message": "A few different theories have come up in the last few minutes -- want to narrow down to one to test first?",
