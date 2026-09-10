@@ -457,7 +457,7 @@ async def _decide_spoken_reply(
 
     if should_speak_aloud(update, latest_user_message, call.structured_state):
         reason = describe_speak_reason(update, latest_user_message, call.structured_state)
-        spoken_reply = build_gated_spoken_reply(update, reason)
+        spoken_reply = build_gated_spoken_reply(update, reason, call.structured_state)
         if reason == "missing_info":
             call = await record_missing_info_nudge(db, call)
         elif reason == "direct_address":

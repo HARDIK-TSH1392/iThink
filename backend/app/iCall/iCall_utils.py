@@ -14,6 +14,7 @@ from .iCall_schema import (
     ChatMessage,
     StructuringUpdate,
     CallRoleClassification,
+    ActionItem,
     ActionItemOwnerAssignments,
     UnresolvedRisksSummary,
     ReviewedTicketContent,
@@ -963,6 +964,39 @@ def _direct_address_off_cooldown(structured_state: dict) -> bool:
     return elapsed >= DIRECT_ADDRESS_REPLY_COOLDOWN_S
 
 
+def action_item_key(text: str) -> str:
+    """Normalized identity for matching the same action item re-extracted
+    across STT-fragmented turns -- lowercased, whitespace-collapsed exact
+    match, deliberately not fuzzy. Confirmed live (incident-46): the real
+    duplicates ("check the port config" extracted three separate times as
+    the room circled back to confirm an owner) were byte-identical after
+    this normalization, so exact match already covers the observed
+    failure without the tuning risk of a similarity threshold nobody has
+    measured against real transcripts."""
+    return " ".join(text.lower().split())
+
+
+def _is_new_owner_assignment(item: ActionItem, structured_state: dict) -> bool:
+    """
+    True only if this item's owner is information the room hasn't already
+    heard confirmed out loud -- i.e. either this action item's text isn't
+    in state yet, or it is but with no owner recorded yet. False when the
+    same (text, owner) pairing is already there, which happens when STT
+    fragments one instruction into several turns and the model
+    re-extracts the same item, with the same owner, on a later turn (see
+    apply_structuring_update's action_items dedup, same normalization).
+    Without this check, should_speak_aloud/describe_speak_reason would
+    re-fire "action_item_owner" once per re-extraction instead of once
+    per actual assignment -- confirmed live (incident-46): "Got it, Ted's
+    on that." spoken four times for what was one real assignment.
+    """
+    key = action_item_key(item.text)
+    for existing in structured_state.get("action_items", []) or []:
+        if action_item_key(existing.get("text", "")) == key:
+            return not existing.get("owner")
+    return True
+
+
 def should_speak_aloud(
     update: StructuringUpdate, latest_user_message: Optional[str], structured_state: dict
 ) -> bool:
@@ -986,7 +1020,7 @@ def should_speak_aloud(
         return True
     if _has_speakable_missing_info(update.missing_info, structured_state):
         return True
-    if any(item.owner for item in update.action_items):
+    if any(item.owner and _is_new_owner_assignment(item, structured_state) for item in update.action_items):
         return True
     if (
         latest_user_message
@@ -997,13 +1031,22 @@ def should_speak_aloud(
     return False
 
 
-def build_gated_spoken_reply(update: StructuringUpdate, reason: str) -> str:
+def build_gated_spoken_reply(update: StructuringUpdate, reason: str, structured_state: dict) -> str:
     """
     Deterministic spoken text for the three should_speak_aloud reasons that
     have an already-extracted structured field to build from -- conflict,
     missing_info, action_item_owner. direct_address has no such field (it's
     open-ended conversational content), so that reason still uses
     update.spoken_reply as-is.
+
+    structured_state is only actually used by the action_item_owner branch
+    (to pick the item whose owner is genuinely new, same
+    _is_new_owner_assignment check as should_speak_aloud/
+    describe_speak_reason -- see there for why) -- required anyway, rather
+    than optional, since reason is only ever "action_item_owner" when
+    those two already confirmed a new assignment exists, so a caller that
+    somehow got here without state would be masking a real bug, not
+    hitting a legitimate no-state case.
 
     Confirmed live (incident-101, after the gemini-flash-lite-latest swap):
     update.spoken_reply produced generic acknowledgments ("Got it, noting
@@ -1030,7 +1073,10 @@ def build_gated_spoken_reply(update: StructuringUpdate, reason: str) -> str:
         gap = update.missing_info[0] if update.missing_info else ""
         return f"Can you clarify: {gap}?" if gap else ""
     if reason == "action_item_owner":
-        owner_item = next((item for item in update.action_items if item.owner), None)
+        owner_item = next(
+            (item for item in update.action_items if item.owner and _is_new_owner_assignment(item, structured_state)),
+            None,
+        )
         return f"Got it, {owner_item.owner}'s on that." if owner_item else ""
     return update.spoken_reply
 
@@ -1050,7 +1096,7 @@ def describe_speak_reason(
         return "conflict"
     if _has_speakable_missing_info(update.missing_info, structured_state):
         return "missing_info"
-    if any(item.owner for item in update.action_items):
+    if any(item.owner and _is_new_owner_assignment(item, structured_state) for item in update.action_items):
         return "action_item_owner"
     return "direct_address"
 
