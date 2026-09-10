@@ -375,6 +375,36 @@ class Agent:
                             # Needs live re-testing to confirm; this is a
                             # reasoned adjustment, not a verified fix.
                             "interrupt_duration_ms": 350,
+                            # Separate from interrupt_duration_ms above --
+                            # this one specifically gates how long a voice
+                            # has to sustain to interrupt the agent while
+                            # it is ALREADY TALKING, distinct from ordinary
+                            # turn-taking when it's silent (confirmed in
+                            # the installed SDK's own vad_config type,
+                            # matches Agora's own documented example
+                            # pairing 160ms/320ms for the same two fields).
+                            # Real feedback from a mentor session (Hardik,
+                            # 2026-09-10): backchannels ("umm," "okay,"
+                            # "right") were being read as real
+                            # interruptions, cutting the agent off mid-
+                            # sentence for what was just the room listening,
+                            # not taking the floor. Backchannels are
+                            # typically well under 500ms; a genuine
+                            # interruption is sustained speech. Higher than
+                            # interrupt_duration_ms deliberately -- ordinary
+                            # turn-taking (agent silent) should stay
+                            # responsive; only the mid-speech case gets the
+                            # extra tolerance. Keyword-only interruption
+                            # (interruption.mode="keywords") was considered
+                            # and rejected for this: already tried once on
+                            # this project and reverted after real
+                            # interjections that didn't use a listed
+                            # trigger word got talked over -- worse than
+                            # the problem being fixed. Not live-tested yet;
+                            # this is a reasoned adjustment same as
+                            # interrupt_duration_ms above, not a verified
+                            # fix.
+                            "speaking_interrupt_duration_ms": 650,
                             "prefix_padding_ms": 300,
                         },
                     },
