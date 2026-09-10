@@ -91,8 +91,18 @@ class Agent:
         if not self.app_id or not self.app_certificate:
             raise ValueError("AGORA_APP_ID and AGORA_APP_CERTIFICATE are required")
 
+        # Area picks the regional domain pool for Agora's own REST control
+        # plane (agent join/start/stop) -- separate from which STT/TTS/LLM
+        # vendors are reachable (confirmed against the installed SDK's
+        # region.py: AP and US both resolve to the same "global" vendor
+        # list, only CN is special-cased). This hackathon runs in India;
+        # AP routes our join/start/stop calls to Agora's Asia-Pacific
+        # domains instead of US ones. Does not touch the backend's own
+        # Gemini round trip (that's a separate, unrelated hop) -- this is
+        # specifically the "how fast does the agent join" latency, not
+        # per-turn Thinking Engine latency.
         self.client = AsyncAgora(
-            area=Area.US,
+            area=Area.AP,
             app_id=self.app_id,
             app_certificate=self.app_certificate,
         )
