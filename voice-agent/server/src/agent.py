@@ -261,9 +261,22 @@ class Agent:
         # speaking_interrupt_duration_ms are separate layers -- so
         # keyterm is the only plausible cause. Zero transcription is a
         # worse failure than an occasionally-misheard wake word, so this
-        # goes back to no boosting rather than staying broken. If ever
-        # revisited, it needs to be tested against this actual Agora
-        # pipeline live, not just the raw vendor API in isolation. Not
+        # goes back to no boosting rather than staying broken.
+        #
+        # ALSO TRIED live (same day): sending keyterm as a real JSON list
+        # via additional_params={"keyterm": [...]}  instead of a
+        # space-joined string, on the theory that Deepgram's own
+        # repeated-query-param format for multiple terms might be the
+        # real expectation. Agora's REST API accepts the array shape
+        # (HTTP 200, no validation error) -- but on a live call
+        # (incident-51, same day, immediately after the string-form
+        # failure on incident-50) it reproduced the EXACT SAME
+        # zero-content-transcript failure: 4 real turns,
+        # latest_user_message='' every time. This rules out "wrong
+        # shape" as the explanation -- both the string and the list form
+        # fail identically, so the problem is keyterm itself on this
+        # pipeline, not its formatting. Do not re-attempt either shape
+        # without new evidence pointing somewhere else entirely. Not
         # calling _fetch_keyterms at all here (rather than calling it and
         # discarding the result) so this doesn't cost a wasted round trip
         # to our own backend on every call start.
