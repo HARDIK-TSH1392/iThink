@@ -247,11 +247,29 @@ class Agent:
         # keyterm alone does the same "off"->"auth" correction. smart_format
         # and punctuation stay off -- they were never re-tested in
         # isolation and aren't needed for either fix.
-        keyterm = await _fetch_keyterms(ithink_base, channel_name)
+        #
+        # REVERTED live (incident-50, 2026-09-10): the isolated keyterm
+        # test above was against a synthesized clip via the raw Deepgram
+        # API, not this actual Agora-managed pipeline -- and on a real
+        # call through Agora, keyterm alone reproduced the exact
+        # zero-content-transcript failure described two paragraphs up
+        # (incidents 33/34/35, 43): 5 real, non-silence turns, backend
+        # log showed latest_user_message='' facts_this_turn=[] every
+        # single time, confirmed via direct log inspection, not a guess.
+        # Nothing else changed around this time touches what's sent to
+        # Deepgram -- turn_detection.language/audio_scenario/
+        # speaking_interrupt_duration_ms are separate layers -- so
+        # keyterm is the only plausible cause. Zero transcription is a
+        # worse failure than an occasionally-misheard wake word, so this
+        # goes back to no boosting rather than staying broken. If ever
+        # revisited, it needs to be tested against this actual Agora
+        # pipeline live, not just the raw vendor API in isolation. Not
+        # calling _fetch_keyterms at all here (rather than calling it and
+        # discarding the result) so this doesn't cost a wasted round trip
+        # to our own backend on every call start.
         stt = DeepgramSTT(
             model="nova-3",
             language="en-IN",
-            keyterm=keyterm,
         )
         tts = MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_captivating_female1")
 
