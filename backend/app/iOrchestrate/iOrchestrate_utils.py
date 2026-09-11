@@ -159,6 +159,39 @@ async def notify_jira_approval_needed(db, incident, call) -> bool:
     return ok
 
 
+async def approve_incident_with_delegate_notes(db, incident_id: int, notes: str, approved_by: str) -> bool:
+    """
+    Shared by the Slack delegate-notes modal (iOrchestrate_api's
+    view_submission handler) and the voice-note web page's confirm step
+    (iCall_api's delegate-approve endpoint) -- typing into Slack and
+    speaking into a browser both end up here, so there's exactly one
+    place that decides what "approve with delegate notes" actually does.
+
+    A blank/whitespace-only notes string is treated as a cancel, not an
+    approval with empty notes -- lets a caller "submit" without notes
+    (e.g. closing the Slack modal after already using the voice link, or
+    a stray empty POST) safely no-op rather than silently approving.
+    Returns False for both "already decided" and "empty notes" -- callers
+    that need to tell those apart should check incident.status themselves
+    first, same as the existing button-click handlers already do.
+    """
+    from app.iNcidents.iNcidents_crudl import get_incident, record_approval_decision
+    from app.iNcidents.iNcidents_utils import STATUS_AWAITING_APPROVAL
+
+    if not notes or not notes.strip():
+        return False
+
+    incident = await get_incident(db, incident_id)
+    if not incident or incident.status != STATUS_AWAITING_APPROVAL:
+        return False
+
+    incident.delegate_notes = notes.strip()
+    await db.commit()
+    incident = await record_approval_decision(db, incident, "approve", approved_by=approved_by)
+    await notify_incident_approved(db, incident)
+    return True
+
+
 async def notify_delegate_review_needed(db, incident, call) -> bool:
     """
     Replaces notify_jira_approval_needed for a delegated incident (see
@@ -242,6 +275,14 @@ async def open_slack_delegate_modal(trigger_id: str, incident_id: int) -> bool:
         print("[iOrchestrate] SLACK_BOT_TOKEN not set, cannot open delegate modal")
         return False
 
+    # voice_agent_web_base_url is already tunneled/public in --tunnels mode
+    # (it's the same base the call join_url uses) -- demo/dashboard.html's
+    # own directory is explicitly local-only even then, so the voice-note
+    # page lives under voice-agent/web/public/ instead, a plain static
+    # file Next.js serves with no build step, reached through the same
+    # public URL a remote team lead can actually open.
+    voice_note_url = f"{settings.voice_agent_web_base_url.rstrip('/')}/delegate-voice.html?incident={incident_id}"
+
     view = {
         "type": "modal",
         "callback_id": "delegate_notes_modal",
@@ -263,6 +304,7 @@ async def open_slack_delegate_modal(trigger_id: str, incident_id: int) -> bool:
             {
                 "type": "input",
                 "block_id": "delegate_notes_block",
+                "optional": True,
                 "label": {"type": "plain_text", "text": "Your update"},
                 "element": {
                     "type": "plain_text_input",
@@ -273,6 +315,15 @@ async def open_slack_delegate_modal(trigger_id: str, incident_id: int) -> bool:
                         "text": "e.g. I've already rolled back the deploy and confirmed error rates are dropping. "
                         "Ask the team to confirm the CDN cache is clear and check for any other affected services.",
                     },
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"Prefer to speak instead of type? <{voice_note_url}|Record your update here> — "
+                    "it approves the incident for you once you confirm, so you can just close this form "
+                    "without submitting after you're done there.",
                 },
             },
         ],

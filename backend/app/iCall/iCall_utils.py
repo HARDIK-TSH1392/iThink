@@ -2002,6 +2002,61 @@ async def parse_delegate_reply(current_draft: str, user_reply: str) -> DelegateR
     return result
 
 
+TRANSCRIBE_VOICE_NOTE_SYSTEM_INSTRUCTION = """Transcribe the spoken audio
+into clean, readable text -- this becomes a team lead's written update on
+an incident (what they've done, what to cover), read by both a person and
+an LLM afterward. Light cleanup only: fix obvious stutters/false starts
+and add punctuation, but never add, remove, or reinterpret content -- this
+is a transcript, not a summary. If the audio contains no discernible
+speech (silence, noise, non-speech sound), respond with exactly
+NO_SPEECH_DETECTED and nothing else.
+"""
+
+
+async def transcribe_delegate_voice_note(audio_bytes: bytes, mime_type: str) -> Optional[str]:
+    """
+    Voice alternative to typing delegate notes into the Slack modal (see
+    the web recorder page linked from open_slack_delegate_modal). Returns
+    None on failure OR when Gemini reports no speech was found -- callers
+    must show the human an error either way, never silently proceed with
+    empty/garbage notes the way a malformed edit reply is guarded against
+    above.
+    """
+    if not audio_bytes or not get_settings().gemini_api_key:
+        return None
+
+    client = _get_client()
+    content = types.Content(
+        role="user",
+        parts=[
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+            types.Part.from_text(text="Transcribe this recording per the system instruction."),
+        ],
+    )
+    config = types.GenerateContentConfig(system_instruction=TRANSCRIBE_VOICE_NOTE_SYSTEM_INSTRUCTION)
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(client.models.generate_content, model=PRIMARY_MODEL, contents=[content], config=config),
+            timeout=GEMINI_CALL_TIMEOUT_S,
+        )
+    except Exception as exc:
+        print(f"[iCall] Voice-note transcription primary call failed/timed out, trying fallback: {exc}")
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(client.models.generate_content, model=FALLBACK_MODEL, contents=[content], config=config),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc2:
+            print(f"[iCall] Voice-note transcription failed on both attempts: {exc2}")
+            return None
+
+    text = (response.text or "").strip()
+    if not text or text == "NO_SPEECH_DETECTED":
+        return None
+    return text
+
+
 # -----------------------------------------------------------------------------
 # Agora platform webhooks (Console -> Project -> notification config).
 # Event type numbers per Agora's Conversational AI event-notifications docs.

@@ -24,16 +24,10 @@ from .iOrchestrate_utils import (
     post_jira_ticket_created_notification,
     open_slack_delegate_modal,
     reply_to_delegate_dm,
+    approve_incident_with_delegate_notes,
 )
 
 router = APIRouter(prefix="/iorchestrate", tags=["iOrchestrate"])
-
-
-async def _set_delegate_notes(db, incident_id: int, notes: str) -> None:
-    incident = await get_incident(db, incident_id)
-    if incident:
-        incident.delegate_notes = notes
-        await db.commit()
 
 
 async def _handle_incident_decision(db, action_id: str, incident_id: int, user_name: str, response_url: str):
@@ -93,18 +87,18 @@ async def _handle_approve_delegate(db, incident_id: int, trigger_id: str, respon
 
 
 async def _handle_delegate_modal_submission(db, payload: dict) -> None:
+    """
+    Submitting with the text field left blank -- e.g. they used the voice
+    link instead and are just closing this form -- safely no-ops via
+    approve_incident_with_delegate_notes's own blank-notes guard, rather
+    than approving with empty notes.
+    """
     incident_id = int(payload["view"]["private_metadata"])
     values = payload["view"]["state"]["values"]
-    notes = values["delegate_notes_block"]["delegate_notes_input"]["value"] or ""
+    notes = values["delegate_notes_block"]["delegate_notes_input"].get("value") or ""
     user_name = payload.get("user", {}).get("username") or payload.get("user", {}).get("name", "unknown")
 
-    incident = await get_incident(db, incident_id)
-    if not incident or incident.status != STATUS_AWAITING_APPROVAL:
-        return
-
-    await _set_delegate_notes(db, incident_id, notes)
-    incident = await record_approval_decision(db, incident, "approve", approved_by=user_name)
-    await notify_incident_approved(db, incident)
+    await approve_incident_with_delegate_notes(db, incident_id, notes, user_name)
 
 
 async def _handle_jira_decision(db, action_id: str, call_id: int, user_name: str, response_url: str):

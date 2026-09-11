@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,6 +65,7 @@ from .iCall_utils import (
     build_correction_callout,
     redact_sensitive_reply,
     build_keyterms,
+    transcribe_delegate_voice_note,
     CALL_STATUS_COMPLETED,
     EVENT_AGENT_LEFT,
     CLOSING_LINE,
@@ -73,11 +74,13 @@ from .iCall_utils import (
     MALFORMED_RESPONSE_FALLBACK,
 )
 from app.iNcidents.iNcidents_crudl import get_incident
+from app.iNcidents.iNcidents_utils import STATUS_AWAITING_APPROVAL
 from app.iLogs.iLogs_crudl import list_logs
 from app.iOrchestrate.iOrchestrate_utils import (
     post_call_summary_notification,
     notify_jira_approval_needed,
     notify_delegate_review_needed,
+    approve_incident_with_delegate_notes,
 )
 
 router = APIRouter(prefix="/icall", tags=["iCall"])
@@ -327,6 +330,68 @@ async def get_delegate_endpoint(
         "data": {"delegate_notes": notes, "approver_name": approver_name},
         "msg": "success",
     }
+
+
+@router.post("/incidents/{incident_id}/delegate-voice-note")
+async def transcribe_delegate_voice_note_endpoint(
+    incident_id: int,
+    audio: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Voice alternative to typing delegate notes into the Slack modal (see
+    demo/delegate-voice.html, linked from open_slack_delegate_modal).
+    Transcribe-only -- no side effects, never touches approval state.
+    The page shows the transcript back for review/edit before the human
+    explicitly confirms via POST .../delegate-approve below, same "see it
+    before it's final" discipline as the Slack modal's own text field.
+    """
+    incident = await get_incident(db, incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+    if incident.status != STATUS_AWAITING_APPROVAL:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Incident {incident_id} is no longer awaiting approval (status: {incident.status})",
+        )
+
+    audio_bytes = await audio.read()
+    transcript = await transcribe_delegate_voice_note(audio_bytes, audio.content_type or "audio/webm")
+    if not transcript:
+        raise HTTPException(
+            status_code=422,
+            detail="Couldn't make out any speech in that recording -- try again, speaking clearly.",
+        )
+    return {"code": 0, "data": {"transcript": transcript}, "msg": "success"}
+
+
+@router.post("/incidents/{incident_id}/delegate-approve")
+async def delegate_approve_endpoint(
+    incident_id: int,
+    notes: str = Form(...),
+    approved_by: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Confirms delegate notes (typed, spoken-then-transcribed, or edited
+    after either) and approves the incident in one step -- the same
+    shared action the Slack modal's Submit button triggers (see
+    iOrchestrate_utils.approve_incident_with_delegate_notes), just reached
+    from a plain web form instead of Slack. Blank notes safely no-op
+    rather than approving with nothing -- see that function's own guard.
+    """
+    ok = await approve_incident_with_delegate_notes(db, incident_id, notes, approved_by)
+    if not ok:
+        incident = await get_incident(db, incident_id)
+        if not incident:
+            raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+        if incident.status != STATUS_AWAITING_APPROVAL:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Incident {incident_id} is no longer awaiting approval (status: {incident.status})",
+            )
+        raise HTTPException(status_code=422, detail="Notes can't be empty")
+    return {"code": 0, "msg": "success"}
 
 
 @router.get("/{call_id}/utterances", response_model=List[CallUtteranceRead])

@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watcher — Speak your update</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 560px; margin: 40px auto; padding: 0 20px; color: #1a1a2e; background: #fafafa; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  p.sub { color: #666; font-size: 14px; margin-top: 0; }
+  .card { background: white; border: 1px solid #ddd; border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+  button { background: #2b5cff; color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; font-size: 15px; }
+  button.secondary { background: #eee; color: #333; }
+  button.danger { background: #d64545; }
+  button:disabled { background: #ccc; cursor: not-allowed; }
+  button.record { display: flex; align-items: center; gap: 10px; margin: 0 auto; padding: 16px 28px; font-size: 16px; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: #fff; }
+  .recording .dot { animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .center { text-align: center; }
+  .timer { font-variant-numeric: tabular-nums; font-size: 14px; color: #666; margin-top: 10px; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 140px; font-family: inherit; font-size: 14px; padding: 10px; border: 1px solid #ccc; border-radius: 6px; resize: vertical; }
+  input[type=text] { width: 100%; box-sizing: border-box; font-family: inherit; font-size: 14px; padding: 10px; border: 1px solid #ccc; border-radius: 6px; margin-top: 6px; }
+  label { font-size: 13px; font-weight: 600; color: #333; display: block; margin-bottom: 4px; }
+  .field { margin-bottom: 14px; }
+  .error { background: #f8d7da; color: #721c24; border-radius: 6px; padding: 10px 14px; font-size: 14px; margin-bottom: 14px; }
+  .success { background: #d4edda; color: #155724; border-radius: 8px; padding: 20px; text-align: center; }
+  .note { font-size: 12px; color: #888; }
+  .actions { display: flex; gap: 10px; margin-top: 14px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<h1>🎙️ Speak your update</h1>
+<p class="sub">Watcher will join the call in your place and open with this. Record, review, then confirm.</p>
+
+<div id="error-box" class="error" hidden></div>
+
+<div id="record-card" class="card center">
+  <p class="note" style="margin-top:0">What have you done so far, and what should Watcher cover or ask about?</p>
+  <button id="record-btn" class="record">
+    <span class="dot"></span>
+    <span id="record-label">Start recording</span>
+  </button>
+  <div id="timer" class="timer" hidden>0:00</div>
+</div>
+
+<div id="review-card" class="card" hidden>
+  <div class="field">
+    <label for="transcript">Your update (edit if anything's off)</label>
+    <textarea id="transcript"></textarea>
+  </div>
+  <div class="field">
+    <label for="approver-name">Your name</label>
+    <input type="text" id="approver-name" placeholder="e.g. Priya Sharma">
+  </div>
+  <div class="actions">
+    <button id="confirm-btn">Confirm &amp; approve</button>
+    <button id="rerecord-btn" class="secondary">Record again</button>
+  </div>
+</div>
+
+<div id="success-card" class="success" hidden>
+  <h2 style="margin-top:0">✅ You're all set</h2>
+  <p>The incident is approved and Watcher has your update. You can close this page.</p>
+</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const incidentId = params.get("incident");
+// Matches demo/dashboard.html's own convention: edit this constant if the
+// backend isn't running locally, or override per-link with ?api=<url>
+// (useful since a tunnel URL changes every restart).
+let API_BASE = params.get("api") || "http://127.0.0.1:8123/api/v1";
+
+const errorBox = document.getElementById("error-box");
+const recordCard = document.getElementById("record-card");
+const reviewCard = document.getElementById("review-card");
+const successCard = document.getElementById("success-card");
+const recordBtn = document.getElementById("record-btn");
+const recordLabel = document.getElementById("record-label");
+const timerEl = document.getElementById("timer");
+const transcriptEl = document.getElementById("transcript");
+const approverNameEl = document.getElementById("approver-name");
+const confirmBtn = document.getElementById("confirm-btn");
+const rerecordBtn = document.getElementById("rerecord-btn");
+
+function showError(msg) {
+  errorBox.textContent = msg;
+  errorBox.hidden = false;
+}
+function clearError() {
+  errorBox.hidden = true;
+}
+
+if (!incidentId) {
+  showError("Missing incident id in the link — ask whoever sent this to resend it.");
+  recordBtn.disabled = true;
+}
+
+let mediaRecorder = null;
+let chunks = [];
+let timerInterval = null;
+let startedAt = null;
+let recording = false;
+
+async function startRecording() {
+  clearError();
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    showError("This browser doesn't support in-browser recording — try a recent Chrome, Safari, or Edge.");
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    chunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop());
+      handleRecordingStopped();
+    };
+    mediaRecorder.start();
+    recording = true;
+    startedAt = Date.now();
+    recordBtn.classList.add("recording");
+    recordLabel.textContent = "Stop recording";
+    timerEl.hidden = false;
+    timerInterval = setInterval(() => {
+      const secs = Math.floor((Date.now() - startedAt) / 1000);
+      timerEl.textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+    }, 250);
+  } catch (err) {
+    showError("Couldn't access your microphone — check the browser's permission prompt and try again.");
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && recording) {
+    mediaRecorder.stop();
+    recording = false;
+    recordBtn.classList.remove("recording");
+    clearInterval(timerInterval);
+  }
+}
+
+recordBtn.addEventListener("click", () => {
+  if (recording) stopRecording();
+  else startRecording();
+});
+
+async function handleRecordingStopped() {
+  recordLabel.textContent = "Transcribing…";
+  recordBtn.disabled = true;
+  const mimeType = mediaRecorder.mimeType || "audio/webm";
+  const blob = new Blob(chunks, { type: mimeType });
+
+  const form = new FormData();
+  form.append("audio", blob, "delegate-note." + (mimeType.includes("mp4") ? "m4a" : "webm"));
+
+  try {
+    const res = await fetch(`${API_BASE}/icall/incidents/${incidentId}/delegate-voice-note`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || `Transcription failed (${res.status})`);
+    }
+    transcriptEl.value = data.data.transcript;
+    recordCard.hidden = true;
+    reviewCard.hidden = false;
+  } catch (err) {
+    showError(err.message || "Something went wrong transcribing that — try recording again.");
+    recordLabel.textContent = "Start recording";
+    recordBtn.disabled = false;
+    timerEl.hidden = true;
+  }
+}
+
+rerecordBtn.addEventListener("click", () => {
+  reviewCard.hidden = true;
+  recordCard.hidden = false;
+  recordLabel.textContent = "Start recording";
+  recordBtn.disabled = false;
+  timerEl.hidden = true;
+  timerEl.textContent = "0:00";
+});
+
+confirmBtn.addEventListener("click", async () => {
+  clearError();
+  const notes = transcriptEl.value.trim();
+  const approvedBy = approverNameEl.value.trim();
+  if (!notes) {
+    showError("The update is empty — record again or type something before confirming.");
+    return;
+  }
+  if (!approvedBy) {
+    showError("Add your name so the approval is attributed to you.");
+    return;
+  }
+  confirmBtn.disabled = true;
+  confirmBtn.textContent = "Confirming…";
+
+  const form = new FormData();
+  form.append("notes", notes);
+  form.append("approved_by", approvedBy);
+
+  try {
+    const res = await fetch(`${API_BASE}/icall/incidents/${incidentId}/delegate-approve`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || `Approval failed (${res.status})`);
+    }
+    reviewCard.hidden = true;
+    successCard.hidden = false;
+  } catch (err) {
+    showError(err.message || "Something went wrong approving — try again.");
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = "Confirm & approve";
+  }
+});
+</script>
+
+</body>
+</html>
