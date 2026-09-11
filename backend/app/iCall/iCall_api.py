@@ -391,6 +391,7 @@ async def _decide_spoken_reply(
     old_facts: List[str],
     latest_user_message: Optional[str],
     health_score: int,
+    force_speak: bool = False,
 ) -> str:
     """
     Given a StructuringUpdate already merged into call.structured_state,
@@ -453,6 +454,21 @@ async def _decide_spoken_reply(
     if update.corrects_fact and update.corrects_fact in old_facts:
         spoken_reply = build_correction_callout(update)
         await record_agent_utterance(db, call.id, spoken_reply, "correction")
+        return spoken_reply
+
+    # A tool-result turn is always the answer to something the model itself
+    # just chose to go look up -- confirmed live that the generic gate's
+    # direct-address cooldown (meant to stop the SAME utterance getting
+    # answered twice by fragmented STT turns) also silently ate the actual
+    # answer here: the ack ("Pulling up the logs...") starts the cooldown,
+    # and the tool round-trip routinely finishes inside that window, so the
+    # real report-back got gated as if it were a duplicate of the ack. Same
+    # "bypass the generic gate with a dedicated deterministic path" pattern
+    # as is_wrapping_up/corrects_fact above -- this just always speaks
+    # whatever the model actually has to report, when it has anything to say.
+    if force_speak and update.spoken_reply:
+        spoken_reply = update.spoken_reply
+        await record_agent_utterance(db, call.id, spoken_reply, "tool_result")
         return spoken_reply
 
     if should_speak_aloud(update, latest_user_message, call.structured_state):
@@ -610,7 +626,9 @@ async def _process_tool_result_turn(
         "channel=%s tool-result turn latest_user_message=%r",
         channel_name, latest_user_message,
     )
-    spoken_reply = await _decide_spoken_reply(db, call, update, old_facts, latest_user_message, health_score)
+    spoken_reply = await _decide_spoken_reply(
+        db, call, update, old_facts, latest_user_message, health_score, force_speak=True,
+    )
     return spoken_reply, None
 
 
