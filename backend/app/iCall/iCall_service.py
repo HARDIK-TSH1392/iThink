@@ -16,6 +16,7 @@ from .iCall_utils import (
     classify_participant_roles,
     assign_action_item_owners,
     summarize_unresolved_risks,
+    action_item_key,
     CALL_STATUS_SCHEDULED,
     HEALTH_SCORE_HISTORY_MAX_LEN,
 )
@@ -171,6 +172,14 @@ async def apply_structuring_update(
         "identified_speakers": list(old.get("identified_speakers", [])),
         "timeline": list(old.get("timeline", [])),
         "chat_notes": list(old.get("chat_notes", [])),
+        # Tracks facts that are themselves the PRODUCT of an earlier
+        # correction -- not a fixed ID system (facts are plain strings with
+        # no stable identity across a correction), just enough of a chain to
+        # recognize "the thing being corrected right now was already a
+        # correction once" as distinct from an ordinary first-time
+        # contradiction. See the corrects_fact handling below for how this
+        # gets read and extended.
+        "previously_corrected_facts": list(old.get("previously_corrected_facts", [])),
         # This function only ever runs for a real turn (the silence-trigger
         # branch skips it entirely -- see iCall_api._process_turn), so
         # reaching here means the room actually said something. Resets the
@@ -194,8 +203,22 @@ async def apply_structuring_update(
     # superseded fact too, since it's the actual historical record.
     if update.corrects_fact and update.corrects_fact in state["facts"]:
         state["facts"].remove(update.corrects_fact)
+        # Escalation: is the fact being corrected RIGHT NOW itself the
+        # result of an earlier correction? That's settled ground coming
+        # loose a second time, not an ordinary first contradiction -- more
+        # alarming, and worth a bigger, immediate health-score hit rather
+        # than waiting to be noticed the normal way (see
+        # compute_coordination_health_score's second_contradiction_count
+        # penalty). An ordinary first-time correction still records
+        # normally, just without the escalation marker.
+        is_second_contradiction = update.corrects_fact in state["previously_corrected_facts"]
+        state["second_contradiction_count"] = old.get("second_contradiction_count", 0) + (
+            1 if is_second_contradiction else 0
+        )
+        if update.facts:
+            state["previously_corrected_facts"].append(update.facts[0])
         _add_timeline_entry(
-            "correction",
+            "second_correction" if is_second_contradiction else "correction",
             f'Correction: "{update.corrects_fact}" is superseded by updated information.',
         )
 
@@ -211,9 +234,43 @@ async def apply_structuring_update(
     for decision in update.decisions:
         _add_timeline_entry("decision", decision)
 
-    state["action_items"].extend(item.model_dump() for item in update.action_items)
+    # Dedup by normalized text (see iCall_utils.action_item_key) before
+    # appending -- without this, an STT-fragmented instruction that gets
+    # re-extracted across several turns (the room circling back to
+    # confirm an owner, say) produced a separate action_items entry each
+    # time. Confirmed live (incident-46): "check the port config" ended up
+    # recorded three times, once unowned then twice with the same owner.
+    # A genuinely new item (new text) still appends normally; a repeat of
+    # existing text merges into it instead -- filling in the owner if this
+    # turn is the one that supplies it, otherwise a pure no-op. Matching
+    # should_speak_aloud/describe_speak_reason/build_gated_spoken_reply use
+    # the same normalization to decide whether to announce the assignment,
+    # so the timeline and the spoken confirmation never disagree about
+    # what's actually new.
     for item in update.action_items:
-        _add_timeline_entry("action_item", item.text)
+        key = action_item_key(item.text)
+        existing_index = next(
+            (i for i, ai in enumerate(state["action_items"]) if action_item_key(ai.get("text", "")) == key),
+            None,
+        )
+        if existing_index is None:
+            state["action_items"].append(item.model_dump())
+            _add_timeline_entry("action_item", item.text)
+        elif item.owner and not state["action_items"][existing_index].get("owner"):
+            # Replace with a NEW dict rather than mutating the existing one
+            # in place -- state["action_items"] is a shallow copy of
+            # old["action_items"], so the entries themselves are still the
+            # SAME dict objects as in call.structured_state (the value
+            # SQLAlchemy already tracks). Mutating one in place would mutate
+            # that old value too, defeating the old != new change-detection
+            # this function's own top-of-function docstring already warns
+            # about -- caught by the dedup regression test doing exactly
+            # this (backend/eval/test_action_item_dedup.py), not by
+            # inspection.
+            state["action_items"][existing_index] = {
+                **state["action_items"][existing_index],
+                "owner": item.owner,
+            }
 
     state["missing_info"].extend(update.missing_info)
     for gap in update.missing_info:

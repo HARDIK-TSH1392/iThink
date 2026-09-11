@@ -14,6 +14,7 @@ from .iCall_schema import (
     ChatMessage,
     StructuringUpdate,
     CallRoleClassification,
+    ActionItem,
     ActionItemOwnerAssignments,
     UnresolvedRisksSummary,
     ReviewedTicketContent,
@@ -93,8 +94,27 @@ FALLBACK_MODEL = "gemini-3.5-flash"
 # 25s was cutting that too close.
 GEMINI_CALL_TIMEOUT_S = 30
 
-_gemini_semaphore = asyncio.Semaphore(4)
+# A hardcoded Semaphore(4) global concurrency cap used to live here --
+# removed after confirming live (direct test: 12 concurrent Gemini calls,
+# 3x the old limit) that the real API handles it fine with no rate-limit
+# errors and no latency degradation. It was never based on a measured rate
+# limit or a real observed failure; it just quietly capped real capacity
+# with no evidence it was ever needed.
 
+# Hedged requests (fire a duplicate after ~1.6s -- just above our measured
+# p90 -- and take whichever finishes first) were tried here and reverted.
+# The reasoning going in was sound (our slowest observed turn happened on
+# the SMALLEST-context turn of a call, pointing at infra noise rather than
+# input size, which is the textbook condition hedging is documented to
+# help with) -- but measured live, the wrapper itself added ~180ms of
+# overhead to essentially every call, not just the slow tail, making mean
+# latency worse (1.41s direct vs 1.59s hedged, same prompt). Not debugged
+# further under time pressure rather than shipped on the strength of the
+# theory alone. If this is revisited, the actual overhead source (task
+# creation/shielding cost vs. something else) needs isolating first, and
+# it needs to be re-measured against this same benchmark before trusting
+# it again -- the theory being right last time is exactly why the
+# implementation still has to be checked, not assumed correct.
 _client: "genai.Client | None" = None
 
 
@@ -426,6 +446,28 @@ Hard constraints:
   at it"), set that item's owner to that name. Leave owner null when no
   specific person was named — don't guess an owner from role, context, or
   who seems most likely responsible.
+  This includes an IMPLICIT reference back to something asked earlier in
+  the call, not just a task stated fresh in this same turn. Concretely:
+  if an earlier turn asked "does anyone know which port is affected?" and
+  this turn says "Ted covers it", record an action item for that earlier
+  question ("find out which port is affected") with owner "Ted" -- do not
+  require the task itself to be restated in full for the owner to count.
+  Look at the state given below for what open question or gap "it" is
+  most plausibly referring to before deciding there's nothing to record.
+- root-cause fishing vs. hypothesis vs. resolution: someone directly
+  asking what caused the incident ("what actually caused this", "do we
+  know the root cause yet") is is_root_cause_question -- this is a
+  question being asked OF the room, not a guess being floated (that's a
+  hypothesis) and not the room settling something (that's
+  is_resolution_declared, see below). Never let is_root_cause_question
+  being true tempt spoken_reply into actually answering with a cause;
+  the hard constraint against asserting root cause applies here exactly
+  as everywhere else in this prompt.
+- is_resolution_declared: true when this turn explicitly settles an open
+  hypothesis or conflict as resolved or ruled out ("consider it ruled
+  out, we got confirmation", "that's confirmed fixed now", "we can rule
+  out the database"). This can fire mid-call, well before the incident
+  or the call itself is over -- it is unrelated to is_wrapping_up.
 - identified_speakers: only include a name/role if someone actually
   introduced themselves in this turn (e.g. "this is Priya, on-call SRE").
   Do not guess who is speaking from tone or content alone.
@@ -806,36 +848,35 @@ async def generate_structuring_update(
         tools=[gemini_tool] if gemini_tool else None,
     )
 
-    async with _gemini_semaphore:
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.models.generate_content,
+                model=PRIMARY_MODEL,
+                contents=prompt,
+                config=config,
+            ),
+            timeout=GEMINI_CALL_TIMEOUT_S,
+        )
+    except Exception as exc:
+        print(f"[iCall] Structuring primary call failed/timed out, trying fallback: {exc}")
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     client.models.generate_content,
-                    model=PRIMARY_MODEL,
+                    model=FALLBACK_MODEL,
                     contents=prompt,
                     config=config,
                 ),
                 timeout=GEMINI_CALL_TIMEOUT_S,
             )
-        except Exception as exc:
-            print(f"[iCall] Structuring primary call failed/timed out, trying fallback: {exc}")
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.models.generate_content,
-                        model=FALLBACK_MODEL,
-                        contents=prompt,
-                        config=config,
-                    ),
-                    timeout=GEMINI_CALL_TIMEOUT_S,
-                )
-            except Exception as exc2:
-                # This is the live per-turn call -- a hang here previously
-                # had no ceiling at all and would have frozen the actual
-                # conversation (Agora's Custom LLM hook has nothing to send
-                # back to the room until this returns).
-                print(f"[iCall] Structuring failed on both attempts, falling back: {exc2}")
-                return StructuringResult(_fallback_structuring_update(MODEL_UNAVAILABLE_REPLY), None, None)
+        except Exception as exc2:
+            # This is the live per-turn call -- a hang here previously
+            # had no ceiling at all and would have frozen the actual
+            # conversation (Agora's Custom LLM hook has nothing to send
+            # back to the room until this returns).
+            print(f"[iCall] Structuring failed on both attempts, falling back: {exc2}")
+            return StructuringResult(_fallback_structuring_update(MODEL_UNAVAILABLE_REPLY), None, None)
 
     parts = response.candidates[0].content.parts if response.candidates else []
     function_call = next((p.function_call for p in parts if p.function_call), None)
@@ -923,6 +964,39 @@ def _direct_address_off_cooldown(structured_state: dict) -> bool:
     return elapsed >= DIRECT_ADDRESS_REPLY_COOLDOWN_S
 
 
+def action_item_key(text: str) -> str:
+    """Normalized identity for matching the same action item re-extracted
+    across STT-fragmented turns -- lowercased, whitespace-collapsed exact
+    match, deliberately not fuzzy. Confirmed live (incident-46): the real
+    duplicates ("check the port config" extracted three separate times as
+    the room circled back to confirm an owner) were byte-identical after
+    this normalization, so exact match already covers the observed
+    failure without the tuning risk of a similarity threshold nobody has
+    measured against real transcripts."""
+    return " ".join(text.lower().split())
+
+
+def _is_new_owner_assignment(item: ActionItem, structured_state: dict) -> bool:
+    """
+    True only if this item's owner is information the room hasn't already
+    heard confirmed out loud -- i.e. either this action item's text isn't
+    in state yet, or it is but with no owner recorded yet. False when the
+    same (text, owner) pairing is already there, which happens when STT
+    fragments one instruction into several turns and the model
+    re-extracts the same item, with the same owner, on a later turn (see
+    apply_structuring_update's action_items dedup, same normalization).
+    Without this check, should_speak_aloud/describe_speak_reason would
+    re-fire "action_item_owner" once per re-extraction instead of once
+    per actual assignment -- confirmed live (incident-46): "Got it, Ted's
+    on that." spoken four times for what was one real assignment.
+    """
+    key = action_item_key(item.text)
+    for existing in structured_state.get("action_items", []) or []:
+        if action_item_key(existing.get("text", "")) == key:
+            return not existing.get("owner")
+    return True
+
+
 def should_speak_aloud(
     update: StructuringUpdate, latest_user_message: Optional[str], structured_state: dict
 ) -> bool:
@@ -946,7 +1020,7 @@ def should_speak_aloud(
         return True
     if _has_speakable_missing_info(update.missing_info, structured_state):
         return True
-    if any(item.owner for item in update.action_items):
+    if any(item.owner and _is_new_owner_assignment(item, structured_state) for item in update.action_items):
         return True
     if (
         latest_user_message
@@ -957,13 +1031,22 @@ def should_speak_aloud(
     return False
 
 
-def build_gated_spoken_reply(update: StructuringUpdate, reason: str) -> str:
+def build_gated_spoken_reply(update: StructuringUpdate, reason: str, structured_state: dict) -> str:
     """
     Deterministic spoken text for the three should_speak_aloud reasons that
     have an already-extracted structured field to build from -- conflict,
     missing_info, action_item_owner. direct_address has no such field (it's
     open-ended conversational content), so that reason still uses
     update.spoken_reply as-is.
+
+    structured_state is only actually used by the action_item_owner branch
+    (to pick the item whose owner is genuinely new, same
+    _is_new_owner_assignment check as should_speak_aloud/
+    describe_speak_reason -- see there for why) -- required anyway, rather
+    than optional, since reason is only ever "action_item_owner" when
+    those two already confirmed a new assignment exists, so a caller that
+    somehow got here without state would be masking a real bug, not
+    hitting a legitimate no-state case.
 
     Confirmed live (incident-101, after the gemini-flash-lite-latest swap):
     update.spoken_reply produced generic acknowledgments ("Got it, noting
@@ -990,7 +1073,10 @@ def build_gated_spoken_reply(update: StructuringUpdate, reason: str) -> str:
         gap = update.missing_info[0] if update.missing_info else ""
         return f"Can you clarify: {gap}?" if gap else ""
     if reason == "action_item_owner":
-        owner_item = next((item for item in update.action_items if item.owner), None)
+        owner_item = next(
+            (item for item in update.action_items if item.owner and _is_new_owner_assignment(item, structured_state)),
+            None,
+        )
         return f"Got it, {owner_item.owner}'s on that." if owner_item else ""
     return update.spoken_reply
 
@@ -1010,7 +1096,7 @@ def describe_speak_reason(
         return "conflict"
     if _has_speakable_missing_info(update.missing_info, structured_state):
         return "missing_info"
-    if any(item.owner for item in update.action_items):
+    if any(item.owner and _is_new_owner_assignment(item, structured_state) for item in update.action_items):
         return "action_item_owner"
     return "direct_address"
 
@@ -1169,6 +1255,11 @@ def compute_coordination_health_score(structured_state: dict) -> int:
     score = 100
     score -= 15 * len(structured_state.get("conflicts", []))
     score -= 10 * len(structured_state.get("missing_info", []))
+    # A fact getting contradicted a SECOND time (settled ground coming loose
+    # again, not an ordinary first contradiction) is weighted heavier than a
+    # routine conflict -- see apply_structuring_update's
+    # previously_corrected_facts chain for how this gets detected.
+    score -= 25 * structured_state.get("second_contradiction_count", 0)
 
     timeline = structured_state.get("timeline", [])
     decision_timestamps = []
@@ -1261,15 +1352,40 @@ def build_health_recap(structured_state: dict) -> str:
     Deterministic, not model-generated -- a status recap triggered by a
     code-computed pattern shouldn't itself depend on another LLM call to
     say something coherent about that same state.
+
+    Names actual conflicts/unowned items rather than only counting them --
+    "2 conflicts still unresolved" with no indication of *what* they are
+    is technically accurate but not actually useful to someone on the
+    call. The content is already sitting in structured_state (extracted
+    by the same turn that recorded it); this just uses more of it. Zero
+    added latency or cost -- no new LLM call, just a richer deterministic
+    template over data already in hand. Facts/hypotheses stay as counts
+    since those lists can grow long over a call; conflicts and unowned
+    items are usually few and are the actionable part of a recap.
     """
     facts_n = len(structured_state.get("facts", []))
     hyp_n = len(structured_state.get("hypotheses", []))
     items_n = len(structured_state.get("action_items", []))
-    conflicts_n = len(structured_state.get("conflicts", []))
-    return (
+    conflicts = structured_state.get("conflicts", [])
+    conflicts_n = len(conflicts)
+
+    summary = (
         f"Quick status check -- {facts_n} facts confirmed, {hyp_n} open "
-        f"theories, {items_n} action items tracked, {conflicts_n} still unresolved."
+        f"theories, {items_n} action items tracked."
     )
+
+    if conflicts:
+        named = "; ".join(conflicts[:2])
+        more = f" and {conflicts_n - 2} more" if conflicts_n > 2 else ""
+        summary += f" Still unresolved: {named}{more}."
+    else:
+        summary += " Nothing unresolved right now."
+
+    unowned = [item["text"] for item in structured_state.get("action_items", []) if not (item.get("owner") or item.get("owner_uid"))]
+    if unowned:
+        summary += f' Still needs an owner: "{unowned[0]}"' + (f" and {len(unowned) - 1} more." if len(unowned) > 1 else ".")
+
+    return summary
 
 
 # -----------------------------------------------------------------------------
@@ -1350,37 +1466,36 @@ async def classify_participant_roles(
         response_schema=CallRoleClassification,
     )
 
-    async with _gemini_semaphore:
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.models.generate_content,
+                model=PRIMARY_MODEL,
+                contents=prompt,
+                config=config,
+            ),
+            timeout=GEMINI_CALL_TIMEOUT_S,
+        )
+    except Exception as exc:
+        print(f"[iCall] Role classification primary call failed/timed out, trying fallback: {exc}")
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     client.models.generate_content,
-                    model=PRIMARY_MODEL,
+                    model=FALLBACK_MODEL,
                     contents=prompt,
                     config=config,
                 ),
                 timeout=GEMINI_CALL_TIMEOUT_S,
             )
-        except Exception as exc:
-            print(f"[iCall] Role classification primary call failed/timed out, trying fallback: {exc}")
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.models.generate_content,
-                        model=FALLBACK_MODEL,
-                        contents=prompt,
-                        config=config,
-                    ),
-                    timeout=GEMINI_CALL_TIMEOUT_S,
-                )
-            except Exception as exc2:
-                # Runs once, at call end, with no retry beyond this -- a
-                # silent failure here means role recognition for this call
-                # is permanently empty with nothing in the logs to explain
-                # why. Caught by a dry run that happened to hit a transient
-                # failure with no visible cause until this was added.
-                print(f"[iCall] Role classification failed on both attempts, leaving roles unresolved: {exc2}")
-                return CallRoleClassification()
+        except Exception as exc2:
+            # Runs once, at call end, with no retry beyond this -- a
+            # silent failure here means role recognition for this call
+            # is permanently empty with nothing in the logs to explain
+            # why. Caught by a dry run that happened to hit a transient
+            # failure with no visible cause until this was added.
+            print(f"[iCall] Role classification failed on both attempts, leaving roles unresolved: {exc2}")
+            return CallRoleClassification()
 
     try:
         return CallRoleClassification.model_validate_json(response.text)
@@ -1453,32 +1568,31 @@ async def assign_action_item_owners(
         response_schema=ActionItemOwnerAssignments,
     )
 
-    async with _gemini_semaphore:
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.models.generate_content,
+                model=PRIMARY_MODEL,
+                contents=prompt,
+                config=config,
+            ),
+            timeout=GEMINI_CALL_TIMEOUT_S,
+        )
+    except Exception as exc:
+        print(f"[iCall] Owner assignment primary call failed/timed out, trying fallback: {exc}")
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     client.models.generate_content,
-                    model=PRIMARY_MODEL,
+                    model=FALLBACK_MODEL,
                     contents=prompt,
                     config=config,
                 ),
                 timeout=GEMINI_CALL_TIMEOUT_S,
             )
-        except Exception as exc:
-            print(f"[iCall] Owner assignment primary call failed/timed out, trying fallback: {exc}")
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.models.generate_content,
-                        model=FALLBACK_MODEL,
-                        contents=prompt,
-                        config=config,
-                    ),
-                    timeout=GEMINI_CALL_TIMEOUT_S,
-                )
-            except Exception as exc2:
-                print(f"[iCall] Owner assignment failed on both attempts, leaving items unassigned: {exc2}")
-                return ActionItemOwnerAssignments()
+        except Exception as exc2:
+            print(f"[iCall] Owner assignment failed on both attempts, leaving items unassigned: {exc2}")
+            return ActionItemOwnerAssignments()
 
     try:
         return ActionItemOwnerAssignments.model_validate_json(response.text)
@@ -1541,32 +1655,31 @@ async def summarize_unresolved_risks(structured_state: dict) -> UnresolvedRisksS
         response_schema=UnresolvedRisksSummary,
     )
 
-    async with _gemini_semaphore:
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.models.generate_content,
+                model=PRIMARY_MODEL,
+                contents=prompt,
+                config=config,
+            ),
+            timeout=GEMINI_CALL_TIMEOUT_S,
+        )
+    except Exception as exc:
+        print(f"[iCall] Unresolved-risks primary call failed/timed out, trying fallback: {exc}")
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     client.models.generate_content,
-                    model=PRIMARY_MODEL,
+                    model=FALLBACK_MODEL,
                     contents=prompt,
                     config=config,
                 ),
                 timeout=GEMINI_CALL_TIMEOUT_S,
             )
-        except Exception as exc:
-            print(f"[iCall] Unresolved-risks primary call failed/timed out, trying fallback: {exc}")
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.models.generate_content,
-                        model=FALLBACK_MODEL,
-                        contents=prompt,
-                        config=config,
-                    ),
-                    timeout=GEMINI_CALL_TIMEOUT_S,
-                )
-            except Exception as exc2:
-                print(f"[iCall] Unresolved-risks summary failed on both attempts, leaving risks empty: {exc2}")
-                return UnresolvedRisksSummary()
+        except Exception as exc2:
+            print(f"[iCall] Unresolved-risks summary failed on both attempts, leaving risks empty: {exc2}")
+            return UnresolvedRisksSummary()
 
     try:
         return UnresolvedRisksSummary.model_validate_json(response.text)
@@ -1664,32 +1777,31 @@ async def review_ticket_content(structured_state: dict) -> ReviewedTicketContent
         response_schema=ReviewedTicketContent,
     )
 
-    async with _gemini_semaphore:
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.models.generate_content,
+                model=PRIMARY_MODEL,
+                contents=prompt,
+                config=config,
+            ),
+            timeout=GEMINI_CALL_TIMEOUT_S,
+        )
+    except Exception as exc:
+        print(f"[iCall] Ticket-content review primary call failed/timed out, trying fallback: {exc}")
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     client.models.generate_content,
-                    model=PRIMARY_MODEL,
+                    model=FALLBACK_MODEL,
                     contents=prompt,
                     config=config,
                 ),
                 timeout=GEMINI_CALL_TIMEOUT_S,
             )
-        except Exception as exc:
-            print(f"[iCall] Ticket-content review primary call failed/timed out, trying fallback: {exc}")
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.models.generate_content,
-                        model=FALLBACK_MODEL,
-                        contents=prompt,
-                        config=config,
-                    ),
-                    timeout=GEMINI_CALL_TIMEOUT_S,
-                )
-            except Exception as exc2:
-                print(f"[iCall] Ticket-content review failed on both attempts, using unedited content: {exc2}")
-                return fallback
+        except Exception as exc2:
+            print(f"[iCall] Ticket-content review failed on both attempts, using unedited content: {exc2}")
+            return fallback
 
     try:
         return ReviewedTicketContent.model_validate_json(response.text)

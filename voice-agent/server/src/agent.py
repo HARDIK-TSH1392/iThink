@@ -91,8 +91,18 @@ class Agent:
         if not self.app_id or not self.app_certificate:
             raise ValueError("AGORA_APP_ID and AGORA_APP_CERTIFICATE are required")
 
+        # Area picks the regional domain pool for Agora's own REST control
+        # plane (agent join/start/stop) -- separate from which STT/TTS/LLM
+        # vendors are reachable (confirmed against the installed SDK's
+        # region.py: AP and US both resolve to the same "global" vendor
+        # list, only CN is special-cased). This hackathon runs in India;
+        # AP routes our join/start/stop calls to Agora's Asia-Pacific
+        # domains instead of US ones. Does not touch the backend's own
+        # Gemini round trip (that's a separate, unrelated hop) -- this is
+        # specifically the "how fast does the agent join" latency, not
+        # per-turn Thinking Engine latency.
         self.client = AsyncAgora(
-            area=Area.US,
+            area=Area.AP,
             app_id=self.app_id,
             app_certificate=self.app_certificate,
         )
@@ -207,8 +217,7 @@ class Agent:
         # en-IN is a real, separately-documented Deepgram nova-3 language
         # code (confirmed against Deepgram's own docs, not just "en" with
         # an accent guess) -- tunes the acoustic model for Indian-accented
-        # English instead of defaulting toward US English. Per-call keyterm
-        # fetch already boosts the agent's own name via build_keyterms.
+        # English instead of defaulting toward US English.
         #
         # keyterm/smart_format/punctuation were reverted earlier this
         # session after incident-33/34/35 each produced real, non-silence
@@ -219,15 +228,30 @@ class Agent:
         # correct -- but it just reproduced live again (incident-43,
         # 2026-09-06: 8 real, non-silence turns, latest_user_message=''
         # every single time, confirmed via direct log inspection, not a
-        # guess). Reverting keyterm/smart_format/punctuation again, keeping
-        # en-IN (never implicated in either occurrence -- both times the
-        # empty-transcript symptom tracked keyterm/smart_format/
-        # punctuation being on, not the locale). If this combination is
-        # ever revisited, re-test it in isolation (one flag at a time)
-        # rather than reinstating all three together again.
+        # guess). Reverted again at that point, keeping only en-IN (never
+        # implicated in either occurrence), with an explicit note to
+        # re-test each flag in isolation rather than reinstate all three
+        # together again.
+        #
+        # keyterm, alone, is that isolated re-test. _fetch_keyterms was
+        # already written to call build_keyterms (which always includes
+        # AGENT_NAME -- see iCall_utils.BASE_KEYTERMS) but was never
+        # actually wired to the STT config below, so "Watcher" has had
+        # zero acoustic boosting this whole time -- confirmed live
+        # (incident-46, 2026-09-09): asked for repeatedly, transcribed as
+        # "Voucher"/"Voiture"/spelled-out/"Vachir", direct_address never
+        # fired once. Confirmed by direct A/B test against the real
+        # Deepgram API on our own real BASE_KEYTERMS list, same audio: a
+        # real jargon word ("auth-api") that nova-3 mistranscribed as "off
+        # API" unboosted came back correctly as "auth API" boosted --
+        # keyterm alone does the same "off"->"auth" correction. smart_format
+        # and punctuation stay off -- they were never re-tested in
+        # isolation and aren't needed for either fix.
+        keyterm = await _fetch_keyterms(ithink_base, channel_name)
         stt = DeepgramSTT(
             model="nova-3",
             language="en-IN",
+            keyterm=keyterm,
         )
         tts = MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_captivating_female1")
 
@@ -255,7 +279,18 @@ class Agent:
         # )
 
         parameters = {
-            "audio_scenario": "chorus",  # web client → ultra-low-latency chorus profile
+            # "chorus" ("real-time chorus scenario... requires ultra-low
+            # latency" per Agora's own SDK docstring) was chosen for raw
+            # speed, but Agora's audio best-practices doc names this exact
+            # scenario as the documented cause of needing to speak loudly
+            # for the agent to pick up speech, with "aiserver" -- "optimized
+            # for interactions between the user and the conversational AI
+            # agent in terms of latency and network resilience" -- as the
+            # fix. Confirmed live (incident-46, 2026-09-09): had to speak
+            # unusually loudly for turns to register at all. Not yet
+            # re-tested live after this change; if aiserver doesn't resolve
+            # it, the next lever is speech_threshold below, not this one.
+            "audio_scenario": "aiserver",
             "data_channel": "rtm",
             "enable_error_message": True,
             "enable_metrics": True,
@@ -290,6 +325,19 @@ class Agent:
             failure_message="Please wait a moment.",
             max_history=50,
             turn_detection={
+                # Separate from the STT's own `language` above -- this is
+                # what Agora's own turn-detection/semantic-completeness
+                # layer uses to judge whether a sentence is actually done
+                # (see end_of_speech.mode="semantic" below), and it was
+                # never set here, silently defaulting to "en-US" (see
+                # agora_agent.agentkit.agent.DEFAULT_TURN_DETECTION_LANGUAGE
+                # in the installed SDK) while every other locale-aware
+                # setting in this file is en-IN. "en-IN" is a real,
+                # validated value for this field too (agentkit/agent.py's
+                # own TURN_DETECTION_LANGUAGE_VALUES whitelist). Not yet
+                # re-tested live -- the mismatch is confirmed from the SDK
+                # source, not the resulting behavior.
+                "language": "en-IN",
                 "config": {
                     # 0.5 is the SDK's own mid-range default. Flagged early
                     # this session as an open question (does a quieter

@@ -181,6 +181,22 @@ class StructuringUpdate(BaseModel):
     # iLogs directly (deterministic DB query, not LLM-guessed data) and
     # broadcasting a shared screen -- this field is only the intent signal.
     wants_log_screen: bool = False
+    # True when someone is asking what caused the incident (e.g. "what
+    # actually caused this", "do we know the root cause yet") -- distinct
+    # from a hypothesis (someone floating a guess) and from wants_log_screen
+    # (asking to see raw log data). This is purely a detection signal for
+    # should_speak_aloud/describe_speak_reason to react to -- it does NOT
+    # give iCall license to answer with a root cause itself; the hard
+    # constraint above (never assert or imply a root cause) still applies
+    # in full to whatever spoken_reply says in response.
+    is_root_cause_question: bool = False
+    # True when this turn explicitly settles an open hypothesis or conflict
+    # as resolved/ruled out (e.g. "consider it ruled out, we got
+    # confirmation", "that's confirmed fixed now") -- distinct from
+    # corrects_fact (which replaces a specific FACT's text) and from
+    # is_wrapping_up (the whole call ending). A resolution can happen mid-
+    # call with the incident still very much ongoing.
+    is_resolution_declared: bool = False
 
 
 class RoleScore(BaseModel):

@@ -58,26 +58,26 @@ export function LiveRecapPanel({ channelName }: LiveRecapPanelProps) {
 					<ClipboardList className="h-4 w-4" />
 				</div>
 				<div>
-					<h2 className="text-sm font-semibold text-foreground">Incident timeline</h2>
-					<p className="text-xs text-muted-foreground">
+					<h2 className="text-sm font-semibold text-white">Incident timeline</h2>
+					<p className="text-xs text-white/60">
 						Facts, decisions &amp; action items Watcher has recorded so far
 					</p>
 				</div>
 			</div>
 
 			{loading ? (
-				<div className="flex h-full flex-col items-center justify-center gap-3 text-center text-sm text-muted-foreground">
-					<RefreshCw className="h-9 w-9 animate-spin text-muted-foreground/40" aria-hidden="true" />
+				<div className="flex h-full flex-col items-center justify-center gap-3 text-center text-sm text-white/60">
+					<RefreshCw className="h-9 w-9 animate-spin text-white/25" aria-hidden="true" />
 					<span>Loading...</span>
 				</div>
 			) : !recap ? (
-				<div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center text-sm text-muted-foreground">
-					<ClipboardList className="h-9 w-9 text-muted-foreground/40" aria-hidden="true" />
+				<div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center text-sm text-white/60">
+					<ClipboardList className="h-9 w-9 text-white/25" aria-hidden="true" />
 					<span>Nothing recorded yet -- this fills in as the call progresses.</span>
 				</div>
 			) : (
 				<div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-					<pre className="whitespace-pre-wrap break-words font-sans text-sm text-foreground">
+					<pre className="whitespace-pre-wrap break-words font-sans text-sm text-white">
 						{recap}
 					</pre>
 				</div>
