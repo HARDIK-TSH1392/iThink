@@ -26,6 +26,20 @@ type QuickstartTranscriptPanelProps = {
 	chatNotes: ChatNote[];
 };
 
+// Deepgram mishears "Watcher" often enough that the backend now recognizes
+// these as valid wake-word attempts too (see iCall_utils.py's
+// _KNOWN_MISHEARINGS -- keep both lists in sync). That fix makes the agent
+// respond correctly, but doesn't change the text Deepgram actually
+// produced -- without this, the transcript panel would keep showing
+// "Voucher" on screen even while the agent visibly answers as if it heard
+// "Watcher". Display-only: doesn't touch persisted transcripts or
+// anything the structuring pipeline sees, just what's rendered here.
+const KNOWN_MISHEARINGS = /\b(voucher|vajar|vucher|voacher|vacher|varcher)\b/gi;
+
+function displayText(text: string): string {
+	return text.replace(KNOWN_MISHEARINGS, "Watcher");
+}
+
 function formatMessageTime(createdAt?: number) {
 	if (!createdAt) return null;
 	return new Intl.DateTimeFormat(undefined, {
@@ -122,7 +136,8 @@ export function QuickstartTranscriptPanel({
 							: isLocal
 								? "You"
 								: (participantNames[uidStr] ?? `Participant ${uidStr}`);
-						const text = message.text?.trim();
+						const rawText = message.text?.trim();
+						const text = isAgent || !rawText ? rawText : displayText(rawText);
 						const time = formatMessageTime(message.createdAt);
 
 						return (
