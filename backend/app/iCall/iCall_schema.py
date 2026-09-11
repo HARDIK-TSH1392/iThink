@@ -14,6 +14,7 @@ class IncidentCallRead(BaseModel):
     status: str
     structured_state: dict
     participant_roles: dict = Field(default_factory=dict)
+    language_code: str = "multi"
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     created_at: datetime
@@ -22,10 +23,42 @@ class IncidentCallRead(BaseModel):
         from_attributes = True
 
 
+class CallCreateRequest(BaseModel):
+    """
+    Optional body for POST /icall/incidents/{incident_id}/call. Only
+    applied on the branch that actually creates a new row -- an existing
+    call ignores this (channel_name/language_code are decided once, same
+    discipline as get_or_create_call's own idempotency). Defaulting the
+    whole model lets demo/dashboard.html's current bodyless POST keep
+    working unchanged.
+    """
+
+    language_code: Optional[str] = None
+
+
 class CallStatusUpdate(BaseModel):
     """Advance a call's lifecycle status."""
 
     status: CallStatus
+
+
+class LanguageSwitchUpdate(BaseModel):
+    """Body for PATCH .../language -- voice-agent server confirms a handoff completed."""
+
+    code: str = Field(..., min_length=1)
+
+
+class TranslateLineRequest(BaseModel):
+    """
+    Body for POST /icall/translate-line -- lets voice-agent server (a
+    separate service with no direct access to iCall_utils.
+    translate_fixed_line) translate a deterministic spoken string, e.g.
+    the post-handoff "I'm back -- now listening in X" greeting, into the
+    target Tier-2 language before speaking it.
+    """
+
+    text: str = Field(..., min_length=1)
+    language_code: str = Field(..., min_length=1)
 
 
 class CallUtteranceCreate(BaseModel):

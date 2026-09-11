@@ -1034,6 +1034,7 @@ export default function ConversationComponent({
 						localUid={agoraData.uid}
 						participantNames={participantNames}
 						chatNotes={chatNotes}
+						channel={agoraData.channel}
 					/>
 				}
 				visualizer={

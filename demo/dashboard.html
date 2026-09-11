@@ -70,7 +70,20 @@
   <h2>3. Voice room</h2>
   <p>Pick an incident id below to create (or fetch) its room, then join it as a human — the agent joins the same named room via the same call.</p>
   <input id="call-incident-id" type="number" placeholder="incident id" style="padding:8px;border:1px solid #ccc;border-radius:6px;width:120px;">
+  <select id="call-language-code" style="padding:8px;border:1px solid #ccc;border-radius:6px;">
+    <option value="multi">English / Hindi (default)</option>
+    <option value="ta-IN">Tamil</option>
+    <option value="te-IN">Telugu</option>
+    <option value="kn-IN">Kannada</option>
+    <option value="bn-IN">Bengali</option>
+    <option value="mr-IN">Marathi</option>
+    <option value="gu-IN">Gujarati</option>
+    <option value="pa-IN">Punjabi</option>
+    <option value="ml-IN">Malayalam</option>
+    <option value="or-IN">Odia</option>
+  </select>
   <button onclick="createCall()">Create / get room</button>
+  <p class="note">Only applied when the room is first created -- an existing call ignores this (see get_or_create_call). Language can also be switched live during a call by saying "switch to Tamil" etc.</p>
   <pre id="call-result"></pre>
   <div id="join-link-container"></div>
 </div>
@@ -94,7 +107,7 @@ const API_BASE = "http://127.0.0.1:8123/api/v1";
 // different machine to join. Matches backend/.env's
 // VOICE_AGENT_WEB_BASE_URL, used for the same join link in the Slack
 // approval message -- keep both pointed at the same place if you change it.
-const WEB_CLIENT_BASE = "https://von-interior-trackback-printing.trycloudflare.com";
+const WEB_CLIENT_BASE = "https://playstation-dried-webpage-pointed.trycloudflare.com";
 document.getElementById("api-base-display").textContent = API_BASE;
 
 async function simulateIncident() {
@@ -164,8 +177,13 @@ async function createCall() {
   const linkContainer = document.getElementById("join-link-container");
   if (!incidentId) { out.textContent = "enter an incident id first"; return; }
 
+  const languageCode = document.getElementById("call-language-code").value;
   out.textContent = "creating/fetching room...";
-  const res = await fetch(`${API_BASE}/icall/incidents/${incidentId}/call`, { method: "POST" });
+  const res = await fetch(`${API_BASE}/icall/incidents/${incidentId}/call`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ language_code: languageCode }),
+  });
   if (!res.ok) {
     out.textContent = `error: ${res.status} ${await res.text()}`;
     linkContainer.innerHTML = "";

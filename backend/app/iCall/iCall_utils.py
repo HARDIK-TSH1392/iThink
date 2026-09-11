@@ -175,7 +175,12 @@ AGENT_NAME = "Watcher"
 # Deepgram actually produced, so without a matching frontend fix the
 # transcript panel would keep showing the wrong word even while the agent
 # correctly responds to it. Keep both lists in sync if this list changes.
-_KNOWN_MISHEARINGS = ("voucher", "vajar", "vucher", "voacher", "vacher", "varcher")
+_KNOWN_MISHEARINGS = (
+    "voucher", "vajar", "vucher", "voacher", "vacher", "varcher",  # Deepgram
+    "vachar", "vache",  # Sarvam, observed live -- same root W-to-V acoustic
+    # confusion pattern, independently confirmed on a second, unrelated
+    # vendor -- not a Deepgram-specific quirk.
+)
 
 # Case-insensitive, whole-word match: also answers to "agent" (the generic,
 # obvious way to address an AI assistant on a call -- confirmed live,
@@ -197,6 +202,127 @@ _ADDRESS_PATTERN = re.compile(
 def _is_direct_address(text: str) -> bool:
     """True if this turn looks like someone deliberately addressing the agent by name."""
     return bool(_ADDRESS_PATTERN.search(text))
+
+
+# -----------------------------------------------------------------------------
+# Language-switch trigger detection
+# -----------------------------------------------------------------------------
+# Deliberately explicit-command based, not passive auto-detection: neither
+# Deepgram (language="multi", English+Hindi only) nor Sarvam can reliably
+# detect a language they have no model for, so the switch is always
+# requested in a language the CURRENTLY active vendor already understands
+# (English/Hindi via Deepgram to enter Tier 2, or the active Tier-2
+# language itself to switch again/return). Matched against plain text the
+# same way _is_direct_address is -- cheap, deterministic, no LLM call.
+
+LANGUAGE_DISPLAY_NAMES: Dict[str, str] = {
+    "multi": "English/Hindi",
+    "ta-IN": "Tamil",
+    "te-IN": "Telugu",
+    "kn-IN": "Kannada",
+    "bn-IN": "Bengali",
+    "mr-IN": "Marathi",
+    "gu-IN": "Gujarati",
+    "pa-IN": "Punjabi",
+    "ml-IN": "Malayalam",
+    "or-IN": "Odia",
+}
+
+_LANGUAGE_TRIGGER_MAP: Dict[str, str] = {
+    "tamil": "ta-IN",
+    "telugu": "te-IN",
+    "kannada": "kn-IN",
+    "bengali": "bn-IN",
+    "marathi": "mr-IN",
+    "gujarati": "gu-IN",
+    "punjabi": "pa-IN",
+    "malayalam": "ml-IN",
+    "odia": "or-IN",
+    "oriya": "or-IN",
+    "hindi": "multi",
+    "english": "multi",
+}
+
+_LANGUAGE_TRIGGER_PATTERN = re.compile(
+    r"\b(?:switch(?:ing)? to|(?:can|could) we (?:talk|speak) in|speak in|reply in)\s+"
+    r"(" + "|".join(_LANGUAGE_TRIGGER_MAP.keys()) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def detect_language_switch_trigger(text: str) -> Optional[str]:
+    """
+    Returns the target language_code (Sarvam's own target_language_code
+    format, or "multi" for the Deepgram tier) if this turn's text contains
+    an explicit switch-language request, else None. Caller (iCall_api's
+    _process_turn) compares the result against the call's current
+    language_code before acting -- a match on the language already active
+    is not a real switch request.
+    """
+    match = _LANGUAGE_TRIGGER_PATTERN.search(text)
+    if not match:
+        return None
+    return _LANGUAGE_TRIGGER_MAP.get(match.group(1).lower())
+
+
+def build_language_switch_ack(target_code: str) -> str:
+    """
+    Deterministic, non-LLM-authored acknowledgment spoken the instant a
+    switch trigger fires -- same "don't let the model freely narrate a
+    state change" discipline as CLOSING_LINE/build_correction_callout. The
+    actual handoff (stop old agent, start new one) happens after this is
+    already on its way back to the room, since it has real, measured
+    latency (see voice-agent/server's switch_language) -- this line is
+    what covers that gap honestly instead of dead air.
+    """
+    display_name = LANGUAGE_DISPLAY_NAMES.get(target_code, target_code)
+    return f"Switching to {display_name} now, one moment."
+
+
+_FIXED_LINE_TRANSLATION_CACHE: Dict[tuple, str] = {}
+
+
+async def translate_fixed_line(text: str, language_code: str) -> str:
+    """
+    Converts one of the small, fixed set of deterministic spoken strings
+    (CLOSING_LINE, FALLBACK_REPLY, etc.) into the currently-active Tier-2
+    language, so a Tamil/Telugu/etc. call doesn't hear these specific
+    lines revert to English mid-conversation. In-process cache since this
+    is a small, fixed set (~6 strings x 9 languages, at most) -- not meant
+    to translate arbitrary/growing content, only this one deterministic
+    set. Degrades to the original English text on any failure (never
+    blocks the call over a translation hiccup) -- same discipline as every
+    other best-effort external call in this file.
+    """
+    if language_code == "multi" or not text:
+        return text
+    cache_key = (text, language_code)
+    if cache_key in _FIXED_LINE_TRANSLATION_CACHE:
+        return _FIXED_LINE_TRANSLATION_CACHE[cache_key]
+    if not get_settings().gemini_api_key:
+        return text
+    display_name = LANGUAGE_DISPLAY_NAMES.get(language_code, language_code)
+    try:
+        client = _get_client()
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.models.generate_content,
+                model=PRIMARY_MODEL,
+                contents=(
+                    f"Translate the following into natural, conversational {display_name}, "
+                    f"as it would actually be spoken aloud on a live phone call -- not a "
+                    f"literal word-for-word translation. Return only the translated text, "
+                    f"nothing else.\n\n{text}"
+                ),
+            ),
+            timeout=GEMINI_CALL_TIMEOUT_S,
+        )
+        translated = (response.text or "").strip() or text
+    except Exception as exc:
+        print(f"[iCall] translate_fixed_line failed for language={language_code}: {exc}")
+        translated = text
+    _FIXED_LINE_TRANSLATION_CACHE[cache_key] = translated
+    return translated
 
 # Spoken when StructuringUpdate.is_wrapping_up is true. Deliberately a fixed
 # string, not LLM-generated -- see StructuringUpdate.is_wrapping_up's
@@ -389,6 +515,30 @@ async def get_live_participant_count(channel_name: str) -> Optional[int]:
     return len(names) if isinstance(names, dict) else None
 
 
+async def trigger_language_handoff(channel_name: str, target_code: str) -> None:
+    """
+    Fire-and-forget POST to the voice-agent server's /switchLanguage,
+    reusing the same voice_agent_server_url setting get_live_participant_
+    count already calls (no new env var needed -- this is the reverse
+    direction of that same, already-existing link). Deliberately not
+    awaited by the caller (_process_turn): the actual stop -> poll -> start
+    handoff has real, measured latency, and the turn's own response (the
+    deterministic switch acknowledgment) must return promptly, not block
+    on it. Best-effort -- logs on failure, never raises into the request
+    path, same discipline as every other cross-service call in this file.
+    """
+    base = get_settings().voice_agent_server_url.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                f"{base}/switchLanguage",
+                json={"channelName": channel_name, "targetLanguage": target_code},
+            )
+            response.raise_for_status()
+    except Exception as exc:
+        print(f"[iCall] Language handoff request failed for channel={channel_name} target={target_code}: {exc}")
+
+
 STRUCTURING_SYSTEM_INSTRUCTION = f"""You are {AGENT_NAME}, a voice participant in a live
 incident call. Your job is narrow, the same way it is for a human note-taker
 who also happens to be allowed to ask one question: keep the room's shared
@@ -562,6 +712,64 @@ Hard constraints:
   yourself -- you don't have the actual log data, the caller queries it
   separately and shows it visually to everyone on the call.
 - Output must strictly match the provided response schema.
+"""
+
+
+def build_structuring_system_instruction(language_code: Optional[str]) -> str:
+    """
+    STRUCTURING_SYSTEM_INSTRUCTION is kept as a module-level constant
+    (backend/eval/measure_groq_latency.py and measure_te_config_variants.py
+    import it directly, always exercising the English/multi baseline) --
+    this wraps it with an additional instruction block, rather than
+    restructuring the constant itself. Only spoken_reply changes language;
+    facts/hypotheses/decisions stay English-internal (that's what's
+    displayed/logged, not spoken), so this is a narrow prompt addition,
+    not a schema change.
+
+    Tier 1 (language_code == "multi", Deepgram's English+Hindi
+    code-switching) gets its own instruction block too, not a no-op --
+    confirmed live (incident-63): with no language guidance at all, Gemini
+    defaulted to English even when the user spoke Hindi, since the base
+    STRUCTURING_SYSTEM_INSTRUCTION is itself written in English and says
+    nothing about matching the speaker. Deliberately NOT a fixed target
+    language the way Tier 2 is (there is no single "the language" for this
+    tier) -- instead it asks the model to mirror whichever language the
+    user's own latest message was actually in, since Gemini already sees
+    the full conversation text and inferring "was that Hindi or English"
+    from it needs no separate detection step or extra model call.
+    """
+    if not language_code or language_code == "multi":
+        return STRUCTURING_SYSTEM_INSTRUCTION + """
+- This call is running in Watcher's English/Hindi tier (Deepgram's
+  native code-switching mode) -- participants may speak English, Hindi,
+  or naturally mix both within the same sentence, and the transcript you
+  see may itself be mixed-script for that reason (e.g. Devanagari Hindi
+  with English technical terms/proper nouns left in Latin script) -- that
+  is expected, not a transcription error, so don't treat mixed-script
+  input as unclear or ask the room to repeat it. Match spoken_reply's
+  language to the user's most recent message: if they spoke mostly in
+  Hindi, reply in natural, conversational Hindi (Devanagari script) the
+  way someone would actually say it out loud -- not a literal
+  word-for-word translation of English incident jargon (keep proper
+  nouns, service names, and jargon like "rollback"/"PR"/"API" in their
+  usual English/Latin form even inside an otherwise-Hindi reply, since
+  that's how they're actually said in real Hindi tech conversation). If
+  they spoke in English, reply in English as usual. If they genuinely
+  mixed both in one sentence, mirror that same natural code-switching in
+  your reply rather than force it into a single language. Keep
+  facts/hypotheses/decisions/action_items/missing_info in English as
+  usual (internal record-keeping, not spoken content) -- only
+  spoken_reply's language changes.
+"""
+    display_name = LANGUAGE_DISPLAY_NAMES.get(language_code, language_code)
+    return STRUCTURING_SYSTEM_INSTRUCTION + f"""
+- This call is currently being conducted in {display_name}. Write
+  spoken_reply in natural, conversational {display_name} -- the way
+  someone would actually say it out loud on a live incident call, not a
+  literal word-for-word translation of English incident jargon. Keep
+  facts/hypotheses/decisions/action_items/missing_info in English as
+  usual (internal record-keeping, not spoken content) -- only
+  spoken_reply's language changes.
 """
 
 
@@ -826,6 +1034,7 @@ async def generate_structuring_update(
     messages: List[ChatMessage],
     existing_state: dict,
     service: Optional[str] = None,
+    language_code: Optional[str] = None,
     tools: Optional[List[dict]] = None,
     tool_result_text: Optional[str] = None,
     region: Optional[str] = None,
@@ -875,7 +1084,7 @@ async def generate_structuring_update(
         service=service, region=region, incident_age_minutes=incident_age_minutes,
     )
     config = types.GenerateContentConfig(
-        system_instruction=STRUCTURING_SYSTEM_INSTRUCTION,
+        system_instruction=build_structuring_system_instruction(language_code),
         response_mime_type="application/json",
         response_schema=StructuringUpdate,
         tools=[gemini_tool] if gemini_tool else None,
