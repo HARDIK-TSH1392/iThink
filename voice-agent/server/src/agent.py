@@ -13,7 +13,10 @@ import httpx
 
 from agora_agent import Area, AsyncAgora
 from agora_agent.agentkit import Agent as AgoraAgent
-from agora_agent.agentkit.vendors import CustomLLM, DeepgramSTT, MiniMaxTTS, OpenAI
+from agora_agent.agentkit.token import generate_convo_ai_token
+from agora_agent.agentkit.vendors import (
+    CustomLLM, DeepgramSTT, MiniMaxTTS, OpenAI, SarvamSTT, SarvamTTS,
+)
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -52,27 +55,72 @@ DEFAULT_GREETING = "Hi, this is Watcher. I'll listen in and keep track of what's
 # extract facts from. Keep this in sync with SILENCE_TRIGGER_MARKER there.
 SILENCE_TRIGGER_MARKER = "[[ithink-silence-check]]"
 
+# Tier 1 (English + Hindi): one continuous Deepgram nova-3 session,
+# language="multi" -- Deepgram's own real-time code-switching mode,
+# confirmed to cover this exact language pair. No entry in TIER2_LANGUAGES
+# means "multi" (or any language_code we don't recognize -- fail toward
+# the proven path, not a silent Sarvam attempt on an unsupported code).
+#
+# Tier 2 (everything else): Sarvam, model="saaras:v3" -- the ONLY model
+# string confirmed to produce real transcripts through Agora's Sarvam
+# integration (live-tested twice: "saaras:v3-realtime" breaks
+# transcription entirely, empty transcripts despite the pipeline staying
+# alive). No keyterm-equivalent boosting exists on this path (confirmed
+# 3x live: unboosted 1/4, bare-word prompt 0/4, natural-sentence prompt
+# 0/4 on wake-word recognition) and no partial/interim transcripts exist
+# either (confirmed via pilot-bot-v1's own production code hitting the
+# identical wall on direct API access) -- accepted, real limitations of
+# this tier, not something more parameter-tuning fixes.
+#
+# turn_detection_language falls back to "en-IN" for four of these nine
+# languages -- confirmed absent from the installed SDK's own
+# TURN_DETECTION_LANGUAGE_VALUES whitelist (mr-IN, pa-IN, ml-IN, or-IN are
+# not in the 32-entry list; ta-IN/te-IN/kn-IN/bn-IN/gu-IN/hi-IN are).
+# Passing an unsupported code raises ValueError at agent-start time, so
+# this fallback isn't optional -- it's a real, accepted mismatch (Agora's
+# own semantic end-of-speech layer judges completeness in en-IN for these
+# four languages' speech), not a bug worth chasing.
+TIER2_LANGUAGES: Dict[str, Dict[str, str]] = {
+    "ta-IN": {"sarvam_speaker": "priya", "turn_detection_language": "ta-IN"},
+    "te-IN": {"sarvam_speaker": "priya", "turn_detection_language": "te-IN"},
+    "kn-IN": {"sarvam_speaker": "priya", "turn_detection_language": "kn-IN"},
+    "bn-IN": {"sarvam_speaker": "priya", "turn_detection_language": "bn-IN"},
+    "gu-IN": {"sarvam_speaker": "priya", "turn_detection_language": "gu-IN"},
+    "mr-IN": {"sarvam_speaker": "priya", "turn_detection_language": "en-IN"},
+    "pa-IN": {"sarvam_speaker": "priya", "turn_detection_language": "en-IN"},
+    "ml-IN": {"sarvam_speaker": "priya", "turn_detection_language": "en-IN"},
+    "or-IN": {"sarvam_speaker": "priya", "turn_detection_language": "en-IN"},
+}
 
-async def _fetch_keyterms(ithink_base: str, channel_name: str) -> Optional[str]:
+LANGUAGE_DISPLAY_NAMES: Dict[str, str] = {
+    "multi": "English/Hindi",
+    "ta-IN": "Tamil", "te-IN": "Telugu", "kn-IN": "Kannada", "bn-IN": "Bengali",
+    "mr-IN": "Marathi", "gu-IN": "Gujarati", "pa-IN": "Punjabi",
+    "ml-IN": "Malayalam", "or-IN": "Odia",
+}
+
+
+async def _fetch_voice_config(ithink_base: str, channel_name: str) -> Dict[str, Any]:
     """
-    Deepgram keyterm-prompting string for this call (see
-    iCall_utils.build_keyterms) -- boosts recognition of words STT has no
-    reason to get right on its own (the incident's service name, this
-    agent's own name, incident-call jargon). Confirmed live this session:
-    "auth-api" came back as "OT API" with no boosting at all.
+    Voice-pipeline config for this call: Deepgram keyterm-prompting string
+    (see iCall_utils.build_keyterms) plus language_code, the durable
+    Tier-1/Tier-2 selection read at agent-start time. Replaces
+    _fetch_keyterms -- same endpoint, grown one field, still one round
+    trip per agent start.
 
     Best-effort, same reasoning as _fetch_late_joiner_catchup in server.py:
-    a slow/unreachable backend should degrade to no boosting, never block
-    the agent from starting.
+    a slow/unreachable backend should degrade to Tier-1 defaults, never
+    block the agent from starting.
     """
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             response = await client.get(f"{ithink_base}/icall/channel/{channel_name}/keyterms")
             response.raise_for_status()
-            return response.json().get("data", {}).get("keyterm")
+            data = response.json().get("data", {})
+            return {"keyterm": data.get("keyterm"), "language_code": data.get("language_code") or "multi"}
     except Exception:
-        logger.warning("Failed to fetch keyterms for channel=%s", channel_name, exc_info=True)
-        return None
+        logger.warning("Failed to fetch voice config for channel=%s", channel_name, exc_info=True)
+        return {"keyterm": None, "language_code": "multi"}
 
 
 class Agent:
@@ -109,10 +157,13 @@ class Agent:
 
         # Track active sessions by agent_id
         self._sessions: Dict[str, Any] = {}
-        # channel_name -> (agent_id, result) for the currently-running agent
-        # in that channel, if any. Lets a second/third person joining the
-        # same incident's call skip starting a duplicate agent (and hearing
-        # a second greeting) -- only the first joiner actually starts one.
+        # channel_name -> (agent_id, result, agent_uid, user_uid) for the
+        # currently-running agent in that channel, if any. Lets a
+        # second/third person joining the same incident's call skip
+        # starting a duplicate agent (and hearing a second greeting) --
+        # only the first joiner actually starts one. agent_uid/user_uid
+        # are kept here (not just agent_id/result) so switch_language can
+        # restart with the same identity across a language handoff.
         self._channel_agents: Dict[str, tuple] = {}
         # channel_name -> lock serializing start() for that channel. Without
         # this, two people opening the shared join link within the same
@@ -136,6 +187,8 @@ class Agent:
         agent_uid: int,
         user_uid: int,
         output_audio_codec: Optional[str] = None,
+        language_code: Optional[str] = None,
+        greeting_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Start agent with the same default vendor chain as the Next.js quickstart."""
         if not channel_name or not str(channel_name).strip():
@@ -144,7 +197,9 @@ class Agent:
             raise ValueError("agent_uid is required and cannot be empty")
 
         async with self._get_channel_lock(channel_name):
-            return await self._start_locked(channel_name, agent_uid, user_uid, output_audio_codec)
+            return await self._start_locked(
+                channel_name, agent_uid, user_uid, output_audio_codec, language_code, greeting_override,
+            )
 
     async def _start_locked(
         self,
@@ -152,16 +207,20 @@ class Agent:
         agent_uid: int,
         user_uid: int,
         output_audio_codec: Optional[str],
+        language_code: Optional[str] = None,
+        greeting_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         # An agent is already running in this channel (a prior joiner started
         # it) -- return that result instead of starting a second agent, which
         # would greet the room again and duplicate note-taking. Re-checked
         # here, inside the per-channel lock, since a concurrent start() for
         # this same channel may have finished while this call was waiting
-        # for the lock.
+        # for the lock. Not applicable to a switch_language restart -- that
+        # path calls stop() first, which evicts this entry before start()
+        # runs again for the same channel.
         existing = self._channel_agents.get(channel_name)
         if existing is not None:
-            existing_agent_id, existing_result = existing
+            existing_agent_id, existing_result = existing[0], existing[1]
             logger.info(
                 "Agent already running for channel=%s agent_id=%s, skipping duplicate start",
                 channel_name,
@@ -207,84 +266,75 @@ class Agent:
             ),
             api_key=os.getenv("ITHINK_LLM_API_KEY", "unused"),
             model="ithink-proxy",
-            greeting_message=self.greeting,
+            # greeting_override is set by switch_language after a handoff
+            # ("I'm back -- now listening in Tamil.") -- reuses the
+            # existing, already-proven greeting-on-join code path rather
+            # than introducing a separate agent_think()/speak() call for
+            # this specific notice.
+            greeting_message=greeting_override or self.greeting,
             failure_message="Please wait a moment.",
             max_history=15,
             max_tokens=1024,
             temperature=0.7,
             mcp_servers=mcp_servers or None,
         )
-        # en-IN is a real, separately-documented Deepgram nova-3 language
-        # code (confirmed against Deepgram's own docs, not just "en" with
-        # an accent guess) -- tunes the acoustic model for Indian-accented
-        # English instead of defaulting toward US English.
-        #
-        # keyterm/smart_format/punctuation were reverted earlier this
-        # session after incident-33/34/35 each produced real, non-silence
-        # turns but zero usable transcript content -- correlated, never
-        # actually root-caused. Reinstated alongside the en-IN locale
-        # change on the team's decision to re-test properly rather than
-        # assume the old correlation still holds with the locale now
-        # correct -- but it just reproduced live again (incident-43,
-        # 2026-09-06: 8 real, non-silence turns, latest_user_message=''
-        # every single time, confirmed via direct log inspection, not a
-        # guess). Reverted again at that point, keeping only en-IN (never
-        # implicated in either occurrence), with an explicit note to
-        # re-test each flag in isolation rather than reinstate all three
-        # together again.
-        #
-        # keyterm, alone, is that isolated re-test. _fetch_keyterms was
-        # already written to call build_keyterms (which always includes
-        # AGENT_NAME -- see iCall_utils.BASE_KEYTERMS) but was never
-        # actually wired to the STT config below, so "Watcher" has had
-        # zero acoustic boosting this whole time -- confirmed live
-        # (incident-46, 2026-09-09): asked for repeatedly, transcribed as
-        # "Voucher"/"Voiture"/spelled-out/"Vachir", direct_address never
-        # fired once. Confirmed by direct A/B test against the real
-        # Deepgram API on our own real BASE_KEYTERMS list, same audio: a
-        # real jargon word ("auth-api") that nova-3 mistranscribed as "off
-        # API" unboosted came back correctly as "auth API" boosted --
-        # keyterm alone does the same "off"->"auth" correction. smart_format
-        # and punctuation stay off -- they were never re-tested in
-        # isolation and aren't needed for either fix.
-        #
-        # REVERTED live (incident-50, 2026-09-10): the isolated keyterm
-        # test above was against a synthesized clip via the raw Deepgram
-        # API, not this actual Agora-managed pipeline -- and on a real
-        # call through Agora, keyterm alone reproduced the exact
-        # zero-content-transcript failure described two paragraphs up
-        # (incidents 33/34/35, 43): 5 real, non-silence turns, backend
-        # log showed latest_user_message='' facts_this_turn=[] every
-        # single time, confirmed via direct log inspection, not a guess.
-        # Nothing else changed around this time touches what's sent to
-        # Deepgram -- turn_detection.language/audio_scenario/
-        # speaking_interrupt_duration_ms are separate layers -- so
-        # keyterm is the only plausible cause. Zero transcription is a
-        # worse failure than an occasionally-misheard wake word, so this
-        # goes back to no boosting rather than staying broken.
-        #
-        # ALSO TRIED live (same day): sending keyterm as a real JSON list
-        # via additional_params={"keyterm": [...]}  instead of a
-        # space-joined string, on the theory that Deepgram's own
-        # repeated-query-param format for multiple terms might be the
-        # real expectation. Agora's REST API accepts the array shape
-        # (HTTP 200, no validation error) -- but on a live call
-        # (incident-51, same day, immediately after the string-form
-        # failure on incident-50) it reproduced the EXACT SAME
-        # zero-content-transcript failure: 4 real turns,
-        # latest_user_message='' every time. This rules out "wrong
-        # shape" as the explanation -- both the string and the list form
-        # fail identically, so the problem is keyterm itself on this
-        # pipeline, not its formatting. Do not re-attempt either shape
-        # without new evidence pointing somewhere else entirely. Not
-        # calling _fetch_keyterms at all here (rather than calling it and
-        # discarding the result) so this doesn't cost a wasted round trip
-        # to our own backend on every call start.
-        stt = DeepgramSTT(
-            model="nova-3",
-            language="en-IN",
-        )
-        tts = MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_captivating_female1")
+        # Two-tier multilingual STT/TTS, keyed off the call's durable
+        # language_code (backend/app/iCall/iCall_model.py). Full history
+        # of how keyterm's actual working format was found (a %20-encoded
+        # string, not a literal space, matching Agora's own documented
+        # example byte-for-byte -- literal spaces and JSON-array/
+        # additional_params forms all reproduced a real, live,
+        # zero-content-transcript failure across incidents 33/34/35/43/
+        # 50/51) lives in git history on fix/watcher-wake-word-mishearings
+        # and the keyterm-format investigation branch -- not repeated here
+        # now that the branching logic itself needs the space.
+        voice_config = await _fetch_voice_config(ithink_base, channel_name)
+        resolved_language = language_code or voice_config["language_code"]
+        tier2_config = TIER2_LANGUAGES.get(resolved_language)
+
+        if tier2_config is None:
+            # Tier 1: English + Hindi, one continuous Deepgram session via
+            # language="multi" -- Deepgram's own real-time code-switching
+            # mode, covering both languages with zero vendor-switch logic.
+            # keyterm boosting is proven live (3/3 wake-word accuracy) only
+            # in this exact encoding -- %20, not a literal space or comma,
+            # matching Agora's own documented example for this field.
+            keyterm = voice_config["keyterm"]
+            stt = DeepgramSTT(
+                model="nova-3",
+                language="multi",
+                keyterm=keyterm.replace(" ", "%20") if keyterm else None,
+            )
+            # language_boost="hi" removed: confirmed live (real TTS-layer
+            # error, code 2013, "invalid params: language_boost") that
+            # MiniMax rejects a plain ISO code here -- whatever format it
+            # actually wants (a full language name, an "auto" value, or
+            # something else) is unconfirmed. Second corrected assumption
+            # in a row from the Doc 2 feature sweep (after sal_mode) --
+            # not re-attempted without checking MiniMax's own real
+            # accepted-value list first.
+            tts = MiniMaxTTS(
+                model="speech_2_6_turbo",
+                voice_id="English_captivating_female1",
+            )
+            turn_detection_language = "en-IN"
+        else:
+            # Tier 2: Sarvam, model="saaras:v3" is the ONLY value confirmed
+            # to produce real transcripts through Agora's Sarvam
+            # integration -- "saaras:v3-realtime" breaks transcription
+            # entirely (confirmed twice live), likely because Agora's
+            # integration connects to Sarvam's legacy (non-"-realtime")
+            # endpoint regardless of the model string given. No keyterm
+            # equivalent exists on this path at all (confirmed 3x live) --
+            # accepted, not something more parameter-tuning fixes.
+            sarvam_key = os.getenv("SARVAM_API_KEY")
+            stt = SarvamSTT(api_key=sarvam_key, language=resolved_language, model="saaras:v3")
+            tts = SarvamTTS(
+                key=sarvam_key,
+                target_language_code=resolved_language,
+                speaker=tier2_config["sarvam_speaker"],
+            )
+            turn_detection_language = tier2_config["turn_detection_language"]
 
         # Optional BYOK example: replace the STT block above and set DEEPGRAM_API_KEY.
         # stt = DeepgramSTT(api_key=os.getenv("DEEPGRAM_API_KEY"), model="nova-3", language="en")
@@ -345,6 +395,12 @@ class Agent:
                 "action": "think",
                 "content": SILENCE_TRIGGER_MARKER,
             },
+            # Makes stop() wait for the agent to finish its current
+            # sentence (reach IDLE) before actually leaving, up to the
+            # timeout -- without this, a language-switch handoff's stop()
+            # could cut the agent off mid-word right as the switch fires.
+            # Also benefits ordinary /stopAgent calls, not just handoffs.
+            "farewell_config": {"graceful_enabled": True, "graceful_timeout_seconds": 5},
         }
         if isinstance(output_audio_codec, str) and output_audio_codec.strip():
             parameters["output_audio_codec"] = output_audio_codec.strip()
@@ -365,10 +421,12 @@ class Agent:
                 # in the installed SDK) while every other locale-aware
                 # setting in this file is en-IN. "en-IN" is a real,
                 # validated value for this field too (agentkit/agent.py's
-                # own TURN_DETECTION_LANGUAGE_VALUES whitelist). Not yet
-                # re-tested live -- the mismatch is confirmed from the SDK
-                # source, not the resulting behavior.
-                "language": "en-IN",
+                # own TURN_DETECTION_LANGUAGE_VALUES whitelist). Computed
+                # above per-tier: en-IN for Tier 1 and for the four Tier-2
+                # languages absent from that whitelist (mr-IN, pa-IN,
+                # ml-IN, or-IN), the language's own code for the other
+                # five Tier-2 languages that are present in it.
+                "language": turn_detection_language,
                 "config": {
                     # 0.5 is the SDK's own mid-range default. Flagged early
                     # this session as an open question (does a quieter
@@ -540,7 +598,23 @@ class Agent:
             # actively defeats should_speak_aloud's whole point (stay
             # silent unless there's a real reason) -- dead air while
             # Gemini thinks is fine, humans keep talking through it.
+            # SAL disabled: confirmed live (real 400 from Agora, not a
+            # silent failure) that sal_mode="recognition" REQUIRES
+            # sample_urls (pre-registered voice samples per speaker) to be
+            # non-empty -- contradicting the doc's framing that recognition
+            # mode "doesn't require picking one speaker." We have no way to
+            # pre-register incident-call participants' voices before they
+            # join a live call, so this mode isn't usable here without data
+            # we can't realistically supply. Corrected assumption, not
+            # re-attempted without a real sample-collection flow.
             advanced_features={"enable_rtm": True, "enable_tools": True},
+            # Opt-in, not default: disables Agora's automatic cross-region
+            # failover in exchange for a hard India-region guarantee.
+            # Real trade-off given this hackathon's explicit India focus
+            # (lower baseline latency, no silent failover elsewhere) --
+            # not enabled unconditionally since the failover behavior
+            # itself has never caused a problem worth giving up.
+            geofence={"area": "INDIA"} if os.getenv("WATCHER_GEOFENCE_INDIA") else None,
             parameters=parameters,
         )
         
@@ -550,6 +624,22 @@ class Agent:
             .with_llm(llm)
             .with_tts(tts)
         )
+
+        if tier2_config is not None:
+            # SarvamTTSOptions has no `model`/`additional_params` field at
+            # all (unlike every sibling vendor wrapper), so Agora's backend
+            # falls back to its own hardcoded default -- confirmed live to
+            # be the now-deprecated "bulbul:v2" (real HTTP 400 from
+            # Sarvam's own API: "Model 'bulbul:v2' has been deprecated.
+            # Please use 'bulbul:v3' instead."). The RAW type underneath
+            # the wrapper (SarvamTtsParams) uses extra="allow", and
+            # Agent._tts is stored as a plain mutable dict after
+            # with_tts() -- same workaround Doc 2 documented for
+            # CustomLLM's missing `tools` kwarg. Untested live yet; if
+            # Agora's backend doesn't read this key at all, this line is a
+            # no-op, not a regression -- worst case, same broken bulbul:v2
+            # behavior as before this change.
+            agora_agent._tts["params"]["model"] = "bulbul:v3"
 
         # "*" subscribes the agent to every human in the channel, not just
         # whoever's join triggered the start -- remote_rtc_uids only takes a
@@ -607,8 +697,9 @@ class Agent:
             # to whichever agent the first joiner actually started (see the
             # existing-channel check above).
             "agent_uid": str(agent_uid),
+            "language_code": resolved_language,
         }
-        self._channel_agents[channel_name] = (agent_id, result)
+        self._channel_agents[channel_name] = (agent_id, result, agent_uid, user_uid)
         return result
 
     async def stop(self, agent_id: str) -> None:
@@ -617,7 +708,7 @@ class Agent:
             raise ValueError("agent_id is required and cannot be empty")
 
         stale_channels = [
-            channel for channel, (aid, _) in self._channel_agents.items() if aid == agent_id
+            channel for channel, entry in self._channel_agents.items() if entry[0] == agent_id
         ]
         for channel in stale_channels:
             self._channel_agents.pop(channel, None)
@@ -638,3 +729,110 @@ class Agent:
 
         logger.info("Stopping Agora agent through client.stop_agent agent_id=%s", agent_id)
         await self.client.stop_agent(agent_id)
+
+    async def _get_status(self, agent_id: str) -> Optional[str]:
+        """
+        Polls the real agent status (IDLE/STARTING/RUNNING/STOPPING/
+        STOPPED/FAILED) -- used by switch_language to confirm a stopped
+        agent has actually released its channel identity before restarting
+        with the same agent_uid. Replicates stop_agent's own token-building
+        (pool_client.py) since client.agents.get() needs the same
+        app-credentials auth header stop_agent already builds for itself,
+        and this method isn't exposed as a top-level client convenience the
+        way stop_agent is. Returns None on any failure -- caller treats
+        that as "unknown, proceed anyway" rather than blocking forever.
+        """
+        request_options = None
+        if self.client.auth_mode == "app-credentials":
+            token = generate_convo_ai_token(
+                app_id=self.app_id, app_certificate=self.app_certificate, channel_name="status", uid=0,
+            )
+            request_options = {"additional_headers": {"Authorization": f"agora token={token}"}}
+        try:
+            response = await self.client.agents.get(self.app_id, agent_id, request_options=request_options)
+            return response.status
+        except Exception:
+            logger.warning("Failed to query agent status agent_id=%s", agent_id, exc_info=True)
+            return None
+
+    async def switch_language(self, channel_name: str, target_language: str) -> Dict[str, Any]:
+        """
+        Handoff to a different STT/TTS tier mid-call -- the only way to
+        change vendor, confirmed exhaustively from the installed SDK's own
+        UpdateAgentsRequestProperties (token/llm/mllm only, no asr/tts
+        field exists at all). Stop the current agent, wait for it to
+        actually release the channel (the ERR_REPEAT_JOIN_REQUEST risk
+        this project hit once already, incident-55), then start a fresh
+        one with the SAME agent_uid/user_uid so the room's "Watcher"
+        identity doesn't change across the switch.
+
+        Raises if no agent is currently tracked for this channel -- there's
+        nothing to hand off from.
+        """
+        existing = self._channel_agents.get(channel_name)
+        if existing is None:
+            raise ValueError(f"No agent running for channel={channel_name} to switch from")
+        old_agent_id, _, agent_uid, user_uid = existing
+
+        logger.info(
+            "Switching language channel=%s target=%s old_agent_id=%s",
+            channel_name, target_language, old_agent_id,
+        )
+        await self.stop(old_agent_id)
+
+        # Bounded poll, not indefinite -- proceed regardless after the
+        # timeout rather than risk hanging the switch forever on a status
+        # query that never resolves. This is the safeguard, not a
+        # guarantee: the actual ERR_REPEAT_JOIN_REQUEST risk is reduced,
+        # not eliminated, by waiting.
+        for _ in range(20):  # ~10s at 500ms per poll
+            status = await self._get_status(old_agent_id)
+            if status in ("STOPPED", "IDLE") or status is None:
+                break
+            await asyncio.sleep(0.5)
+
+        display_name = LANGUAGE_DISPLAY_NAMES.get(target_language, target_language)
+        ithink_base = os.getenv("ITHINK_BACKEND_BASE_URL", "http://127.0.0.1:8123/api/v1")
+        greeting_english = f"I'm back -- now listening in {display_name}."
+        # Only this post-handoff greeting gets translated, deliberately --
+        # it's spoken by the tier being ENTERED, which is the one actually
+        # built for the target language. The pre-handoff acknowledgment
+        # (build_language_switch_ack, in iCall_utils.py) stays in English
+        # on purpose: it's spoken by the tier being LEFT, which may not
+        # render the target language correctly at all (that's often
+        # exactly why the call is leaving it). Best-effort -- falls back
+        # to the English line on any failure, never blocks the handoff.
+        greeting_override = greeting_english
+        if target_language != "multi":
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    response = await client.post(
+                        f"{ithink_base}/icall/translate-line",
+                        json={"text": greeting_english, "language_code": target_language},
+                    )
+                    response.raise_for_status()
+                    greeting_override = response.json().get("data", {}).get("translated") or greeting_english
+            except Exception:
+                logger.warning(
+                    "Failed to translate post-handoff greeting, using English channel=%s target=%s",
+                    channel_name, target_language, exc_info=True,
+                )
+
+        result = await self.start(
+            channel_name, agent_uid=agent_uid, user_uid=user_uid,
+            language_code=target_language,
+            greeting_override=greeting_override,
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.patch(
+                    f"{ithink_base}/icall/channel/{channel_name}/language",
+                    json={"code": target_language},
+                )
+        except Exception:
+            logger.warning(
+                "Failed to confirm language switch to backend channel=%s target=%s",
+                channel_name, target_language, exc_info=True,
+            )
+        return result

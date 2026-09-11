@@ -83,11 +83,23 @@ class StartAgentRequest(BaseModel):
     rtcUid: int
     userUid: int
     parameters: Optional[Dict[str, Any]] = None
+    # Optional override for the Tier-1/Tier-2 language selection --
+    # normally resolved server-side by agent.py fetching the call's
+    # durable language_code from the backend, but useful for testing a
+    # specific Tier-2 language directly without going through the
+    # explicit-trigger switch flow.
+    languageCode: Optional[str] = None
 
 
 class StopAgentRequest(BaseModel):
     """Request body for POST /stopAgent"""
     agentId: str
+
+
+class SwitchLanguageRequest(BaseModel):
+    """Request body for POST /switchLanguage"""
+    channelName: str
+    targetLanguage: str
 
 
 class SetNameRequest(BaseModel):
@@ -200,6 +212,7 @@ async def start_agent(request: StartAgentRequest):
             agent_uid=request.rtcUid,
             user_uid=request.userUid,
             output_audio_codec=output_audio_codec,
+            language_code=request.languageCode,
         )
         return {"code": 0, "msg": "success", "data": result}
     except Exception as e:
@@ -227,6 +240,31 @@ async def stop_agent(request: StopAgentRequest):
         return {"code": 0, "msg": "success"}
     except Exception as e:
         _log_route_error("/stopAgent", e, agentId=request.agentId)
+        raise _to_http_error(e)
+
+
+@router.post("/switchLanguage")
+async def switch_language(request: SwitchLanguageRequest):
+    """
+    Language-tier handoff mid-call -- stops the current agent, waits for
+    it to actually release the channel, and starts a fresh one on the
+    target language, reusing the same agent_uid/user_uid. Called by the
+    backend's language-switch trigger detection (iCall_api._process_turn)
+    once it detects an explicit spoken request ("switch to Tamil").
+    """
+    if agent is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Service not properly configured. Please check environment variables.",
+        )
+
+    try:
+        result = await agent.switch_language(request.channelName, request.targetLanguage)
+        return {"code": 0, "msg": "success", "data": result}
+    except Exception as e:
+        _log_route_error(
+            "/switchLanguage", e, channelName=request.channelName, targetLanguage=request.targetLanguage,
+        )
         raise _to_http_error(e)
 
 
