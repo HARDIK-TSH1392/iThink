@@ -63,6 +63,7 @@ from .iCall_utils import (
     detect_health_score_drop,
     build_health_recap,
     build_correction_callout,
+    redact_sensitive_reply,
     build_keyterms,
     CALL_STATUS_COMPLETED,
     EVENT_AGENT_LEFT,
@@ -428,7 +429,7 @@ async def _decide_spoken_reply(
         # right for it. CLOSING_LINE's own promise about Slack/Jira stays
         # exactly as accurate as before; this just says what actually
         # happened before promising where the fuller version goes.
-        spoken_reply = f"{build_health_recap(call.structured_state)} {CLOSING_LINE}"
+        spoken_reply = redact_sensitive_reply(f"{build_health_recap(call.structured_state)} {CLOSING_LINE}")
         call = await record_wrapped_up(db, call)
         await record_agent_utterance(db, call.id, spoken_reply, "is_wrapping_up")
         return spoken_reply
@@ -452,7 +453,7 @@ async def _decide_spoken_reply(
     # correction actually applied (old_facts contained the exact text) --
     # see apply_structuring_update's fail-safe exact-match requirement.
     if update.corrects_fact and update.corrects_fact in old_facts:
-        spoken_reply = build_correction_callout(update)
+        spoken_reply = redact_sensitive_reply(build_correction_callout(update))
         await record_agent_utterance(db, call.id, spoken_reply, "correction")
         return spoken_reply
 
@@ -467,13 +468,16 @@ async def _decide_spoken_reply(
     # as is_wrapping_up/corrects_fact above -- this just always speaks
     # whatever the model actually has to report, when it has anything to say.
     if force_speak and update.spoken_reply:
-        spoken_reply = update.spoken_reply
+        # Highest-risk path for this: it's a direct readback of a tool/log
+        # result the model just fetched, which is exactly the kind of raw
+        # content a real credential could be sitting inside.
+        spoken_reply = redact_sensitive_reply(update.spoken_reply)
         await record_agent_utterance(db, call.id, spoken_reply, "tool_result")
         return spoken_reply
 
     if should_speak_aloud(update, latest_user_message, call.structured_state):
         reason = describe_speak_reason(update, latest_user_message, call.structured_state)
-        spoken_reply = build_gated_spoken_reply(update, reason, call.structured_state)
+        spoken_reply = redact_sensitive_reply(build_gated_spoken_reply(update, reason, call.structured_state))
         if reason == "missing_info":
             call = await record_missing_info_nudge(db, call)
         elif reason == "direct_address":
@@ -488,13 +492,16 @@ async def _decide_spoken_reply(
     # more directly relevant to what was just said.
     pattern = evaluate_call_patterns(call.structured_state)
     if pattern:
-        spoken_reply = pattern["message"]
-        call = await record_pattern_nudge(db, call, pattern["pattern"], pattern["message"])
+        # record_pattern_nudge's own message param is itself persisted to
+        # the timeline (see its docstring) -- pass the redacted text there
+        # too, not just what's returned/spoken.
+        spoken_reply = redact_sensitive_reply(pattern["message"])
+        call = await record_pattern_nudge(db, call, pattern["pattern"], spoken_reply)
         await record_agent_utterance(db, call.id, spoken_reply, f"pattern:{pattern['pattern']}")
         return spoken_reply
 
     if detect_health_score_drop(call.structured_state):
-        spoken_reply = build_health_recap(call.structured_state)
+        spoken_reply = redact_sensitive_reply(build_health_recap(call.structured_state))
         await record_pattern_nudge(db, call, "health_score_drop", spoken_reply, score=health_score)
         await record_agent_utterance(db, call.id, spoken_reply, "health_score_drop")
         return spoken_reply

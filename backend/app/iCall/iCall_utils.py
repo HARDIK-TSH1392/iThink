@@ -190,6 +190,55 @@ CLOSING_LINE = (
 )
 
 
+# Pattern-based, not a keyword blocklist -- these match the *shape* of a
+# real credential (AWS/GitHub/OpenAI/Slack key formats, JWTs, a generic
+# "key/token/secret/password: <value>" phrase) rather than trying to
+# enumerate every service name someone might read aloud during an
+# incident. Deliberately whole-message replacement on a match, not a
+# surgical strip of just the matched substring -- same design as Agora's
+# own content-filter recipe ("filtered content is spoken aloud as
+# 'Content filtered.'"): cutting only the secret out of a sentence can
+# still leave a broken, confusing half-sentence, and there's no safe way
+# to guess how much surrounding context is also compromised (e.g. "the
+# key is AKIA... just rotate that one" -- redacting only the key leaves
+# "the key is  just rotate that one", which reads as a transcription
+# glitch, not a deliberate safety action).
+_SENSITIVE_CONTENT_PATTERNS = [
+    re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key id
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),  # GitHub token (ghp_/gho_/ghu_/ghs_/ghr_)
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),  # OpenAI-style secret key
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),  # Slack token
+    re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),  # JWT
+    re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]{20,}=*", re.IGNORECASE),
+    re.compile(
+        r"(?:api[_-]?key|secret|token|password|credential)s?\s*[:=]\s*\S{6,}",
+        re.IGNORECASE,
+    ),
+]
+
+REDACTED_REPLY = "That last part isn't safe to repeat aloud -- it looked like a credential or secret. Please rotate it if it's real."
+
+
+def redact_sensitive_reply(spoken_reply: str) -> str:
+    """
+    Last-line safety net before anything is spoken or persisted:
+    incident calls routinely involve someone reading a config value,
+    error message, or log line out loud, and any of those can contain a
+    real credential. Applied uniformly to every non-empty spoken_reply in
+    _decide_spoken_reply (see iCall_api.py) right before it's recorded
+    and returned -- covers the direct-quote paths (a tool/log result read
+    back verbatim) and the deterministic-template paths alike, since a
+    template's inputs (facts, hypotheses) still ultimately come from
+    something said on the call.
+    """
+    if not spoken_reply:
+        return spoken_reply
+    for pattern in _SENSITIVE_CONTENT_PATTERNS:
+        if pattern.search(spoken_reply):
+            return REDACTED_REPLY
+    return spoken_reply
+
+
 def build_correction_callout(update: StructuringUpdate) -> str:
     """
     Deterministic, non-LLM-authored line for when a previously recorded
