@@ -200,6 +200,60 @@ class Agent:
         if ilogs_mcp_url:
             mcp_servers.append({"name": "ilogs", "endpoint": ilogs_mcp_url})
 
+        # filler_words was removed entirely (see the interruption block below)
+        # because its only mode at the time -- a static phrase list, fired
+        # unconditionally on every LLM round-trip over response_wait_ms --
+        # fought should_speak_aloud's own gate. The SDK also supports a
+        # "generated" content mode: a *separate*, parallel LLM call (fed only
+        # the last user message, explicitly instructed not to answer it) that
+        # still falls back to the static list on failure/timeout/empty --
+        # mechanically different from what was tested and removed, so this
+        # re-enables it only in generated mode, and only when a real key for
+        # that separate call is actually configured (GEMINI_API_KEY unset ->
+        # filler_words stays off entirely, same as today -- never falls back
+        # to the already-proven-broken static-only behavior).
+        # response_wait_ms=2500 reuses the exact threshold this codebase
+        # already validated (see commit history: 1200ms fired on nearly every
+        # turn, 2500ms only fires when a turn is genuinely slow).
+        filler_words = None
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if gemini_api_key:
+            filler_words = {
+                "enable": True,
+                "trigger": {
+                    "mode": "fixed_time",
+                    "fixed_time_config": {"response_wait_ms": 2500},
+                },
+                "content": {
+                    "mode": "generated",
+                    # Required even in generated mode -- the SDK's own
+                    # fallback tier when the generated call isn't ready,
+                    # fails, or returns empty text.
+                    "static_config": {
+                        "phrases": ["One moment.", "Still with you.", "Just a second."],
+                        "selection_rule": "round_robin",
+                    },
+                    "generated_config": {
+                        "llm_provider": {
+                            # Google's OpenAI-compatible endpoint for Gemini
+                            # (ai.google.dev/gemini-api/docs/openai) -- a
+                            # genuinely separate call from the main iThink
+                            # custom-LLM proxy, per the SDK's own docstring
+                            # ("runs in parallel with the main business LLM").
+                            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                            "api_key": gemini_api_key,
+                            "params": {"model": "gemini-flash-lite-latest"},
+                        },
+                        "prompt": (
+                            "Generate a brief, conversational filler phrase "
+                            "acknowledging you heard the user while you finish "
+                            "thinking. Do not answer their question or "
+                            "restate what they said."
+                        ),
+                    },
+                },
+            }
+
         llm = CustomLLM(
             base_url=os.getenv(
                 "ITHINK_LLM_URL",
@@ -253,7 +307,17 @@ class Agent:
             language="en-IN",
             keyterm=keyterm,
         )
-        tts = MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_captivating_female1")
+        # language_boost="English" is the TTS-side sibling of the STT's own
+        # language="en-IN" above -- same reasoning, opposite direction: it
+        # tells MiniMax's model the output text/jargon (service names, "Watcher")
+        # is English, rather than leaving language detection to guesswork.
+        # Confirmed "English" is a real, documented MiniMax value (not "Hindi" --
+        # the audience is Indian-English speakers, but the spoken text is English).
+        tts = MiniMaxTTS(
+            model="speech_2_6_turbo",
+            voice_id="English_captivating_female1",
+            language_boost="English",
+        )
 
         # Optional BYOK example: replace the STT block above and set DEEPGRAM_API_KEY.
         # stt = DeepgramSTT(api_key=os.getenv("DEEPGRAM_API_KEY"), model="nova-3", language="en")
@@ -314,6 +378,16 @@ class Agent:
                 "action": "think",
                 "content": SILENCE_TRIGGER_MARKER,
             },
+            # Without this, stop() can cut the agent off mid-sentence --
+            # nothing today guarantees it finishes speaking before leaving
+            # the channel. graceful_enabled makes stop() wait for the agent
+            # to reach IDLE (done speaking) before actually exiting, capped
+            # at graceful_timeout_seconds so a stuck/looping agent can't hang
+            # a real stop() call indefinitely.
+            "farewell_config": {
+                "graceful_enabled": True,
+                "graceful_timeout_seconds": 8,
+            },
         }
         if isinstance(output_audio_codec, str) and output_audio_codec.strip():
             parameters["output_audio_codec"] = output_audio_codec.strip()
@@ -323,7 +397,12 @@ class Agent:
             instructions=ADA_PROMPT,
             greeting=self.greeting,
             failure_message="Please wait a moment.",
-            max_history=50,
+            # max_history lives on CustomLLM below (max_history=15), not here --
+            # Agent.__init__'s own max_history/instructions/greeting/failure_message
+            # are documented-deprecated in favor of configuring the LLM/MLLM vendor
+            # directly. A stray max_history=50 here was dead config: it never
+            # governed anything, and its different value (50 vs 15) made it look
+            # like an intentional, larger history window that didn't actually exist.
             turn_detection={
                 # Separate from the STT's own `language` above -- this is
                 # what Agora's own turn-detection/semantic-completeness
@@ -374,7 +453,21 @@ class Agent:
                             # (which naturally sustains) barges in quickly.
                             # Needs live re-testing to confirm; this is a
                             # reasoned adjustment, not a verified fix.
+                            #
+                            # The SDK's vad_config actually has two separate
+                            # interrupt thresholds: interrupt_duration_ms
+                            # (barge-in while the agent is NOT talking) and
+                            # speaking_interrupt_duration_ms (barge-in while
+                            # the agent IS talking -- the exact mic-pop
+                            # scenario the comment above describes). Only the
+                            # first was ever set, so the mic-pop case was
+                            # actually governed by whatever the SDK's own
+                            # default is for the second field, not 350ms.
+                            # Set explicitly to the same value for now --
+                            # same reasoning applies to both, and there's no
+                            # live evidence yet that they should differ.
                             "interrupt_duration_ms": 350,
+                            "speaking_interrupt_duration_ms": 350,
                             "prefix_padding_ms": 300,
                         },
                     },
@@ -461,6 +554,22 @@ class Agent:
                 "enable": True,
                 "mode": "start_of_speech",
             },
+            # Selective Attention Locking, "recognition" mode: identifies
+            # multiple distinct speakers on the call and suppresses only
+            # background/environmental noise -- unlike "locking" mode (which
+            # latches onto a single speaker), this doesn't require picking
+            # one "the" speaker, which matters for a multi-responder incident
+            # bridge where several people are legitimately talking. Needs
+            # advanced_features.enable_sal=True below to actually activate.
+            sal={"sal_mode": "recognition"},
+            filler_words=filler_words,
+            # Locks the Conversational AI Engine to Agora's India servers,
+            # matching the actual audience (en-IN STT/TTS tuning throughout
+            # this file). Deliberate tradeoff, made explicitly rather than
+            # left implicit: this also disables Agora's automatic
+            # cross-region failover, so a regional Agora outage would
+            # hard-error instead of silently falling back elsewhere.
+            geofence={"area": "INDIA"},
             # Removed filler_words entirely -- it's an Agora engine feature
             # that speaks a canned phrase from a static list on a fixed
             # timer, completely independent of chat_completions_endpoint's
@@ -479,7 +588,7 @@ class Agent:
             # actively defeats should_speak_aloud's whole point (stay
             # silent unless there's a real reason) -- dead air while
             # Gemini thinks is fine, humans keep talking through it.
-            advanced_features={"enable_rtm": True, "enable_tools": True},
+            advanced_features={"enable_rtm": True, "enable_tools": True, "enable_sal": True},
             parameters=parameters,
         )
         
