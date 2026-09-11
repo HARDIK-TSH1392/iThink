@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Literal
 
@@ -17,6 +17,19 @@ class IncidentCallRead(BaseModel):
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     created_at: datetime
+
+    # GET /icall/{call_id} 500s on any call whose participant_roles is a
+    # genuine NULL in the DB (confirmed live: 3 of 19 existing rows --
+    # calls that predate infer_and_store_participant_roles ever running
+    # for them). default_factory only fills in a value that's *missing*,
+    # not one explicitly passed as None, so model_validate(call) still
+    # sees the ORM attribute's real None and raises. structured_state has
+    # no NULLs in the current data but gets the same treatment for the
+    # same reason, since nothing prevents one from existing.
+    @field_validator("participant_roles", "structured_state", mode="before")
+    @classmethod
+    def _null_to_empty_dict(cls, value: Any) -> Any:
+        return {} if value is None else value
 
     class Config:
         from_attributes = True
