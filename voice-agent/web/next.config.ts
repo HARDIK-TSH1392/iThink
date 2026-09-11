@@ -15,8 +15,11 @@ const nextConfig: NextConfig = {
   // '*' alone doesn't match here (confirmed live: still blocked) --
   // Next.js's allowedDevOrigins wants a hostname pattern, not a bare
   // wildcard. cloudflared quick tunnels get a new random subdomain every
-  // restart, so a specific hostname breaks every time -- this wildcard
-  // covers any of them without needing to update it per-restart.
+  // restart, so a specific hostname broke every time this was a literal
+  // subdomain -- '*.trycloudflare.com' covers any of them without needing
+  // to update it per-restart (the previous value here was a stale,
+  // one-off subdomain, not actually a wildcard, despite this comment
+  // already describing the wildcard as the intent).
   allowedDevOrigins: ['172.25.231.35', '*.trycloudflare.com'],
 
   // Optimize images
