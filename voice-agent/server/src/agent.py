@@ -6,6 +6,7 @@ High-level API for managing Agora Conversational AI Agents.
 import asyncio
 import logging
 import os
+import random
 import time
 from typing import Any, Dict, Optional
 
@@ -13,7 +14,7 @@ import httpx
 
 from agora_agent import Area, AsyncAgora
 from agora_agent.agentkit import Agent as AgoraAgent
-from agora_agent.agentkit.vendors import CustomLLM, DeepgramSTT, GenericAvatar, MiniMaxTTS, OpenAI
+from agora_agent.agentkit.vendors import CustomLLM, DeepgramSTT, Gemini, GenericAvatar, MiniMaxTTS, OpenAI
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -142,6 +143,13 @@ class Agent:
         # one room, double greeting, duplicate note-taking. One lock per
         # channel keeps unrelated incidents' starts fully concurrent.
         self._channel_locks: Dict[str, asyncio.Lock] = {}
+        # channel_name -> the delegate-avatar agent's own agent_id, when
+        # one is running for that channel (see _start_delegate_avatar_agent).
+        # Tracked separately from _channel_agents (Watcher's own) since the
+        # two are independent agents with independent lifecycles that
+        # nonetheless need to be torn down together (see stop()) -- the
+        # web client only ever learns Watcher's agent_id, never this one.
+        self._channel_delegate_agents: Dict[str, str] = {}
 
     def _get_channel_lock(self, channel_name: str) -> asyncio.Lock:
         lock = self._channel_locks.get(channel_name)
@@ -201,13 +209,27 @@ class Agent:
 
         # Delegate mode: the resolved approver approved but couldn't join,
         # and left notes on what's been done / what to cover (see
-        # iOrchestrate_api's approve_delegate/modal flow). When present,
-        # Watcher opens the call speaking for them instead of the generic
-        # greeting -- this is a per-call override, never mutates
-        # self.greeting, which stays the default for every other call.
+        # iOrchestrate_api's approve_delegate/modal flow). Represented by a
+        # SEPARATE second agent (see _start_delegate_avatar_agent below) --
+        # its own voice, its own face, actually standing in for the absent
+        # lead in the room -- not a change to Watcher's own persona.
+        # Watcher's greeting only gets Watcher-authored (not carrying the
+        # delegate's update itself) when that second agent can't actually
+        # start. That requires BOTH an avatar vendor AND GEMINI_API_KEY
+        # (the second agent's own native LLM, checked again inside
+        # _start_delegate_avatar_agent) -- avatar-only would silently drop
+        # the delegate's notes on the floor: Watcher assumes someone else
+        # is carrying the message, the second agent bails on missing
+        # GEMINI_API_KEY, nobody says it.
         delegate_info = await _fetch_delegate_info(ithink_base, channel_name)
+        avatar_api_key = os.getenv("AVATAR_API_KEY")
+        avatar_api_base_url = os.getenv("AVATAR_API_BASE_URL")
+        avatar_id = os.getenv("AVATAR_ID")
+        avatar_configured = bool(avatar_api_key and avatar_api_base_url and avatar_id)
+        delegate_agent_configured = avatar_configured and bool(os.getenv("GEMINI_API_KEY"))
+
         greeting = self.greeting
-        if delegate_info:
+        if delegate_info and not delegate_agent_configured:
             approver_name = delegate_info.get("approver_name") or "the resolved approver"
             greeting = (
                 f"Hi, this is Watcher. {approver_name} couldn't join today, so I'm standing in "
@@ -635,27 +657,6 @@ class Agent:
             .with_tts(tts)
         )
 
-        # Visual stand-in for the delegating approver, generic (not
-        # photo-based) per the team's own call -- clearly labeled as a
-        # delegate, not an impersonation. Only attaches when both delegate
-        # notes exist for this call AND a real avatar vendor is configured;
-        # no vendor has credentials in this project as of this change, so
-        # this path is real, wired, and completely unverified against a
-        # live render -- same honest caveat as the rest of this file's
-        # degrade-safe integrations. GenericAvatar's required_sample_rate
-        # is 0 (unconstrained), so it never conflicts with MiniMaxTTS's
-        # own sample rate the way Akool/LiveAvatar's hard-locked rates would.
-        avatar_api_key = os.getenv("AVATAR_API_KEY")
-        avatar_api_base_url = os.getenv("AVATAR_API_BASE_URL")
-        avatar_id = os.getenv("AVATAR_ID")
-        if delegate_info and avatar_api_key and avatar_api_base_url and avatar_id:
-            agora_agent = agora_agent.with_avatar(GenericAvatar(
-                api_key=avatar_api_key,
-                api_base_url=avatar_api_base_url,
-                avatar_id=avatar_id,
-                agora_uid=str(agent_uid),
-            ))
-
         # "*" subscribes the agent to every human in the channel, not just
         # whoever's join triggered the start -- remote_rtc_uids only takes a
         # single explicit uid per Agora's docs, so listing multiple uids
@@ -714,10 +715,155 @@ class Agent:
             "agent_uid": str(agent_uid),
         }
         self._channel_agents[channel_name] = (agent_id, result)
+
+        # Delegate avatar: a SECOND, independent agent -- its own voice,
+        # its own face -- joining alongside Watcher, not a change to
+        # Watcher itself. Started after Watcher's own session is
+        # confirmed up, and never allowed to fail the whole call: if this
+        # raises, Watcher has already joined and the call proceeds
+        # without a visual stand-in, same degrade-safe discipline as
+        # every other optional piece in this file.
+        if delegate_info and delegate_agent_configured and channel_name not in self._channel_delegate_agents:
+            try:
+                await self._start_delegate_avatar_agent(channel_name, delegate_info)
+            except Exception:
+                logger.exception(
+                    "Failed to start delegate avatar agent for channel=%s -- "
+                    "Watcher itself is still up and the call proceeds without it",
+                    channel_name,
+                )
+
         return result
 
+    async def _start_delegate_avatar_agent(self, channel_name: str, delegate_info: Dict[str, Any]) -> None:
+        """
+        A SECOND, independent Agora agent representing the delegating
+        approver -- its own voice, its own avatar, its own conversational
+        loop -- joining the room alongside Watcher, not a change to
+        Watcher's own persona or session. Watcher keeps doing its own job
+        (structuring/extraction/redaction/speak-gate) for the whole room,
+        including whatever this agent says; this agent's only job is to
+        open with the delegate's update and actively ask the room for
+        status, in their own conversational back-and-forth -- deliberately
+        NOT given iCall's structuring pipeline, since duplicating that
+        here would mean two agents both trying to extract/gate the same
+        conversation.
+
+        Uses Agora's NATIVE Gemini LLM vendor (not a custom-LLM proxy to
+        our own backend) precisely because this agent doesn't need
+        schema-constrained structured output or a deterministic
+        speak-gate -- ordinary conversational replies are exactly what
+        native mode is for, and building a second backend endpoint to
+        replicate that would be pure overhead.
+
+        Uses its own agent_uid (a fresh random one, same convention
+        server.py already uses for Watcher's) -- reusing Watcher's own
+        uid here was an earlier, wrong iteration of this feature: an
+        avatar attached to Watcher's own session makes the avatar look
+        like Watcher, not an independent stand-in for the absent lead.
+
+        Genuinely unverified against a live call: no avatar vendor has
+        real credentials in this project (this method's caller already
+        gates on avatar_configured, so it never runs without believing
+        it has real credentials, but nothing has ever actually rendered),
+        the native Gemini system_messages shape here (Content-style
+        role/parts) is a best-effort match to Gemini's own API shape, not
+        confirmed against a real request, and the TTS voice_id
+        ("English_magnetic_voiced_man", chosen only to sound distinct
+        from Watcher's own "English_captivating_female1") is unverified
+        against the real MiniMax catalog since no BYOK key exists here
+        either -- same honest caveat as everything else this session
+        gated on credentials that aren't set up yet.
+        """
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_api_key:
+            logger.warning(
+                "GEMINI_API_KEY not set -- cannot start the delegate avatar agent's native LLM for channel=%s",
+                channel_name,
+            )
+            return
+
+        approver_name = delegate_info.get("approver_name") or "the resolved approver"
+        delegate_notes = delegate_info["delegate_notes"]
+
+        greeting = (
+            f"Hi, I'm standing in for {approver_name} today, who couldn't join. "
+            f"Here's their update: {delegate_notes} Now, who's working on what?"
+        )
+        system_prompt = (
+            f"You are a stand-in representative for {approver_name}, who approved this "
+            f"incident but couldn't personally join the call. Their own update on what "
+            f"they've done and what they want covered: \"{delegate_notes}\"\n\n"
+            "Open the conversation with that update, in your own words but faithful to "
+            "what they said. Then actively ask the other participants for status -- what "
+            "each of them is working on, what's blocking them, what's still unclear. "
+            "Respond naturally when addressed, as if relaying on their behalf. You are "
+            "NOT responsible for tracking facts, decisions, or action items -- a separate "
+            "system on this call already does that; your only job is representing "
+            f"{approver_name} and keeping the conversation moving. Keep turns brief and "
+            "conversational, not a formal report."
+        )
+
+        avatar_agent_uid = random.randint(10000000, 99999999)
+
+        stt = DeepgramSTT(model="nova-3", language="en-IN")
+        llm = Gemini(
+            api_key=gemini_api_key,
+            model="gemini-flash-lite-latest",
+            system_messages=[{"role": "user", "parts": [{"text": system_prompt}]}],
+            greeting_message=greeting,
+        )
+        tts = MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_magnetic_voiced_man")
+
+        delegate_agent = (
+            AgoraAgent(
+                client=self.client,
+                instructions=system_prompt,
+                greeting=greeting,
+                failure_message="One moment.",
+                interruption={"enable": True, "mode": "start_of_speech"},
+                advanced_features={"enable_rtm": True},
+            )
+            .with_stt(stt)
+            .with_llm(llm)
+            .with_tts(tts)
+            .with_avatar(GenericAvatar(
+                api_key=os.getenv("AVATAR_API_KEY"),
+                api_base_url=os.getenv("AVATAR_API_BASE_URL"),
+                avatar_id=os.getenv("AVATAR_ID"),
+                agora_uid=str(avatar_agent_uid),
+            ))
+        )
+
+        session = delegate_agent.create_async_session(
+            channel=channel_name,
+            agent_uid=str(avatar_agent_uid),
+            remote_uids=["*"],
+            enable_string_uid=False,
+            idle_timeout=30,
+            expires_in=3600,
+        )
+
+        logger.info(
+            "Starting delegate avatar agent channel=%s agent_uid=%s", channel_name, avatar_agent_uid
+        )
+        agent_id = await session.start()
+        self._sessions[agent_id] = session
+        self._channel_delegate_agents[channel_name] = agent_id
+        logger.info("Started delegate avatar agent agent_id=%s channel=%s", agent_id, channel_name)
+
     async def stop(self, agent_id: str) -> None:
-        """Stop a running agent. Falls back to the stateless client path."""
+        """
+        Stop a running agent. Falls back to the stateless client path.
+
+        The web client only ever learns Watcher's own agent_id (see
+        result["agent_id"] in _start_locked) -- it has no way to ask for
+        the delegate avatar agent specifically. So stopping Watcher for a
+        channel also stops that channel's delegate avatar agent, if one
+        is running, keeping "End Conversation" a single action from the
+        caller's side even though two independent agents may be in the
+        room.
+        """
         if not agent_id or not str(agent_id).strip():
             raise ValueError("agent_id is required and cannot be empty")
 
@@ -726,6 +872,16 @@ class Agent:
         ]
         for channel in stale_channels:
             self._channel_agents.pop(channel, None)
+            delegate_agent_id = self._channel_delegate_agents.pop(channel, None)
+            if delegate_agent_id:
+                try:
+                    await self.stop(delegate_agent_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to stop delegate avatar agent agent_id=%s for channel=%s",
+                        delegate_agent_id,
+                        channel,
+                    )
 
         session = self._sessions.pop(agent_id, None)
         if session:
