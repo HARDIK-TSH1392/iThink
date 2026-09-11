@@ -612,14 +612,18 @@ class Agent:
                 "enable": True,
                 "mode": "start_of_speech",
             },
-            # Selective Attention Locking, "recognition" mode: identifies
-            # multiple distinct speakers on the call and suppresses only
-            # background/environmental noise -- unlike "locking" mode (which
-            # latches onto a single speaker), this doesn't require picking
-            # one "the" speaker, which matters for a multi-responder incident
-            # bridge where several people are legitimately talking. Needs
-            # advanced_features.enable_sal=True below to actually activate.
-            sal={"sal_mode": "recognition"},
+            # Selective Attention Locking left OFF (see advanced_features
+            # below): "recognition" mode requires a pre-registered
+            # voiceprint sample per speaker (sal.sample_urls, a 10-15s
+            # 16kHz mono PCM file) -- confirmed live, Agora rejects the
+            # whole start_agent call with InvalidModuleParameter when
+            # sal_mode is "recognition" and sample_urls is empty, which it
+            # always is here since there's no per-responder voiceprint
+            # enrollment step in this system. "locking" mode doesn't need
+            # sample_urls but isn't a real alternative either -- it latches
+            # onto ONE speaker and blocks ~95% of other human voices, which
+            # would suppress the other legitimate responders on exactly the
+            # multi-responder incident bridge this was meant to help.
             filler_words=filler_words,
             # Locks the Conversational AI Engine to Agora's India servers,
             # matching the actual audience (en-IN STT/TTS tuning throughout
@@ -646,7 +650,7 @@ class Agent:
             # actively defeats should_speak_aloud's whole point (stay
             # silent unless there's a real reason) -- dead air while
             # Gemini thinks is fine, humans keep talking through it.
-            advanced_features={"enable_rtm": True, "enable_tools": True, "enable_sal": True},
+            advanced_features={"enable_rtm": True, "enable_tools": True},
             parameters=parameters,
         )
         

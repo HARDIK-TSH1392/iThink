@@ -14,10 +14,21 @@ const nextConfig: NextConfig = {
   // machine's LAN adapter rather than relying on this committed value.
   // '*' alone doesn't match here (confirmed live: still blocked) --
   // Next.js's allowedDevOrigins wants a hostname pattern, not a bare
-  // wildcard. cloudflared quick tunnels get a new random subdomain every
-  // restart, so a specific hostname breaks every time -- this wildcard
-  // covers any of them without needing to update it per-restart.
-  allowedDevOrigins: ['172.25.231.35', '*.trycloudflare.com'],
+  // wildcard. Tunnel URLs get a new random subdomain every restart, so a
+  // specific hostname breaks every time -- these wildcards cover any of
+  // them without needing to update it per-restart. Without the domain
+  // actually in use here, Next.js silently blocks the dev server's own
+  // JS chunk/asset requests -- the page's static HTML still loads, but it
+  // never hydrates: no interactivity, no animation, no client-side fetch
+  // calls firing at all (confirmed live -- this is exactly what happened
+  // switching to ngrok without updating this list).
+  allowedDevOrigins: [
+    '172.25.231.35',
+    '*.trycloudflare.com',
+    '*.ngrok-free.dev',
+    '*.ngrok-free.app',
+    '*.loca.lt',
+  ],
 
   // Optimize images
   images: {
