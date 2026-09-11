@@ -13,7 +13,7 @@ import httpx
 
 from agora_agent import Area, AsyncAgora
 from agora_agent.agentkit import Agent as AgoraAgent
-from agora_agent.agentkit.vendors import CustomLLM, DeepgramSTT, MiniMaxTTS, OpenAI
+from agora_agent.agentkit.vendors import CustomLLM, DeepgramSTT, GenericAvatar, MiniMaxTTS, OpenAI
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -72,6 +72,26 @@ async def _fetch_keyterms(ithink_base: str, channel_name: str) -> Optional[str]:
             return response.json().get("data", {}).get("keyterm")
     except Exception:
         logger.warning("Failed to fetch keyterms for channel=%s", channel_name, exc_info=True)
+        return None
+
+
+async def _fetch_delegate_info(ithink_base: str, channel_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Delegate-mode notes for this call (see iCall_api's GET .../delegate) --
+    set when the resolved approver approved but couldn't personally join
+    (iOrchestrate's approve_delegate/modal flow). Same best-effort
+    degrade-safe shape as _fetch_keyterms: a slow/unreachable backend, or
+    simply no delegate notes for this call (the common case), both just
+    mean the normal greeting/no-avatar path runs.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(f"{ithink_base}/icall/channel/{channel_name}/delegate")
+            response.raise_for_status()
+            data = response.json().get("data", {})
+            return data if data.get("delegate_notes") else None
+    except Exception:
+        logger.warning("Failed to fetch delegate info for channel=%s", channel_name, exc_info=True)
         return None
 
 
@@ -179,6 +199,22 @@ class Agent:
         # STT/TTS stay on managed defaults — only the LLM step is ours.
         ithink_base = os.getenv("ITHINK_BACKEND_BASE_URL", "http://127.0.0.1:8123/api/v1")
 
+        # Delegate mode: the resolved approver approved but couldn't join,
+        # and left notes on what's been done / what to cover (see
+        # iOrchestrate_api's approve_delegate/modal flow). When present,
+        # Watcher opens the call speaking for them instead of the generic
+        # greeting -- this is a per-call override, never mutates
+        # self.greeting, which stays the default for every other call.
+        delegate_info = await _fetch_delegate_info(ithink_base, channel_name)
+        greeting = self.greeting
+        if delegate_info:
+            approver_name = delegate_info.get("approver_name") or "the resolved approver"
+            greeting = (
+                f"Hi, this is Watcher. {approver_name} couldn't join today, so I'm standing in "
+                f"for them. Here's their update: {delegate_info['delegate_notes']} "
+                f"Now, let's go around -- who's working on what?"
+            )
+
         # Native MCP tool-calling -- Agora's platform calls these MCP
         # servers directly and forwards real OpenAI-style `tools`/
         # `tool_choice` to our custom LLM endpoint (confirmed live: only
@@ -261,7 +297,7 @@ class Agent:
             ),
             api_key=os.getenv("ITHINK_LLM_API_KEY", "unused"),
             model="ithink-proxy",
-            greeting_message=self.greeting,
+            greeting_message=greeting,
             failure_message="Please wait a moment.",
             max_history=15,
             max_tokens=1024,
@@ -395,7 +431,7 @@ class Agent:
         agora_agent = AgoraAgent(
             client=self.client,
             instructions=ADA_PROMPT,
-            greeting=self.greeting,
+            greeting=greeting,
             failure_message="Please wait a moment.",
             # max_history lives on CustomLLM below (max_history=15), not here --
             # Agent.__init__'s own max_history/instructions/greeting/failure_message
@@ -598,6 +634,27 @@ class Agent:
             .with_llm(llm)
             .with_tts(tts)
         )
+
+        # Visual stand-in for the delegating approver, generic (not
+        # photo-based) per the team's own call -- clearly labeled as a
+        # delegate, not an impersonation. Only attaches when both delegate
+        # notes exist for this call AND a real avatar vendor is configured;
+        # no vendor has credentials in this project as of this change, so
+        # this path is real, wired, and completely unverified against a
+        # live render -- same honest caveat as the rest of this file's
+        # degrade-safe integrations. GenericAvatar's required_sample_rate
+        # is 0 (unconstrained), so it never conflicts with MiniMaxTTS's
+        # own sample rate the way Akool/LiveAvatar's hard-locked rates would.
+        avatar_api_key = os.getenv("AVATAR_API_KEY")
+        avatar_api_base_url = os.getenv("AVATAR_API_BASE_URL")
+        avatar_id = os.getenv("AVATAR_ID")
+        if delegate_info and avatar_api_key and avatar_api_base_url and avatar_id:
+            agora_agent = agora_agent.with_avatar(GenericAvatar(
+                api_key=avatar_api_key,
+                api_base_url=avatar_api_base_url,
+                avatar_id=avatar_id,
+                agora_uid=str(agent_uid),
+            ))
 
         # "*" subscribes the agent to every human in the channel, not just
         # whoever's join triggered the start -- remote_rtc_uids only takes a
