@@ -239,6 +239,28 @@ def redact_sensitive_reply(spoken_reply: str) -> str:
     return spoken_reply
 
 
+def format_related_incident_note(past_incident: Any) -> str:
+    """
+    One-line context note for a resolved incident on the same service/
+    region, looked up once at call creation (see iCall_service.
+    get_or_create_call) and stored in structured_state["related_incident_note"]
+    -- every incident call starts with zero memory of past incidents on
+    the exact same service/region today, even when one exists. Deliberately
+    just a pointer (title/priority/when), not the past incident's own
+    facts/decisions -- pulling those in verbatim risks the model treating
+    an unrelated past cause as this incident's own confirmed fact, the
+    same "never invent/assume" discipline as everywhere else in this file.
+    """
+    when = past_incident.resolved_at or past_incident.created_at
+    when_str = when.strftime("%Y-%m-%d") if when else "an earlier date"
+    priority = f"{past_incident.priority} " if past_incident.priority else ""
+    return (
+        f"Note: this service/region had a resolved {priority}incident on {when_str} "
+        f"(\"{past_incident.title}\"). Mention this only if directly relevant to what's "
+        "being discussed -- don't assume the same cause without evidence from this call."
+    )
+
+
 def build_correction_callout(update: StructuringUpdate) -> str:
     """
     Deterministic, non-LLM-authored line for when a previously recorded
@@ -783,10 +805,15 @@ def _build_structuring_prompt(
         if tool_result_text
         else ""
     )
+    # Looked up once at call creation, not every turn (see
+    # iCall_service.get_or_create_call) -- just read back from
+    # existing_state here, no extra query per turn.
+    related_note = existing_state.get("related_incident_note") if existing_state else None
+    related_section = f"\n{related_note}\n" if related_note else ""
     return f"""Incident state recorded so far (facts/hypotheses/decisions already
 confirmed in this call — use this to detect contradictions, not to repeat):
 {existing_state}
-{incident_context_section}{deploy_section}{tool_section}
+{incident_context_section}{related_section}{deploy_section}{tool_section}
 Conversation so far:
 {conversation}
 

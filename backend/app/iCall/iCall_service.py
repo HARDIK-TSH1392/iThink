@@ -6,13 +6,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from typing import Dict, List, Optional
 
-from app.iNcidents.iNcidents_crudl import get_incident
+from app.iNcidents.iNcidents_crudl import get_incident, list_incidents
+from app.iNcidents.iNcidents_utils import STATUS_RESOLVED
 from app.iDirectory.iDirectory_crudl import find_employee_by_name
 
 from .iCall_model import IncidentCall, CallUtterance, AgentUtterance
 from .iCall_schema import CallUtteranceCreate, StructuringUpdate
 from .iCall_utils import (
     generate_channel_name,
+    format_related_incident_note,
     classify_participant_roles,
     assign_action_item_owners,
     summarize_unresolved_risks,
@@ -95,11 +97,26 @@ async def get_or_create_call(db: AsyncSession, incident_id: int) -> IncidentCall
         if incident is None:
             raise IncidentNotFoundError(f"Incident {incident_id} not found")
 
+        # Cross-incident memory: every call starts fresh today even when
+        # the exact same service/region had a resolved incident before --
+        # looked up once here (not every turn, unlike service/region
+        # grounding above which is cheap and already refetched per turn)
+        # since a call's whole duration won't change which past incident
+        # is most recent, and stored directly on the new row so later
+        # turns just read it back with no extra query.
+        initial_state: dict = {}
+        past_incidents = await list_incidents(
+            db, status=STATUS_RESOLVED, region=incident.region, service=incident.service, limit=5,
+        )
+        related = next((i for i in past_incidents if i.id != incident_id), None)
+        if related is not None:
+            initial_state["related_incident_note"] = format_related_incident_note(related)
+
         call = IncidentCall(
             incident_id=incident_id,
             channel_name=generate_channel_name(incident_id),
             status=CALL_STATUS_SCHEDULED,
-            structured_state={},
+            structured_state=initial_state,
         )
         db.add(call)
         await db.commit()
