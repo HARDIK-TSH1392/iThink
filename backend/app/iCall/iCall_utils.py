@@ -155,10 +155,27 @@ MALFORMED_RESPONSE_FALLBACK = "Sorry, could you say that again?"
 # reason to transcribe distinctly from the hedge phrase "I think", which is
 # why direct-address detection used to require "hey" alongside it just to
 # stay rare enough not to fire on ordinary sentences ("I think the DB is
-# fine"). "Watcher" is an ordinary, distinct English word STT transcribes
-# reliably on its own, so that workaround is gone -- addressing it by name,
-# alone, is now enough.
+# fine"). "Watcher" is an ordinary, distinct English word -- but that
+# doesn't mean STT transcribes it reliably. Confirmed live across two real
+# calls (incident-46, incident-55): asked for roughly 15 times combined,
+# it came back correct only ~25-30% of the time, misheard as "Voucher" /
+# "Vajar" / "Vucher" / "Voacher" / "Vacher" / "Varcher" the rest. Keyterm
+# boosting would fix the acoustic mishearing directly, but re-enabling it
+# reproduces a worse bug (see build_keyterms / agent.py's revert history:
+# it breaks transcription entirely on this pipeline, empty content on most
+# turns). Can't fix Deepgram's ear, so instead of not hearing our own name
+# at all, recognize its own most common mistakes -- a real, if inelegant,
+# fix for the actual practical problem.
 AGENT_NAME = "Watcher"
+
+# The known mis-hearings above, kept as their own list (rather than baked
+# into the regex inline) so QuickstartTranscriptPanel.tsx on the frontend
+# can mirror the same corrections for DISPLAY purposes -- the backend
+# recognizing "Voucher" as a valid wake word doesn't change what text
+# Deepgram actually produced, so without a matching frontend fix the
+# transcript panel would keep showing the wrong word even while the agent
+# correctly responds to it. Keep both lists in sync if this list changes.
+_KNOWN_MISHEARINGS = ("voucher", "vajar", "vucher", "voacher", "vacher", "varcher")
 
 # Case-insensitive, whole-word match: also answers to "agent" (the generic,
 # obvious way to address an AI assistant on a call -- confirmed live,
@@ -168,9 +185,12 @@ AGENT_NAME = "Watcher"
 # to it) is a worse failure than an occasional false accept from ordinary
 # use of the word "agent" -- see the wake-word FRR/FAR tradeoff this is
 # modeled on: in a live incident room, being ignored erodes trust faster
-# than an extra reply does.
+# than an extra reply does. Same asymmetry justifies accepting the known
+# mishearings too, despite the (low) risk of one of them appearing in
+# unrelated speech.
 _ADDRESS_PATTERN = re.compile(
-    r"\b(" + re.escape(AGENT_NAME.lower()) + r"|agent)\b", re.IGNORECASE
+    r"\b(" + re.escape(AGENT_NAME.lower()) + r"|agent|" + "|".join(_KNOWN_MISHEARINGS) + r")\b",
+    re.IGNORECASE,
 )
 
 
