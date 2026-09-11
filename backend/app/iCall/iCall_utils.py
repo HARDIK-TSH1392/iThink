@@ -406,6 +406,19 @@ Hard constraints:
   conflict -- do both when both apply. Phrase the conflict itself as one
   short, targeted clarifying question you would ask out loud -- not a
   statement, not an accusation.
+  Do NOT raise a conflict about something the facts list you were given
+  below has already settled. STT often splits one continuous correction
+  across several turns (e.g. "APAC." then, separately, "hey I mean EU
+  Central was wrong too") -- if the facts list already contains the
+  corrected answer and no longer contains the old one, a later fragment
+  that's just finishing that same thought is not new information to
+  question, even if it reads ambiguously on its own. Confirmed live
+  (incident-55, 2026-09-10): the room heard "Update: APAC. Earlier: EU
+  Central." immediately followed nine seconds later by "So is the region
+  EU Central or APAC?" -- re-litigating something already resolved one
+  turn earlier, confusing rather than clarifying. Only raise a conflict
+  here for a genuinely new contradiction the facts list doesn't already
+  reflect.
 - corrects_fact (optional): set this to the EXACT text of an existing fact
   from the state given below, only when something said in THIS turn
   directly resolves a contradiction as the room's now-confirmed answer

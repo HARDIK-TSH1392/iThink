@@ -112,4 +112,18 @@ FIXTURES = [
             {"speaker": "B", "text": "so, like,", "expect": {}},
         ],
     },
+    {
+        "call_id": 46,
+        "channel": "incident-55",
+        "description": "Real correction/conflict collision (2026-09-10): a genuine correction (EU Central -> APAC) got spoken correctly, but a later STT-fragmented turn re-raised the already-resolved region as a new conflict nine seconds later -- confusing, since the room had just heard it settled. Guards the prompt fix telling the model not to reopen something the given facts list already reflects.",
+        "turns": [
+            {"speaker": "B", "text": "What region is this even in?", "expect": {"missing_info_expected": True}},
+            {"speaker": "A", "text": "Hold on. It's the EU Central region.",
+             "expect": {"key_terms_in_facts": ["eu central"]}},
+            {"speaker": "A", "text": "Hey, actually, I'm saying it's APAC. EU Central was wrong.",
+             "expect": {"corrects_fact_expected": True, "corrects_fact_should_reference": "EU Central"}},
+            {"speaker": "A", "text": "Yeah, EU Central was wrong too, like I said.",
+             "expect": {"conflict_expected": False}},  # facts list already says APAC -- must not reopen as a new conflict
+        ],
+    },
 ]
