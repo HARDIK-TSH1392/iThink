@@ -49,6 +49,7 @@ import {
 import { MicButtonWithVisualizer } from "agora-agent-uikit/rtc";
 import AgoraRTC, {
 	RemoteUser,
+	type IAgoraRTCRemoteUser,
 	type UID,
 	useClientEvent,
 	useJoin,
@@ -146,6 +147,16 @@ export default function ConversationComponent({
 }: ConversationComponentProps) {
 	const client = useRTCClient();
 	const remoteUsers = useRemoteUsers();
+
+	// Temporary diagnostic hook -- exposes the live remoteUsers list on
+	// window for console inspection while debugging why the delegate
+	// avatar's audio isn't playing despite its RTC user showing connected.
+	// Remove once resolved.
+	useEffect(() => {
+		(window as unknown as { __debugRemoteUsers?: typeof remoteUsers }).__debugRemoteUsers =
+			remoteUsers;
+	}, [remoteUsers]);
+
 	const [isEnabled, setIsEnabled] = useState(true);
 	const [isAgentConnected, setIsAgentConnected] = useState(false);
 	const [isConnectionDetailsOpen, setIsConnectionDetailsOpen] = useState(false);
@@ -974,6 +985,23 @@ export default function ConversationComponent({
 		setAudioPlaybackBlocked(false);
 	}, [remoteUsers]);
 
+	// A second (or later) remote user joining mid-call -- e.g. the
+	// delegate avatar agent joining after Watcher -- gets its own new
+	// audio element, which can independently lose the same autoplay race
+	// RemoteUser's own automatic play() already has, even after the
+	// user's initial join click unblocked the first one. Retrying
+	// immediately whenever the remote-user list changes, rather than
+	// only after the "Click to enable audio playback" banner shows and
+	// is noticed, usually succeeds silently since most browsers only
+	// gate the *first* autoplay attempt per tab on a user gesture.
+	useEffect(() => {
+		for (const user of remoteUsers) {
+			if (user.audioTrack && !user.audioTrack.isPlaying) {
+				user.audioTrack.play();
+			}
+		}
+	}, [remoteUsers]);
+
 	const handleEndConversation = useCallback(async () => {
 		const track = localMicrophoneTrack;
 		if (track) {
@@ -1041,11 +1069,34 @@ export default function ConversationComponent({
 						className="relative flex h-full min-h-[20rem] w-full max-w-4xl flex-col items-center justify-center gap-6"
 						aria-label="AI agent status visualization"
 					>
-						{remoteUsers.map((user) => (
-							<div key={user.uid} className="hidden">
-								<RemoteUser user={user} />
-							</div>
-						))}
+						{remoteUsers
+							.filter((user) => !user.hasVideo)
+							.map((user) => (
+								// display:none (Tailwind's "hidden") silently breaks
+								// playback for any participant carrying video -- confirmed
+								// live, browsers routinely refuse to decode/play a <video>
+								// element, audio included, once it or an ancestor has
+								// display:none, even though an audio-only participant
+								// (Watcher, a plain <audio> element) plays fine under the
+								// same wrapper. Kept in the actual render flow via the
+								// classic visually-hidden technique instead. Only
+								// audio-only users land here now -- anyone with video
+								// (e.g. the delegate avatar's Anam stream) gets a real,
+								// visible tile in the participant grid below instead.
+								<div
+									key={user.uid}
+									style={{
+										position: "absolute",
+										width: 1,
+										height: 1,
+										overflow: "hidden",
+										clip: "rect(0,0,0,0)",
+										whiteSpace: "nowrap",
+									}}
+								>
+									<RemoteUser user={user} />
+								</div>
+							))}
 
 						{/* Meet/Zoom-style participant grid. No video (audio-only call) --
 						    each tile is an avatar circle + label, with a pulsing ring while
@@ -1068,6 +1119,8 @@ export default function ConversationComponent({
 										speaking: speakingUids.has(String(localUid)) && isEnabled,
 										muted: !isEnabled,
 										handRaised: raisedHandUids.has(String(localUid)),
+										hasVideo: false,
+										videoUser: undefined as IAgoraRTCRemoteUser | undefined,
 									},
 									...remoteUsers.map((user) => {
 										const isAgent = String(user.uid) === String(agentUID);
@@ -1088,6 +1141,12 @@ export default function ConversationComponent({
 											// actual meeting members.
 											muted: isAgent ? false : remoteMutedUids.has(String(user.uid)),
 											handRaised: isAgent ? false : raisedHandUids.has(String(user.uid)),
+											// Only the delegate avatar (Anam) carries video today --
+											// Watcher and human participants never do. Rendered as a
+											// real, visible tile (see below) instead of the plain
+											// avatar-initial circle when true.
+											hasVideo: user.hasVideo,
+											videoUser: user,
 										};
 									}),
 								];
@@ -1099,12 +1158,23 @@ export default function ConversationComponent({
 									>
 										<div className="relative">
 											<div
-												className={`flex h-24 w-24 items-center justify-center rounded-full font-medium transition-shadow ${
+												className={`flex h-24 w-24 items-center justify-center overflow-hidden rounded-full font-medium transition-shadow ${
 													tile.isAgent ? "bg-primary/15 text-primary" : "bg-muted text-foreground"
 												} ${tile.speaking ? "ring-4 ring-primary/70 animate-pulse" : ""}`}
 											aria-hidden="true"
 										>
-											{tile.isAgent ? (
+											{tile.hasVideo && tile.videoUser ? (
+												// A real, visible video tile -- today only the
+												// delegate avatar (Anam) carries video. RemoteUser
+												// also handles this user's audio, so it's NOT
+												// duplicated in the hidden audio-only block above.
+												<RemoteUser
+													user={tile.videoUser}
+													playVideo
+													playAudio
+													className="video-tile h-full w-full"
+												/>
+											) : tile.isAgent ? (
 												<Sparkles className="h-9 w-9" strokeWidth={1.75} />
 											) : (
 												<span className="text-3xl">{getInitial(tile.avatarName)}</span>

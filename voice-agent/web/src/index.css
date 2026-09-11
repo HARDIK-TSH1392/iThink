@@ -177,3 +177,13 @@ body {
 		max-height: 3.5rem;
 	}
 }
+
+/* RemoteUser (agora-rtc-react) creates its own <video> element internally --
+   its className/style props only reach the wrapping div, not that inner
+   element, so the video itself needs a direct rule to actually fill the
+   circular participant tile instead of rendering at its native size. */
+.video-tile video {
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+}

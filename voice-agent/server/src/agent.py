@@ -14,7 +14,8 @@ import httpx
 
 from agora_agent import Area, AsyncAgora
 from agora_agent.agentkit import Agent as AgoraAgent
-from agora_agent.agentkit.vendors import CustomLLM, DeepgramSTT, Gemini, GenericAvatar, MiniMaxTTS, OpenAI
+from agora_agent.agentkit.token import generate_convo_ai_token
+from agora_agent.agentkit.vendors import AnamAvatar, CustomLLM, DeepgramSTT, Gemini, MiniMaxTTS, OpenAI
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -99,11 +100,17 @@ async def _fetch_delegate_info(ithink_base: str, channel_name: str) -> Optional[
 class Agent:
     """
     High-level wrapper for Agora Conversational AI Agent operations.
-    
+
     Uses AgentSession for full lifecycle management (start/stop),
     which handles Token007 authentication automatically.
     """
-    
+
+    # How long the delegate avatar agent waits before joining/greeting,
+    # so it speaks after Watcher's own short default greeting instead of
+    # over it (see _start_delegate_avatar_agent) -- a rough heuristic, not
+    # a measured value, since Agora has no native cross-agent turn signal.
+    DELEGATE_AVATAR_START_DELAY_SECONDS = 6
+
     def __init__(self):
         self.app_id = os.getenv("AGORA_APP_ID")
         self.app_certificate = os.getenv("AGORA_APP_CERTIFICATE")
@@ -222,10 +229,12 @@ class Agent:
         # is carrying the message, the second agent bails on missing
         # GEMINI_API_KEY, nobody says it.
         delegate_info = await _fetch_delegate_info(ithink_base, channel_name)
-        avatar_api_key = os.getenv("AVATAR_API_KEY")
-        avatar_api_base_url = os.getenv("AVATAR_API_BASE_URL")
-        avatar_id = os.getenv("AVATAR_ID")
-        avatar_configured = bool(avatar_api_key and avatar_api_base_url and avatar_id)
+        # Anam is a first-class Agora vendor (unlike GenericAvatar), so
+        # there's no api_base_url to configure -- Agora's own backend
+        # already knows how to reach it.
+        anam_api_key = os.getenv("ANAM_API_KEY")
+        anam_avatar_id = os.getenv("ANAM_AVATAR_ID")
+        avatar_configured = bool(anam_api_key and anam_avatar_id)
         delegate_agent_configured = avatar_configured and bool(os.getenv("GEMINI_API_KEY"))
 
         greeting = self.greeting
@@ -298,7 +307,20 @@ class Agent:
                             # genuinely separate call from the main iThink
                             # custom-LLM proxy, per the SDK's own docstring
                             # ("runs in parallel with the main business LLM").
+                            #
+                            # Both base_url and url set: confirmed live, this
+                            # installed SDK's own type hints (Fern-generated,
+                            # pydantic model) say the field is base_url, but
+                            # Agora's actual REST API rejects the request with
+                            # InvalidFieldValue demanding
+                            # properties.filler_words.content.generated_config
+                            # .llm_provider.url specifically -- the SDK's
+                            # client-side types are stale relative to the live
+                            # API here. Sending both costs nothing (extra
+                            # fields are allowed) and survives either being
+                            # the one actually read server-side.
                             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                            "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                             "api_key": gemini_api_key,
                             "params": {"model": "gemini-flash-lite-latest"},
                         },
@@ -722,24 +744,42 @@ class Agent:
 
         # Delegate avatar: a SECOND, independent agent -- its own voice,
         # its own face -- joining alongside Watcher, not a change to
-        # Watcher itself. Started after Watcher's own session is
-        # confirmed up, and never allowed to fail the whole call: if this
-        # raises, Watcher has already joined and the call proceeds
-        # without a visual stand-in, same degrade-safe discipline as
-        # every other optional piece in this file.
+        # Watcher itself. Launched as a background task, NOT awaited here:
+        # this method's caller is the actual /startAgent HTTP request, and
+        # the delegate avatar's own start includes a deliberate delay (see
+        # _start_delegate_avatar_agent) so it speaks after Watcher's own
+        # greeting instead of talking over it -- awaiting that inline would
+        # hold up the whole call from starting for that same delay, which
+        # is worse than the caller getting a response the moment Watcher
+        # itself is confirmed up. Never allowed to fail the whole call
+        # either way: if this raises, Watcher has already joined and the
+        # call proceeds without a visual stand-in, same degrade-safe
+        # discipline as every other optional piece in this file.
         if delegate_info and delegate_agent_configured and channel_name not in self._channel_delegate_agents:
-            try:
-                await self._start_delegate_avatar_agent(channel_name, delegate_info)
-            except Exception:
-                logger.exception(
-                    "Failed to start delegate avatar agent for channel=%s -- "
-                    "Watcher itself is still up and the call proceeds without it",
-                    channel_name,
-                )
+            asyncio.create_task(
+                self._start_delegate_avatar_agent_safely(channel_name, delegate_info, user_uid)
+            )
 
         return result
 
-    async def _start_delegate_avatar_agent(self, channel_name: str, delegate_info: Dict[str, Any]) -> None:
+    async def _start_delegate_avatar_agent_safely(
+        self, channel_name: str, delegate_info: Dict[str, Any], user_uid: int
+    ) -> None:
+        """Fire-and-forget wrapper: create_task swallows exceptions silently
+        unless something awaits the task or checks its result, so this is
+        the one place that actually logs a failure here."""
+        try:
+            await self._start_delegate_avatar_agent(channel_name, delegate_info, user_uid)
+        except Exception:
+            logger.exception(
+                "Failed to start delegate avatar agent for channel=%s -- "
+                "Watcher itself is still up and the call proceeds without it",
+                channel_name,
+            )
+
+    async def _start_delegate_avatar_agent(
+        self, channel_name: str, delegate_info: Dict[str, Any], user_uid: int
+    ) -> None:
         """
         A SECOND, independent Agora agent representing the delegating
         approver -- its own voice, its own avatar, its own conversational
@@ -766,18 +806,30 @@ class Agent:
         avatar attached to Watcher's own session makes the avatar look
         like Watcher, not an independent stand-in for the absent lead.
 
-        Genuinely unverified against a live call: no avatar vendor has
-        real credentials in this project (this method's caller already
-        gates on avatar_configured, so it never runs without believing
-        it has real credentials, but nothing has ever actually rendered),
-        the native Gemini system_messages shape here (Content-style
-        role/parts) is a best-effort match to Gemini's own API shape, not
-        confirmed against a real request, and the TTS voice_id
-        ("English_magnetic_voiced_man", chosen only to sound distinct
-        from Watcher's own "English_captivating_female1") is unverified
-        against the real MiniMax catalog since no BYOK key exists here
-        either -- same honest caveat as everything else this session
-        gated on credentials that aren't set up yet.
+        Uses Anam (ANAM_API_KEY/ANAM_AVATAR_ID), a first-class Agora
+        avatar vendor -- not GenericAvatar, which this was originally
+        built against before real avatar credentials existed anywhere in
+        this project. Anam needs no api_base_url (Agora's backend already
+        knows how to reach it) and no agora_uid on the avatar config
+        itself (unlike GenericAvatar, which requires one); the RTC join
+        details are handled entirely on Agora's side for a named vendor.
+
+        Still not fully verified end-to-end: the native Gemini
+        system_messages shape here (Content-style role/parts) is a
+        best-effort match to Gemini's own API shape, and the TTS voice_id
+        ("English_magnetic_voiced_man") is unverified against the real
+        MiniMax catalog since no BYOK key exists here either.
+
+        Delayed START_DELAY_SECONDS before actually starting: confirmed
+        live, with no delay this agent's own greeting starts almost the
+        same instant Watcher's does, so they talk over each other instead
+        of the avatar speaking after Watcher's intro. Agora has no native
+        primitive for sequencing two independent agents' turns (RTM
+        pub/sub is the general mechanism suggested for agent coordination,
+        but there's no ready-made "wait for the other agent to finish"
+        signal) -- this is a fixed-delay heuristic sized to roughly how
+        long Watcher's own short default greeting takes to speak, not a
+        measured or guaranteed handoff.
         """
         gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not gemini_api_key:
@@ -786,6 +838,8 @@ class Agent:
                 channel_name,
             )
             return
+
+        await asyncio.sleep(self.DELEGATE_AVATAR_START_DELAY_SECONDS)
 
         approver_name = delegate_info.get("approver_name") or "the resolved approver"
         delegate_notes = delegate_info["delegate_notes"]
@@ -811,13 +865,56 @@ class Agent:
         avatar_agent_uid = random.randint(10000000, 99999999)
 
         stt = DeepgramSTT(model="nova-3", language="en-IN")
+        # url overridden to Gemini's non-streaming generateContent endpoint
+        # (dropping streamGenerateContent?alt=sse, which this vendor class
+        # hardcodes by default). Root cause per Agora's own optimize-latency
+        # doc: streaming forwards each sentence to TTS/avatar rendering as
+        # soon as it's ready, which is exactly the mute/unmute-every-chunk
+        # pattern confirmed live in the browser console (audio+video both
+        # cut out and back in together every ~2-3s, matching a per-sentence
+        # publish cycle). Non-streaming waits for Gemini's complete response
+        # before handing it to TTS/avatar, trading a bit of initial latency
+        # (acceptable here -- this agent already waits
+        # DELEGATE_AVATAR_START_DELAY_SECONDS before even starting) for one
+        # continuous render instead of many.
+        #
+        # NOT independently verified against a live listener as of this
+        # change (no human available to confirm smoothness) -- confirmed
+        # only that Gemini's plain generateContent endpoint itself returns a
+        # normal, complete response with our real key and this model.
+        # style="gemini" is hardcoded by this vendor's to_config()
+        # regardless of URL; whether Agora's backend parses a non-streaming
+        # body the same way is the one part genuinely unverified. Bounded
+        # risk: this agent is fully independent of Watcher's own session
+        # (wrapped in try/except in the caller), so a bad interaction here
+        # cannot affect Watcher -- worst case is the delegate avatar failing
+        # to start at all, which Agora's own agent-status API (GET
+        # /v2/projects/{appid}/agents/{agent_id}) can confirm or rule out
+        # after the fact via its stop reason.
         llm = Gemini(
             api_key=gemini_api_key,
             model="gemini-flash-lite-latest",
+            url=(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                "gemini-flash-lite-latest:generateContent?key=" + gemini_api_key
+            ),
             system_messages=[{"role": "user", "parts": [{"text": system_prompt}]}],
             greeting_message=greeting,
         )
-        tts = MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_magnetic_voiced_man")
+        # sample_rate=24000 pinned explicitly, unlike Watcher's own
+        # MiniMaxTTS (agent.py, no avatar attached): Anam's own docs
+        # default to expecting 24000Hz and let it be configured (16000 /
+        # 24000 / 48000). Watcher's audio publishes straight to the RTC
+        # channel with no intermediate consumer, so MiniMax's own
+        # (unspecified, provider-default) output rate never has to match
+        # anything else. Here, Anam sits between our TTS output and the
+        # final published track, re-rendering it into synced video -- a
+        # mismatch between what MiniMax actually outputs and what Anam
+        # assumes it's receiving would produce exactly the symptom seen
+        # live: tracks report healthy/playing at the transport level, but
+        # the perceptual audio is silent. Pinning both sides to the same
+        # explicit value removes the guesswork.
+        tts = MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_magnetic_voiced_man", sample_rate=24000)
 
         delegate_agent = (
             AgoraAgent(
@@ -825,24 +922,70 @@ class Agent:
                 instructions=system_prompt,
                 greeting=greeting,
                 failure_message="One moment.",
-                interruption={"enable": True, "mode": "start_of_speech"},
+                # Disabled, unlike Watcher's own start_of_speech
+                # interruption -- confirmed live symptom: the avatar's
+                # participant tile kept flipping muted/unmuted with no
+                # audible speech ever completing, consistent with it
+                # self-interrupting on echo of its own voice picked up by
+                # the human's mic (this agent listens only to that one
+                # uid, per remote_uids, so anything reflected back through
+                # their mic reads as them starting to speak). Watcher
+                # doesn't show the same symptom, but its greeting is much
+                # shorter and only spoken once, so the same echo path may
+                # just be less likely to land mid-sentence there.
+                interruption={"enable": False},
                 advanced_features={"enable_rtm": True},
             )
             .with_stt(stt)
             .with_llm(llm)
             .with_tts(tts)
-            .with_avatar(GenericAvatar(
-                api_key=os.getenv("AVATAR_API_KEY"),
-                api_base_url=os.getenv("AVATAR_API_BASE_URL"),
-                avatar_id=os.getenv("AVATAR_ID"),
-                agora_uid=str(avatar_agent_uid),
+            .with_avatar(AnamAvatar(
+                api_key=os.getenv("ANAM_API_KEY"),
+                avatar_id=os.getenv("ANAM_AVATAR_ID"),
+                # Confirmed against Agora's own live Anam docs (the user
+                # pasted the actual doc page content): agora_uid and
+                # agora_token are BOTH required fields for Anam, same as
+                # GenericAvatar -- but this installed SDK version's
+                # AnamAvatarOptions Python model only exposes api_key and
+                # avatar_id, missing both. additional_params is the escape
+                # hatch (merged into the request dict verbatim by
+                # to_config()) to send what the live API actually needs
+                # despite the SDK's own bindings being behind it. Without
+                # this, avatar.enable=true was accepted by Agora's API
+                # (no 400 error) but its audio never played on the
+                # client -- consistent with the avatar's RTC identity
+                # never being correctly established.
+                additional_params={
+                    "agora_uid": str(avatar_agent_uid),
+                    "agora_token": generate_convo_ai_token(
+                        app_id=self.app_id,
+                        app_certificate=self.app_certificate,
+                        channel_name=channel_name,
+                        uid=avatar_agent_uid,
+                        token_expire=3600,
+                    ),
+                    # Matches the MiniMaxTTS sample_rate=24000 set above --
+                    # stated explicitly on both sides rather than relying
+                    # on Anam's documented default (24000) happening to
+                    # match whatever MiniMax would have used unset.
+                    "sample_rate": 24000,
+                },
             ))
         )
 
         session = delegate_agent.create_async_session(
             channel=channel_name,
             agent_uid=str(avatar_agent_uid),
-            remote_uids=["*"],
+            # Confirmed live: Agora rejects remote_uids=["*"] outright
+            # ("subscribing to all remote RTC UIDs is not allowed") on any
+            # session with an avatar enabled -- unlike Watcher's own
+            # wildcard subscription above, which has no avatar and is
+            # unaffected. Only the joiner who actually triggered this
+            # /startAgent call is a known uid at this point; anyone who
+            # joins the room later won't be heard by this agent specifically
+            # (Watcher's own wildcard subscription still hears everyone,
+            # since only this second agent carries the avatar).
+            remote_uids=[str(user_uid)],
             enable_string_uid=False,
             idle_timeout=30,
             expires_in=3600,
