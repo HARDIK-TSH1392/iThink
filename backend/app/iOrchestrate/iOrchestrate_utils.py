@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import time
 import httpx
 from datetime import datetime
@@ -312,8 +313,11 @@ async def open_slack_delegate_modal(trigger_id: str, incident_id: int) -> bool:
                     "multiline": True,
                     "placeholder": {
                         "type": "plain_text",
-                        "text": "e.g. I've already rolled back the deploy and confirmed error rates are dropping. "
-                        "Ask the team to confirm the CDN cache is clear and check for any other affected services.",
+                        # Slack caps plain_text_input placeholders at 150
+                        # chars (confirmed live -- the original text was
+                        # 175 and made views.open reject the whole modal).
+                        "text": "e.g. I've rolled back the deploy, error rates are dropping. "
+                        "Ask the team to confirm the CDN cache is clear.",
                     },
                 },
             },
@@ -339,7 +343,11 @@ async def open_slack_delegate_modal(trigger_id: str, incident_id: int) -> bool:
             response.raise_for_status()
             data = response.json()
             if not data.get("ok"):
-                print(f"[iOrchestrate] views.open error: {data.get('error')}")
+                # error alone (e.g. "invalid_arguments") doesn't say which
+                # field -- response_metadata.messages carries the actual
+                # per-field validation detail Slack computed, when present.
+                detail = data.get("response_metadata", {}).get("messages")
+                print(f"[iOrchestrate] views.open error: {data.get('error')} detail={detail}")
                 return False
         return True
     except Exception as exc:
@@ -780,11 +788,25 @@ async def update_slack_message(response_url: str, text: str) -> bool:
             )
             response.raise_for_status()
             # Slack's response_url endpoint can return HTTP 200 with a
-            # non-"ok" body (e.g. an expired/already-used response_url) --
-            # raise_for_status alone would treat that as success. Confirmed
-            # worth checking after a ticket-creation success silently didn't
-            # show up as updated in Slack with no error in the logs.
-            if response.text.strip() != "ok":
+            # body that isn't actually success (e.g. an expired/already-used
+            # response_url) -- raise_for_status alone would treat that as
+            # success. Confirmed worth checking after a ticket-creation
+            # success silently didn't show up as updated in Slack with no
+            # error in the logs.
+            #
+            # The body shape itself isn't consistent: some response_urls
+            # return the bare string "ok", others return JSON {"ok": true}
+            # (confirmed live -- the original text-only check flagged every
+            # successful update here as a failure, since this Slack message
+            # type returns the JSON form). Accept either.
+            body = response.text.strip()
+            succeeded = body == "ok"
+            if not succeeded:
+                try:
+                    succeeded = bool(response.json().get("ok"))
+                except (json.JSONDecodeError, ValueError):
+                    succeeded = False
+            if not succeeded:
                 print(f"[iOrchestrate] Slack message update returned non-ok body: {response.text}")
                 return False
         return True
