@@ -44,6 +44,15 @@ class IncidentCall(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
+    # Set to "awaiting_reply" when this call's post-call review DM is sent
+    # to a delegating approver (see iOrchestrate.notify_delegate_review),
+    # and cleared back to None once they reply "approve" and the Jira
+    # ticket is created. Lets the Slack Events handler (a free-text DM
+    # reply carries no action_id/value the way a button click does) find
+    # which call a given Slack user's message is actually about -- see
+    # iOrchestrate_api's find_awaiting_delegate_review_call.
+    delegate_review_status: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), index=True
     )

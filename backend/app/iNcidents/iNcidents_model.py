@@ -30,6 +30,16 @@ class Incident(Base):
     approved_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
+    # Set when the resolved approver approves but can't personally join the
+    # call -- their own notes on what's been done / what they want covered,
+    # captured via a Slack modal at approval time (see iOrchestrate_api's
+    # approve_delegate action). Presence of this field IS "delegate mode"
+    # for this incident's call -- no separate boolean needed. Surfaced into
+    # the call's structured_state at creation (see iCall_service.
+    # get_or_create_call) and into the agent's opening greeting/avatar
+    # (see voice-agent/server/src/agent.py's delegate fetch).
+    delegate_notes: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
     # Metadata
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), index=True

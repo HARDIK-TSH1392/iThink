@@ -74,7 +74,11 @@ from .iCall_utils import (
 )
 from app.iNcidents.iNcidents_crudl import get_incident
 from app.iLogs.iLogs_crudl import list_logs
-from app.iOrchestrate.iOrchestrate_utils import post_call_summary_notification, notify_jira_approval_needed
+from app.iOrchestrate.iOrchestrate_utils import (
+    post_call_summary_notification,
+    notify_jira_approval_needed,
+    notify_delegate_review_needed,
+)
 
 router = APIRouter(prefix="/icall", tags=["iCall"])
 
@@ -140,8 +144,13 @@ async def _apply_status_transition(db: AsyncSession, call: IncidentCall, new_sta
         if not was_already_completed:
             incident = await get_incident(db, call.incident_id)
             if incident:
+                # Public channel summary always posts either way -- only
+                # the private Jira-approval path branches on delegate mode.
                 await post_call_summary_notification(incident, call)
-                await notify_jira_approval_needed(db, incident, call)
+                if incident.delegate_notes:
+                    await notify_delegate_review_needed(db, incident, call)
+                else:
+                    await notify_jira_approval_needed(db, incident, call)
 
     return call
 
@@ -284,6 +293,40 @@ async def get_keyterms_endpoint(
     incident = await get_incident(db, call.incident_id)
     service = incident.service if incident else None
     return {"code": 0, "data": {"keyterm": build_keyterms(service)}, "msg": "success"}
+
+
+@router.get("/channel/{channel_name}/delegate")
+async def get_delegate_endpoint(
+    channel_name: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delegate-mode notes for this call, if the resolved approver approved
+    but couldn't join (see iOrchestrate_api's approve_delegate/modal flow).
+    Called by voice-agent/server right before it starts the agent, so it
+    can enrich the opening greeting -- and, when an avatar vendor is
+    configured, front the session with a visual stand-in -- with what the
+    absent lead wants covered. Same best-effort shape as /keyterms: no
+    delegate notes is the common case, not an error.
+    """
+    call = await get_call_by_channel_name(db, channel_name)
+    if not call:
+        raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
+
+    incident = await get_incident(db, call.incident_id)
+    notes = incident.delegate_notes if incident else None
+    approver_name = None
+    if notes:
+        from app.iDirectory.iDirectory_crudl import resolve_approver
+
+        approver = await resolve_approver(db, incident.service)
+        approver_name = approver.name if approver else None
+
+    return {
+        "code": 0,
+        "data": {"delegate_notes": notes, "approver_name": approver_name},
+        "msg": "success",
+    }
 
 
 @router.get("/{call_id}/utterances", response_model=List[CallUtteranceRead])

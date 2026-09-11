@@ -258,6 +258,25 @@ class UnresolvedRisksSummary(BaseModel):
     risks: List[str] = Field(default_factory=list)
 
 
+class DelegateReplyResult(BaseModel):
+    """
+    LLM output shape for one round of the post-call delegate-review DM
+    (see iCall_utils.parse_delegate_reply). The lead who couldn't join the
+    call is shown the reviewed draft (same content that would become the
+    Jira ticket) and replies in free text -- this classifies that reply
+    as either accepting the draft as-is, requesting changes (in which case
+    updated_draft is the FULL revised draft, never a diff -- same "resend
+    the whole thing, never partial-patch" discipline Agora's own agent-update
+    endpoint needed learning the hard way, see the Agentkit Internals notes),
+    or genuinely unclear (in which case nothing changes and acknowledgement
+    should ask a clarifying question).
+    """
+
+    decision: Literal["approve", "edit", "unclear"]
+    updated_draft: Optional[str] = None
+    acknowledgement: str
+
+
 class ReviewedTicketContent(BaseModel):
     """
     LLM output shape for the pre-Jira-ticket content review (see

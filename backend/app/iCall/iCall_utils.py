@@ -18,6 +18,7 @@ from .iCall_schema import (
     ActionItemOwnerAssignments,
     UnresolvedRisksSummary,
     ReviewedTicketContent,
+    DelegateReplyResult,
 )
 
 # -----------------------------------------------------------------------------
@@ -810,10 +811,23 @@ def _build_structuring_prompt(
     # existing_state here, no extra query per turn.
     related_note = existing_state.get("related_incident_note") if existing_state else None
     related_section = f"\n{related_note}\n" if related_note else ""
+    # Delegate mode (see iCall_service.get_or_create_call): the resolved
+    # approver couldn't join and left notes on what they've done / want
+    # covered. Framed as background the model should ground its opening
+    # and missing_info probing in, not as a fact to restate verbatim every
+    # turn -- the greeting (see voice-agent/server's delegate fetch)
+    # already speaks it once at call start.
+    delegate_notes = existing_state.get("delegate_notes") if existing_state else None
+    delegate_section = (
+        f"\nThe resolved approver couldn't join and left this update -- treat it as "
+        f"background, already communicated to the room at the start of the call: {delegate_notes}\n"
+        if delegate_notes
+        else ""
+    )
     return f"""Incident state recorded so far (facts/hypotheses/decisions already
 confirmed in this call — use this to detect contradictions, not to repeat):
 {existing_state}
-{incident_context_section}{related_section}{deploy_section}{tool_section}
+{incident_context_section}{related_section}{delegate_section}{deploy_section}{tool_section}
 Conversation so far:
 {conversation}
 
@@ -1884,6 +1898,108 @@ async def review_ticket_content(structured_state: dict) -> ReviewedTicketContent
     except Exception as exc:
         print(f"[iCall] Ticket-content review response didn't match schema, using unedited content: {exc}")
         return fallback
+
+
+DELEGATE_REPLY_SYSTEM_INSTRUCTION = """You are helping a team lead who
+couldn't personally join an incident call review the draft that will
+become a Jira ticket, entirely by free-text DM reply. You're shown the
+current draft and their one message. Classify it:
+
+- "approve": they're satisfied with the draft as-is (e.g. "looks good",
+  "approve", "go ahead", "ship it", or no substantive objection).
+- "edit": they want something changed. Produce updated_draft as the FULL
+  revised draft text, not just the changed lines. Copy every unrelated
+  section byte-for-byte from the current draft, including its exact
+  markdown (matching *asterisk pairs*, bullet characters, line breaks) --
+  only the specific lines they asked to change should differ at all. Never
+  invent a new fact, decision, or action item they didn't mention -- if
+  they say "add an action item for Priya to check the cache," add exactly
+  that, don't guess additional detail.
+- "unclear": their message doesn't clearly say approve or specify a
+  change (e.g. a question back, or ambiguous). Leave updated_draft unset
+  and ask a short clarifying question in acknowledgement instead.
+
+acknowledgement is always required: a short, human reply confirming what
+you understood -- for "approve", confirm the ticket is being created; for
+"edit", summarize what changed and ask them to reply "approve" to confirm
+or keep editing; for "unclear", ask specifically what they meant.
+"""
+
+
+def _build_delegate_reply_prompt(current_draft: str, user_reply: str) -> str:
+    return f"""Current draft (will become the Jira ticket description if approved):
+{current_draft}
+
+The team lead's reply:
+{user_reply}
+
+Classify their reply and produce your response per the schema.
+"""
+
+
+async def parse_delegate_reply(current_draft: str, user_reply: str) -> DelegateReplyResult:
+    """
+    One round of the post-call delegate-review DM loop (see
+    iOrchestrate_api's Slack Events handler). Degrades to "unclear" (never
+    silently approves or silently discards their message) when there's no
+    API key or the model call fails -- an unresolvable reply should ask
+    the human to try again, not guess.
+    """
+    fallback = DelegateReplyResult(
+        decision="unclear",
+        acknowledgement="Sorry, I couldn't process that just now -- could you try rephrasing?",
+    )
+    if not user_reply or not user_reply.strip() or not get_settings().gemini_api_key:
+        return fallback
+
+    client = _get_client()
+    prompt = _build_delegate_reply_prompt(current_draft, user_reply)
+    config = types.GenerateContentConfig(
+        system_instruction=DELEGATE_REPLY_SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=DelegateReplyResult,
+    )
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.models.generate_content,
+                model=PRIMARY_MODEL,
+                contents=prompt,
+                config=config,
+            ),
+            timeout=GEMINI_CALL_TIMEOUT_S,
+        )
+    except Exception as exc:
+        print(f"[iCall] Delegate-reply parse primary call failed/timed out, trying fallback: {exc}")
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=FALLBACK_MODEL,
+                    contents=prompt,
+                    config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc2:
+            print(f"[iCall] Delegate-reply parse failed on both attempts: {exc2}")
+            return fallback
+
+    try:
+        result = DelegateReplyResult.model_validate_json(response.text)
+    except Exception as exc:
+        print(f"[iCall] Delegate-reply response didn't match schema: {exc}")
+        return fallback
+
+    # Fail-safe against a malformed "edit" with no actual draft -- treat it
+    # as unclear rather than silently wiping the draft to empty/None.
+    if result.decision == "edit" and not result.updated_draft:
+        return DelegateReplyResult(
+            decision="unclear",
+            acknowledgement="I wasn't sure exactly what to change -- could you be more specific?",
+        )
+    return result
 
 
 # -----------------------------------------------------------------------------

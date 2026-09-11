@@ -159,6 +159,143 @@ async def notify_jira_approval_needed(db, incident, call) -> bool:
     return ok
 
 
+async def notify_delegate_review_needed(db, incident, call) -> bool:
+    """
+    Replaces notify_jira_approval_needed for a delegated incident (see
+    _apply_status_transition, iCall_api.py) -- the lead who couldn't join
+    reviews the same reviewed-for-Jira content, but conversationally: reply
+    with corrections or "approve" in this same DM thread, handled by
+    iOrchestrate_api's Slack Events handler, rather than a single button
+    click. review_ticket_content is the exact same auto-cleanup pass
+    _handle_jira_decision already runs right before ticket creation -- this
+    just also shows the human that reviewed draft before it becomes a real
+    ticket, instead of only the buttons-based approve/skip choice.
+
+    Same "DM-only, no actionable content in the shared channel" discipline
+    as notify_jira_approval_needed -- a delegated incident has no one to
+    fall back to for this specific ask (only the absent lead can review
+    their own delegated call), so unlike that function's channel-post
+    fallback, an unreachable lead here just logs a notice; the public
+    channel summary (post_call_summary_notification, called unconditionally
+    alongside this) still tells the team the call happened either way.
+    """
+    from app.iCall.iCall_service import start_delegate_review
+    from app.iCall.iCall_utils import review_ticket_content
+    from app.iDirectory.iDirectory_crudl import resolve_approver
+
+    approver = await resolve_approver(db, incident.service)
+    if not approver or not approver.slack_user_id:
+        print(f"[iOrchestrate] No reachable approver for delegate review, call {call.id} -- "
+              f"the public channel summary still posted; ticket needs manual follow-up.")
+        return False
+
+    reviewed = await review_ticket_content(call.structured_state or {})
+    ticket_state = dict(call.structured_state or {})
+    ticket_state.update(reviewed.model_dump())
+    draft = format_call_summary(ticket_state, call.participant_roles)
+
+    await start_delegate_review(db, call, draft)
+
+    text = (
+        f"*Call wrapped up — your review needed: Incident #{incident.id}* :memo:\n"
+        f"*{incident.title}*  |  `{incident.service}` in `{incident.region}`\n"
+        f"Watcher stood in for you and here's what was captured:\n\n"
+        f"{draft}\n\n"
+        f"Reply here with any corrections (add/remove/reassign an action item, fix a fact, "
+        f"whatever's off), or just reply *approve* to create the Jira ticket as-is."
+    )
+    ok = await _post_dm_to_slack_user(approver.slack_user_id, text)
+    if ok:
+        print(f"[iOrchestrate] Delegate-review DM sent to {approver.slack_user_id} for call {call.id}")
+    else:
+        print(f"[iOrchestrate] Delegate-review DM failed for call {call.id}")
+    return ok
+
+
+async def reply_to_delegate_dm(slack_user_id: str, text: str) -> bool:
+    """
+    Public wrapper around _post_dm_to_slack_user for the Slack Events
+    handler (iOrchestrate_api.py) -- keeps that module going through this
+    file's own DM-sending path (same signature/error handling as every
+    other Slack message this file sends) instead of reaching into the
+    private helper directly.
+    """
+    return await _post_dm_to_slack_user(slack_user_id, text)
+
+
+async def open_slack_delegate_modal(trigger_id: str, incident_id: int) -> bool:
+    """
+    Opens the "what should Watcher cover for you" modal in response to the
+    approve_delegate button click. Must be called with the SAME trigger_id
+    Slack included in that click's payload, within Slack's ~3-second
+    validity window -- callers must call this before doing anything else
+    (recording the approval decision, updating the original message), not
+    after, or the trigger_id will have expired.
+
+    private_metadata carries incident_id through to the view_submission
+    payload (see iOrchestrate_api's modal handler) -- Slack echoes it back
+    verbatim, no server-side state needed to remember which incident this
+    modal was opened for.
+    """
+    settings = get_settings()
+    if not settings.slack_bot_token:
+        print("[iOrchestrate] SLACK_BOT_TOKEN not set, cannot open delegate modal")
+        return False
+
+    view = {
+        "type": "modal",
+        "callback_id": "delegate_notes_modal",
+        "private_metadata": str(incident_id),
+        "title": {"type": "plain_text", "text": "Delegate to Watcher"},
+        "submit": {"type": "plain_text", "text": "Submit"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Watcher will join in your place and open with your update. "
+                        "What have you done so far, and what should it cover or ask about?"
+                    ),
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "delegate_notes_block",
+                "label": {"type": "plain_text", "text": "Your update"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "delegate_notes_input",
+                    "multiline": True,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "e.g. I've already rolled back the deploy and confirmed error rates are dropping. "
+                        "Ask the team to confirm the CDN cache is clear and check for any other affected services.",
+                    },
+                },
+            },
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                "https://slack.com/api/views.open",
+                headers={"Authorization": f"Bearer {settings.slack_bot_token}"},
+                json={"trigger_id": trigger_id, "view": view},
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("ok"):
+                print(f"[iOrchestrate] views.open error: {data.get('error')}")
+                return False
+        return True
+    except Exception as exc:
+        print(f"[iOrchestrate] Failed to open delegate modal: {exc}")
+        return False
+
+
 def _summary_to_adf(summary_text: str) -> dict:
     """
     Jira Cloud's REST API v3 requires descriptions in Atlassian Document
@@ -379,9 +516,18 @@ async def post_approval_request_notification(
         f"*Approval needed: Incident #{incident_id}* :rotating_light:\n"
         f"{headline}\n"
         f"When: {detected_at.isoformat()}  |  Where: `{service}` in `{region}`  |  Priority: *{priority or 'unset'}*\n"
-        f"Approver: {who}"
+        f"Approver: {who}\n\n"
+        f"If you approve, can you personally join the call?"
     )
 
+    # Combines the approve/reject decision with "can you join" in one
+    # message rather than a separate follow-up -- rejecting means no call
+    # happens at all, so attendance only ever matters alongside approval,
+    # never on its own. approve_delegate opens a modal (see
+    # open_slack_delegate_modal) instead of deciding immediately -- the
+    # incident is only actually approved once that modal is submitted
+    # (see iOrchestrate_api's view_submission handler), so a lead who opens
+    # the modal and then cancels hasn't approved anything.
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": text}},
         {
@@ -390,9 +536,15 @@ async def post_approval_request_notification(
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "✅ Approve"},
+                    "text": {"type": "plain_text", "text": "✅ Approve — I'll join"},
                     "style": "primary",
-                    "action_id": "approve_incident",
+                    "action_id": "approve_join",
+                    "value": str(incident_id),
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🎙️ Approve — I can't join"},
+                    "action_id": "approve_delegate",
                     "value": str(incident_id),
                 },
                 {
