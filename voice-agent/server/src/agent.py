@@ -1178,7 +1178,23 @@ class Agent:
                         },
                     },
                 },
-                advanced_features={"enable_rtm": True},
+                # enable_rtm was copied from Watcher's own config without
+                # re-examining whether THIS agent actually needs it -- it
+                # doesn't. Watcher needs RTM for the chat panel, hand-raise,
+                # and the MCP-results tile; the delegate avatar has none of
+                # those. Confirmed against Agora's own docs: setting
+                # `advanced_features.enable_rtm=True` is also what makes
+                # `parameters.data_channel` default to "rtm" instead of
+                # "datastream" (the RTC media connection's own, more
+                # integrated channel) -- and RTM is the exact channel that
+                # just threw real "socket connection error, connection
+                # seems broken" reconnects live on this network, at the
+                # same time this agent's audio/video kept breaking. Not
+                # confirmed as the actual mechanism yet, but a real,
+                # low-risk thing to rule out: turning this off moves this
+                # agent's data transport off RTM entirely, since it never
+                # needed to be on it in the first place.
+                advanced_features={"enable_rtm": False},
             )
             .with_stt(stt)
             .with_llm(llm)
