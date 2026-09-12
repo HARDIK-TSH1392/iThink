@@ -256,6 +256,44 @@ def _contains_devanagari(text: Optional[str]) -> bool:
     return bool(text) and bool(_DEVANAGARI_PATTERN.search(text))
 
 
+def _new_content_since(current_text: Optional[str], previous_text: Optional[str]) -> Optional[str]:
+    """
+    Isolates the genuinely NEW part of the latest user message, not the
+    whole thing -- confirmed live (incident-68, via the actual backend
+    request log) that Agora accumulates unanswered speech onto the SAME
+    "user" message by exact string append: message N+1 is always message
+    N plus new text tacked on, whenever our own reply to turn N came back
+    empty (should_speak_aloud gated it silent). A Hindi turn that never
+    triggered a reply stays glued to the front of the next, unrelated
+    English turn -- confirmed exactly this shape from the real log:
+    "...service. <hindi turn>" -> "...service. <hindi turn> Watcher, what
+    is the current status?", one exact prefix inside the next.
+
+    Deliberately exact-prefix diffing, not a sentence split or a
+    last-N-characters window -- both were considered and rejected: real
+    Deepgram output here often has NO punctuation between accumulated
+    turns (nothing to split on), and Hindi tech speech routinely embeds
+    English jargon mid-sentence while ending on a Hindi postposition/verb
+    (confirmed across many real transcripts this session) -- a window-
+    based check risks misreading a genuinely-Hindi sentence as English
+    just because it happens to trail off differently. Exact-prefix
+    diffing has no such risk: it isolates precisely what was newly said,
+    nothing more.
+
+    Falls back to the whole current_text whenever the prefix doesn't
+    match exactly (no previous_text stored yet, a fresh accumulation
+    right after we DID speak, or a rare STT revision that alters
+    already-transcribed text) -- this is never worse than the old
+    whole-message check, only better when the prefix match holds.
+    """
+    if not current_text:
+        return current_text
+    if previous_text and current_text.startswith(previous_text):
+        new_part = current_text[len(previous_text):].strip()
+        return new_part or current_text
+    return current_text
+
+
 def resolve_multi_tier_fixed_line_target(call_language_code: str, latest_user_text: Optional[str]) -> str:
     """
     For a Tier-2 call this is a no-op (returns call_language_code
@@ -597,6 +635,18 @@ async def translate_fixed_line(text: str, language_code: str) -> str:
     set. Degrades to the original English text on any failure (never
     blocks the call over a translation hiccup) -- same discipline as every
     other best-effort external call in this file.
+
+    language_code="hi" is a pseudo-target (see LANGUAGE_DISPLAY_NAMES) --
+    resolve_multi_tier_fixed_line_target passes this when a fixed line
+    (CLOSING_LINE, a fallback reply, the switch-confirmation question)
+    should be spoken in Hindi for a moment within a "multi"-tier call, not
+    a real switchable tier. The feminine-grammar instruction below is
+    gated to this one code specifically -- confirmed live (incident-68)
+    this translation path has the identical masculine-default bias as
+    build_structuring_system_instruction's Hindi branch (a separate Gemini
+    call, so not automatically fixed by that one), while Tier 2's other 9
+    languages are untouched by this addition (verified: Tamil's own
+    translation is unaffected, byte-for-byte, by this change).
     """
     if language_code == "multi" or not text:
         return text
@@ -606,6 +656,13 @@ async def translate_fixed_line(text: str, language_code: str) -> str:
     if not get_settings().gemini_api_key:
         return text
     display_name = LANGUAGE_DISPLAY_NAMES.get(language_code, language_code)
+    gender_instruction = (
+        ' The speaker is FEMALE -- use feminine Hindi grammatical forms '
+        'throughout (e.g. "रही हूँ", "करती हूँ", "दूँगी" -- NOT the '
+        'masculine "रहा हूँ", "करता हूँ", "दूँगा").'
+        if language_code == "hi"
+        else ""
+    )
     try:
         client = _get_client()
         response = await asyncio.wait_for(
@@ -615,8 +672,8 @@ async def translate_fixed_line(text: str, language_code: str) -> str:
                 contents=(
                     f"Translate the following into natural, conversational {display_name}, "
                     f"as it would actually be spoken aloud on a live phone call -- not a "
-                    f"literal word-for-word translation. Return only the translated text, "
-                    f"nothing else.\n\n{text}"
+                    f"literal word-for-word translation.{gender_instruction} Return only the "
+                    f"translated text, nothing else.\n\n{text}"
                 ),
             ),
             timeout=GEMINI_CALL_TIMEOUT_S,
@@ -1103,7 +1160,9 @@ Hard constraints:
 
 
 def build_structuring_system_instruction(
-    language_code: Optional[str], latest_user_text: Optional[str] = None
+    language_code: Optional[str],
+    latest_user_text: Optional[str] = None,
+    previous_user_text: Optional[str] = None,
 ) -> str:
     """
     STRUCTURING_SYSTEM_INSTRUCTION is kept as a module-level constant
@@ -1136,16 +1195,42 @@ def build_structuring_system_instruction(
     the exact failing incident-66 transcript (now correctly stays English)
     and against the original incident-63 Hindi case (still correctly
     replies Hindi) before this replaced the softer version.
+
+    previous_user_text (the prior turn's own latest_user_text, persisted
+    in structured_state -- see iCall_service.record_last_seen_user_message)
+    lets the Devanagari check run against _new_content_since's diff
+    instead of the raw latest_user_text -- confirmed live (incident-68,
+    from the actual request log) that Agora accumulates unanswered turns
+    onto one growing message, so the raw text can carry a Hindi turn from
+    several exchanges ago glued onto a brand-new English question. Without
+    the diff, that stale Hindi fragment alone was enough to make the
+    "does this contain Devanagari" check fire, producing a Hindi reply to
+    a purely-English question. See _new_content_since's own docstring for
+    why this is exact-prefix diffing, not a sentence split or a
+    last-N-characters window.
+
+    The Hindi branch also specifies feminine grammatical conjugation
+    (रही/करती/सकती, not the masculine रहा/करता/सकता Gemini defaults to with
+    no persona given) -- confirmed live (incident-68) that Tier 1's
+    configured TTS voice is female (MiniMax "English_captivating_female1"),
+    so ungendered Hindi generation produces a female voice speaking
+    grammatically male sentences. translate_fixed_line carries the
+    identical instruction for the same reason -- confirmed live that its
+    Hindi translations have the exact same masculine default, since it's
+    a separate Gemini call with its own prompt, not automatically covered
+    by this fix.
     """
     if not language_code or language_code == "multi":
-        if not _contains_devanagari(latest_user_text):
+        diffed_text = _new_content_since(latest_user_text, previous_user_text)
+        if not _contains_devanagari(diffed_text):
             return STRUCTURING_SYSTEM_INSTRUCTION + """
 - This call is running in Watcher's English/Hindi tier (Deepgram's
-  native code-switching mode). The user's most recent message contains
-  NO Hindi/Devanagari script at all -- it is entirely in English. Reply
-  in English for this turn, regardless of what language earlier turns in
-  this conversation or your own earlier replies used -- do not switch to
-  Hindi just because earlier turns were in Hindi. Keep
+  native code-switching mode). The genuinely new part of the user's most
+  recent message -- ignoring anything already covered by earlier turns --
+  contains NO Hindi/Devanagari script at all; it is entirely in English.
+  Reply in English for this turn, regardless of what language earlier
+  turns in this conversation or your own earlier replies used -- do not
+  switch to Hindi just because earlier turns were in Hindi. Keep
   facts/hypotheses/decisions/action_items/missing_info in English as
   usual (internal record-keeping, not spoken content).
 """
@@ -1156,16 +1241,19 @@ def build_structuring_system_instruction(
   see may itself be mixed-script for that reason (e.g. Devanagari Hindi
   with English technical terms/proper nouns left in Latin script) -- that
   is expected, not a transcription error, so don't treat mixed-script
-  input as unclear or ask the room to repeat it. The user's most recent
-  message contains Hindi (possibly mixed with English) -- reply in
-  natural, conversational Hindi the way someone would actually say it out
-  loud, not a literal word-for-word translation of English incident
-  jargon (keep proper nouns, service names, and jargon like
-  "rollback"/"PR"/"API" in their usual English/Latin form even inside an
-  otherwise-Hindi reply, since that's how they're actually said in real
-  Hindi tech conversation). Write any Hindi words in Devanagari script --
-  NOT romanized/Latin-script Hindi -- since Devanagari is the script this
-  pipeline's voice synthesis is confirmed to handle correctly. Keep
+  input as unclear or ask the room to repeat it. The genuinely new part of
+  the user's most recent message contains Hindi (possibly mixed with
+  English) -- reply in natural, conversational Hindi the way someone
+  would actually say it out loud, not a literal word-for-word translation
+  of English incident jargon (keep proper nouns, service names, and
+  jargon like "rollback"/"PR"/"API" in their usual English/Latin form
+  even inside an otherwise-Hindi reply, since that's how they're actually
+  said in real Hindi tech conversation). Write any Hindi words in
+  Devanagari script -- NOT romanized/Latin-script Hindi -- since
+  Devanagari is the script this pipeline's voice synthesis is confirmed
+  to handle correctly. You are speaking as a FEMALE voice -- use feminine
+  Hindi grammatical forms throughout (e.g. "रही हूँ", "करती हूँ", "सकती
+  हूँ" -- NOT the masculine "रहा हूँ", "करता हूँ", "सकता हूँ"). Keep
   facts/hypotheses/decisions/action_items/missing_info in English as
   usual (internal record-keeping, not spoken content) -- only
   spoken_reply's language changes.
@@ -1526,8 +1614,15 @@ async def generate_structuring_update(
     latest_user_text = next(
         (m.content for m in reversed(messages) if m.role == "user" and m.content), None
     )
+    # Persisted by iCall_service.record_last_seen_user_message after the
+    # PRIOR turn -- see build_structuring_system_instruction's own
+    # docstring for why diffing against this (not just checking
+    # latest_user_text raw) is what actually fixes the incident-68 bug.
+    previous_user_text = existing_state.get("last_seen_raw_user_message")
     config = types.GenerateContentConfig(
-        system_instruction=build_structuring_system_instruction(language_code, latest_user_text),
+        system_instruction=build_structuring_system_instruction(
+            language_code, latest_user_text, previous_user_text
+        ),
         response_mime_type="application/json",
         response_schema=StructuringUpdate,
         tools=[gemini_tool] if gemini_tool else None,

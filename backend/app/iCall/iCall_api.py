@@ -43,6 +43,7 @@ from .iCall_service import (
     list_agent_utterances,
     record_missing_info_nudge,
     record_direct_address_reply,
+    record_last_seen_user_message,
     record_silence_streak,
     record_wrapped_up,
     record_language_switch_pending,
@@ -842,6 +843,10 @@ async def _process_tool_result_turn(
     )
     update = result.update
     call = await apply_structuring_update(db, call, update)
+    latest_user_message = next(
+        (m.content for m in reversed(payload.messages) if m.role == "user" and m.content), None
+    )
+    call = await record_last_seen_user_message(db, call, latest_user_message)
     call = await _maybe_push_tool_result_screen(db, call, channel_name, tool_name, tool_result_text)
 
     health_score = compute_coordination_health_score(call.structured_state)
@@ -1031,6 +1036,7 @@ async def _process_turn(
         "channel=%s real turn latest_user_message=%r facts_this_turn=%r",
         channel_name, latest_user_message, update.facts,
     )
+    call = await record_last_seen_user_message(db, call, latest_user_message)
     spoken_reply = await _decide_spoken_reply(db, call, update, old_facts, latest_user_message, health_score)
     return spoken_reply, None
 
