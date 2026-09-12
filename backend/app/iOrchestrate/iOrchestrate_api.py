@@ -11,7 +11,6 @@ from app.iCall.iCall_service import (
     get_call,
     find_awaiting_delegate_review_call,
     update_delegate_review_draft,
-    clear_delegate_review,
 )
 from app.iCall.iCall_utils import review_ticket_content, parse_delegate_reply
 
@@ -25,6 +24,7 @@ from .iOrchestrate_utils import (
     open_slack_delegate_modal,
     reply_to_delegate_dm,
     approve_incident_with_delegate_notes,
+    create_ticket_from_delegate_review,
 )
 
 router = APIRouter(prefix="/iorchestrate", tags=["iOrchestrate"])
@@ -149,6 +149,39 @@ async def _handle_jira_decision(db, action_id: str, call_id: int, user_name: str
         )
 
 
+async def _handle_delegate_review_approve(db, call_id: int, user_name: str, response_url: str):
+    """
+    The Approve as-is button on a delegate review DM (see
+    notify_delegate_review_needed) -- the button-driven twin of typing
+    "approve" in that same DM thread, both routed through the one shared
+    create_ticket_from_delegate_review so whichever path fires, the ticket
+    reflects whatever draft is current (including any correction already
+    sent by reply) rather than re-deriving from the call's raw state.
+    """
+    call = await get_call(db, call_id)
+    if not call:
+        await update_slack_message(response_url, f"⚠️ Call #{call_id} not found.")
+        return
+
+    if not (call.structured_state or {}).get("delegate_review_draft"):
+        await update_slack_message(
+            response_url,
+            "⚠️ Nothing pending for this review anymore -- it may have already been approved.",
+        )
+        return
+
+    url, _draft, incident = await create_ticket_from_delegate_review(db, call)
+    if url:
+        await update_slack_message(response_url, f"✅ Approved by {user_name} — Jira ticket created: {url}")
+    else:
+        incident_ref = f"#{incident.id}" if incident else "unknown"
+        await update_slack_message(
+            response_url,
+            f"⚠️ Approved by {user_name}, but ticket creation failed for incident {incident_ref} — "
+            f"check JIRA_* config / server logs.",
+        )
+
+
 def _verify_slack_request(raw_body: bytes, request: Request) -> None:
     settings = get_settings()
     if settings.slack_signing_secret:
@@ -216,6 +249,8 @@ async def slack_interactivity_endpoint(request: Request):
                 await update_slack_message(response_url, "⚠️ Missing trigger_id — try clicking again.")
         elif action_id in ("create_jira_ticket", "skip_jira_ticket"):
             await _handle_jira_decision(db, action_id, value, user_name, response_url)
+        elif action_id == "approve_delegate_review":
+            await _handle_delegate_review_approve(db, value, user_name, response_url)
         else:
             await update_slack_message(response_url, f"⚠️ Unknown action: {action_id}")
 
@@ -281,16 +316,9 @@ async def slack_events_endpoint(request: Request):
         result = await parse_delegate_reply(current_draft, reply_text)
 
         if result.decision == "approve":
-            incident = await get_incident(db, call.incident_id)
-            url = await create_jira_ticket(incident.id, incident.title, current_draft) if incident else None
-            await clear_delegate_review(db, call)
+            url, _draft, _incident = await create_ticket_from_delegate_review(db, call)
             if url:
                 await reply_to_delegate_dm(slack_user_id, f"{result.acknowledgement}\n📋 {url}")
-                if incident:
-                    await post_jira_ticket_created_notification(
-                        incident.id, incident.title, incident.priority, incident.service,
-                        incident.region, "delegate review (Slack DM)", url, current_draft,
-                    )
             else:
                 await reply_to_delegate_dm(
                     slack_user_id,

@@ -193,17 +193,43 @@ async def approve_incident_with_delegate_notes(db, incident_id: int, notes: str,
     return True
 
 
+def _build_delegate_review_blocks(call_id: int, text: str) -> list:
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {
+            "type": "actions",
+            "block_id": f"delegate_review_{call_id}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Approve as-is"},
+                    "style": "primary",
+                    "action_id": "approve_delegate_review",
+                    "value": str(call_id),
+                },
+            ],
+        },
+    ]
+
+
 async def notify_delegate_review_needed(db, incident, call) -> bool:
     """
     Replaces notify_jira_approval_needed for a delegated incident (see
     _apply_status_transition, iCall_api.py) -- the lead who couldn't join
-    reviews the same reviewed-for-Jira content, but conversationally: reply
-    with corrections or "approve" in this same DM thread, handled by
-    iOrchestrate_api's Slack Events handler, rather than a single button
-    click. review_ticket_content is the exact same auto-cleanup pass
-    _handle_jira_decision already runs right before ticket creation -- this
-    just also shows the human that reviewed draft before it becomes a real
-    ticket, instead of only the buttons-based approve/skip choice.
+    reviews the same reviewed-for-Jira content, either way it's easiest for
+    them: click Approve as-is (a button, matching the initial incident
+    approval's own UX -- added after the plain conversational-only version
+    turned out easy to miss, since it looked like nothing was actionable
+    compared to that first step's buttons), or reply here first with
+    corrections (add/remove/reassign an action item, fix a fact) before
+    approving -- handled by iOrchestrate_api's Slack Events handler.
+    Either path ends up at create_ticket_from_delegate_review, so the
+    button always reflects whatever draft is current at click time,
+    including any correction already sent. review_ticket_content is the
+    exact same auto-cleanup pass _handle_jira_decision already runs right
+    before ticket creation -- this just also shows the human that reviewed
+    draft before it becomes a real ticket, instead of only the buttons-
+    based approve/skip choice the non-delegate path uses.
 
     Same "DM-only, no actionable content in the shared channel" discipline
     as notify_jira_approval_needed -- a delegated incident has no one to
@@ -235,15 +261,46 @@ async def notify_delegate_review_needed(db, incident, call) -> bool:
         f"*{incident.title}*  |  `{incident.service}` in `{incident.region}`\n"
         f"Watcher stood in for you and here's what was captured:\n\n"
         f"{draft}\n\n"
-        f"Reply here with any corrections (add/remove/reassign an action item, fix a fact, "
-        f"whatever's off), or just reply *approve* to create the Jira ticket as-is."
+        f"Click *Approve as-is* below to create the Jira ticket now, or reply here with "
+        f"any corrections first (add/remove/reassign an action item, fix a fact, whatever's "
+        f"off) -- the button always reflects your latest correction, whichever comes first."
     )
-    ok = await _post_dm_to_slack_user(approver.slack_user_id, text)
+    blocks = _build_delegate_review_blocks(call.id, text)
+    ok = await _post_dm_to_slack_user(approver.slack_user_id, text, blocks=blocks)
     if ok:
         print(f"[iOrchestrate] Delegate-review DM sent to {approver.slack_user_id} for call {call.id}")
     else:
         print(f"[iOrchestrate] Delegate-review DM failed for call {call.id}")
     return ok
+
+
+async def create_ticket_from_delegate_review(db, call):
+    """
+    Shared core of approving a delegate review's draft as-is -- creates the
+    Jira ticket from whatever draft is currently stored (reflecting any
+    corrections already sent via DM reply) and clears the review state.
+    The ONE place that decides what "approve the delegate review" actually
+    does, used by both entry points that can trigger it: the Slack Events
+    handler's text-reply "approve" path, and the Approve as-is button on
+    the review DM itself (iOrchestrate_api._handle_delegate_review_approve)
+    -- same shared-function discipline as approve_incident_with_delegate_notes
+    for the earlier approval step.
+
+    Returns (ticket_url_or_None, draft_text, incident_or_None).
+    """
+    from app.iNcidents.iNcidents_crudl import get_incident
+    from app.iCall.iCall_service import clear_delegate_review
+
+    current_draft = (call.structured_state or {}).get("delegate_review_draft", "")
+    incident = await get_incident(db, call.incident_id)
+    url = await create_jira_ticket(incident.id, incident.title, current_draft) if incident else None
+    await clear_delegate_review(db, call)
+    if url and incident:
+        await post_jira_ticket_created_notification(
+            incident.id, incident.title, incident.priority, incident.service,
+            incident.region, "delegate review (Slack DM)", url, current_draft,
+        )
+    return url, current_draft, incident
 
 
 async def reply_to_delegate_dm(slack_user_id: str, text: str) -> bool:
