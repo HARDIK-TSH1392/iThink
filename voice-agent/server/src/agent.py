@@ -15,6 +15,7 @@ import httpx
 from agora_agent import Area, AsyncAgora
 from agora_agent.agentkit import Agent as AgoraAgent
 from agora_agent.agentkit.token import generate_convo_ai_token
+from shared_state import channel_names as _channel_names
 from agora_agent.agentkit.vendors import (
     AnamAvatar, CustomLLM, DeepgramSTT, Gemini, MiniMaxTTS, OpenAI, SarvamSTT, SarvamTTS,
 )
@@ -1225,22 +1226,17 @@ class Agent:
         )
 
         # Registers this agent's own display name into the same uid->name
-        # map /getNames already serves (see server.py's set_name/_channel_names)
-        # -- the web client's tile/transcript label lookups already fall
-        # back to that map for any uid that isn't Watcher's own, so this
-        # needs no frontend change at all. Local import (not top-level)
-        # because server.py imports Agent from this module -- importing
-        # server.py back at module load time would be circular; deferring
-        # it to call time, after both modules have finished loading, is
-        # not. Registered BEFORE session.start(), not after -- confirmed
-        # live (2026-09-12) that doing it after left the earliest
-        # transcript lines stuck on "Participant <uid>": Agora starts the
-        # session (and the avatar can already be mid-greeting) the moment
-        # it processes the join, before this coroutine's own await even
-        # returns, so the client's next name poll could already be racing
-        # ahead of a name registered only afterward.
-        from server import _channel_names
-
+        # map /getNames already serves (see shared_state.channel_names,
+        # imported at the top of this file) -- the web client's
+        # tile/transcript label lookups already fall back to that map for
+        # any uid that isn't Watcher's own, so this needs no frontend
+        # change at all. Registered BEFORE session.start(), not after --
+        # confirmed live (2026-09-12) that doing it after left the
+        # earliest transcript lines stuck on "Participant <uid>": Agora
+        # starts the session (and the avatar can already be mid-greeting)
+        # the moment it processes the join, before this coroutine's own
+        # await even returns, so the client's next name poll could already
+        # be racing ahead of a name registered only afterward.
         _channel_names.setdefault(channel_name, {})[str(avatar_agent_uid)] = (
             f"{approver_name}'s Avatar"
         )
