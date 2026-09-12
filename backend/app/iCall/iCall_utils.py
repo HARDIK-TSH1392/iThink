@@ -1243,6 +1243,7 @@ def _build_structuring_prompt(
     service: Optional[str] = None,
     region: Optional[str] = None,
     incident_age_minutes: Optional[int] = None,
+    channel_name: Optional[str] = None,
 ) -> str:
     conversation = "\n".join(f"{m.role}: {m.content or ''}" for m in messages)
     deploy_summary = deploy_check_result.get("summary") if deploy_check_result else None
@@ -1282,12 +1283,18 @@ def _build_structuring_prompt(
             if incident_age_minutes is not None
             else ""
         )
+        channel_line = (
+            f"This call's channel_name is `{channel_name}` -- use this exact value as the channel_name "
+            "argument for get_incident_status or list_action_items, never a guessed or numeric id.\n"
+            if channel_name
+            else ""
+        )
         incident_context_section = (
             f"\nThis incident's service is `{service}`"
             + (f" in region `{region}`" if region else "")
             + " -- use this exact value (not something inferred from conversation) as the service/region argument for "
             "any log or GitHub lookup tool you call.\n"
-            f"{repo_line}\n{age_line}"
+            f"{repo_line}\n{age_line}{channel_line}"
         )
     # tool_result_text: this turn is the follow-up after the model itself
     # called an Agora-native MCP tool (see chat_completions_endpoint) --
@@ -1380,6 +1387,7 @@ async def generate_structuring_update(
     tool_result_text: Optional[str] = None,
     region: Optional[str] = None,
     incident_age_minutes: Optional[int] = None,
+    channel_name: Optional[str] = None,
 ) -> StructuringResult:
     """
     One turn of live structuring: given the conversation and what's already
@@ -1423,6 +1431,7 @@ async def generate_structuring_update(
     prompt = _build_structuring_prompt(
         messages, existing_state, deploy_check_result, tool_result_text,
         service=service, region=region, incident_age_minutes=incident_age_minutes,
+        channel_name=channel_name,
     )
     config = types.GenerateContentConfig(
         system_instruction=build_structuring_system_instruction(language_code),

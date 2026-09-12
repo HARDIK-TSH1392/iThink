@@ -146,6 +146,23 @@ async def get_call_endpoint(
     return IncidentCallRead.model_validate(call)
 
 
+@router.get("/channel/{channel_name}", response_model=IncidentCallRead)
+async def get_call_by_channel_endpoint(
+    channel_name: str,
+    db: AsyncSession = Depends(get_db),
+) -> IncidentCallRead:
+    """
+    Channel-keyed twin of GET /{call_id} -- same shape, for callers that
+    only know the channel name (e.g. get_incident_status/list_action_items
+    in ilogs_mcp_service, which the model calls with the channel_name it
+    was given in its own prompt context, never a numeric id).
+    """
+    call = await get_call_by_channel_name(db, channel_name)
+    if not call:
+        raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
+    return IncidentCallRead.model_validate(call)
+
+
 async def _apply_status_transition(db: AsyncSession, call: IncidentCall, new_status: str) -> IncidentCall:
     """
     Shared by both status endpoints (numeric and channel-keyed). Guards the
@@ -816,6 +833,7 @@ async def _process_tool_result_turn(
     result = await generate_structuring_update(
         payload.messages, call.structured_state or {}, service, language_code=call.language_code,
         tool_result_text=tool_result_text, region=region, incident_age_minutes=incident_age_minutes,
+        channel_name=channel_name,
     )
     update = result.update
     call = await apply_structuring_update(db, call, update)
@@ -979,6 +997,7 @@ async def _process_turn(
     result = await generate_structuring_update(
         payload.messages, call.structured_state or {}, service, language_code=call.language_code,
         tools=payload.tools, region=region, incident_age_minutes=incident_age_minutes,
+        channel_name=channel_name,
     )
     if result.tool_call is not None:
         # The model decided to call a native MCP tool instead of answering
