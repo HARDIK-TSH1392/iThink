@@ -47,6 +47,8 @@ from .iCall_service import (
     record_wrapped_up,
     record_language_switch_pending,
     record_language_switch_applied,
+    record_language_switch_confirmation_pending,
+    clear_language_switch_confirmation_pending,
     get_call_turn_lock,
     infer_and_store_participant_roles,
     IncidentNotFoundError,
@@ -71,7 +73,10 @@ from .iCall_utils import (
     build_correction_callout,
     build_keyterms,
     detect_language_switch_trigger,
+    detect_confirmation_response,
     build_language_switch_ack,
+    build_language_switch_confirmation_prompt,
+    LANGUAGE_CONFIRMATION_TIMEOUT_S,
     translate_fixed_line,
     trigger_language_handoff,
     CALL_STATUS_COMPLETED,
@@ -725,19 +730,51 @@ async def _process_turn(
     # Matched against whatever the currently-active STT vendor already
     # transcribed (English/Hindi via Deepgram to enter Tier 2, or the
     # active Tier-2 language itself to switch again) -- see
-    # detect_language_switch_trigger's docstring for why this is always
-    # explicit-command based, never passive auto-detection.
+    # detect_language_switch_trigger's docstring for why this is
+    # order-independent token-presence matching, not English-only phrase
+    # matching, and why a bare language mention with no verb goes through
+    # a confirmation question (Stage 3) rather than switching outright or
+    # being silently dropped.
     trigger_text = next(
         (m.content for m in reversed(payload.messages) if m.role == "user" and m.content), None
     )
     if trigger_text:
-        target_code = detect_language_switch_trigger(trigger_text)
-        if target_code and target_code != call.language_code:
-            call = await record_language_switch_pending(db, call, target_code)
-            spoken_reply = build_language_switch_ack(target_code)
-            await record_agent_utterance(db, call.id, spoken_reply, "language_switch")
-            asyncio.create_task(trigger_language_handoff(channel_name, target_code))
-            return spoken_reply, None
+        pending = (call.structured_state or {}).get("pending_language_confirmation")
+        if pending:
+            asked_at = datetime.fromisoformat(pending["asked_at"])
+            expired = (datetime.now(timezone.utc) - asked_at).total_seconds() > LANGUAGE_CONFIRMATION_TIMEOUT_S
+            if not expired:
+                answer = detect_confirmation_response(trigger_text)
+                call = await clear_language_switch_confirmation_pending(db, call)
+                if answer is True:
+                    target_code = pending["target"]
+                    call = await record_language_switch_pending(db, call, target_code)
+                    spoken_reply = build_language_switch_ack(target_code)
+                    await record_agent_utterance(db, call.id, spoken_reply, "language_switch")
+                    asyncio.create_task(trigger_language_handoff(channel_name, target_code))
+                    return spoken_reply, None
+                # answer is False or None (unrecognized/no reply) -- decline
+                # is the safe default (see detect_confirmation_response's
+                # docstring); fall through and process this turn normally,
+                # it may have real content of its own.
+            else:
+                call = await clear_language_switch_confirmation_pending(db, call)
+
+        result = detect_language_switch_trigger(trigger_text)
+        if result.target and result.target != call.language_code:
+            if result.confident:
+                call = await record_language_switch_pending(db, call, result.target)
+                spoken_reply = build_language_switch_ack(result.target)
+                await record_agent_utterance(db, call.id, spoken_reply, "language_switch")
+                asyncio.create_task(trigger_language_handoff(channel_name, result.target))
+                return spoken_reply, None
+            else:
+                call = await record_language_switch_confirmation_pending(db, call, result.target)
+                spoken_reply = await translate_fixed_line(
+                    build_language_switch_confirmation_prompt(result.target), call.language_code
+                )
+                await record_agent_utterance(db, call.id, spoken_reply, "language_switch_confirm")
+                return spoken_reply, None
 
     if _is_silence_trigger(payload.messages):
         # Confirmed live (incident-39): the room's silence timer doesn't

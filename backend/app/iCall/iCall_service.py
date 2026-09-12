@@ -444,6 +444,50 @@ async def record_language_switch_applied(
     return call
 
 
+async def record_language_switch_confirmation_pending(
+    db: AsyncSession, call: IncidentCall, target_code: str
+) -> IncidentCall:
+    """
+    Stage 3 of the language-switch detector (see iCall_utils.
+    detect_language_switch_trigger): a language was named but no clear
+    switch-verb accompanied it, so instead of switching outright or
+    silently dropping it, the agent asks and this flag records what it's
+    waiting for. Checked (and its expiry enforced) by iCall_api._process_
+    turn against LANGUAGE_CONFIRMATION_TIMEOUT_S before trusting a later
+    "yes" -- same rebuild-fresh-dict discipline as every other record_*
+    function here.
+    """
+    old = call.structured_state or {}
+    new_state = dict(old)
+    new_state["pending_language_confirmation"] = {
+        "target": target_code,
+        "asked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def clear_language_switch_confirmation_pending(
+    db: AsyncSession, call: IncidentCall
+) -> IncidentCall:
+    """
+    Clears the Stage-3 confirmation flag once it's been resolved (an
+    affirmative/negative reply was seen) or has expired -- see
+    record_language_switch_confirmation_pending.
+    """
+    old = call.structured_state or {}
+    if "pending_language_confirmation" not in old:
+        return call
+    new_state = dict(old)
+    new_state.pop("pending_language_confirmation", None)
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
 async def record_pattern_nudge(
     db: AsyncSession, call: IncidentCall, pattern: str, message: str, score: Optional[int] = None
 ) -> IncidentCall:

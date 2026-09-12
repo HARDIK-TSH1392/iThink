@@ -1,9 +1,11 @@
 import asyncio
+import difflib
 import hashlib
 import hmac
 import re
+import unicodedata
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, NamedTuple, Optional, Set
+from typing import Any, Dict, FrozenSet, List, NamedTuple, Optional, Set
 
 import httpx
 from google import genai
@@ -228,41 +230,290 @@ LANGUAGE_DISPLAY_NAMES: Dict[str, str] = {
     "or-IN": "Odia",
 }
 
-_LANGUAGE_TRIGGER_MAP: Dict[str, str] = {
-    "tamil": "ta-IN",
-    "telugu": "te-IN",
-    "kannada": "kn-IN",
-    "bengali": "bn-IN",
-    "marathi": "mr-IN",
-    "gujarati": "gu-IN",
-    "punjabi": "pa-IN",
-    "malayalam": "ml-IN",
-    "odia": "or-IN",
-    "oriya": "or-IN",
-    "hindi": "multi",
-    "english": "multi",
+# --- Token-presence matching (replaces the old single English-phrasing
+# regex) -----------------------------------------------------------------
+# The old approach (`\b(?:switch to|can we talk in|...)\s+(tamil|...)\b`)
+# only matched literal English sentence structure. Real STT output
+# doesn't respect that once a different language's STT vendor is active --
+# confirmed live (incident-64: "English-ku switch", Tanglish verb-final
+# word order) and via direct, repeated Sarvam API testing this session
+# (TTS-generate genuine audio, feed through STT locked to a target
+# language_code, inspect the real transcript). That testing is the
+# empirical source for every token below, not guesswork -- see each
+# language's inline note for what's actually verified vs. best-effort.
+#
+# Matching is order-independent token PRESENCE, not phrase matching: a
+# confident switch requires a verb signal (GLOBAL_VERB_TOKENS, shared
+# across every language since English loanwords survive code-switching
+# almost unchanged, OR that language's own native verb_tokens) AND a
+# language-name signal (that language's name_tokens) to both be present
+# somewhere in the utterance -- no connector words, no word order.
+GLOBAL_VERB_TOKENS: FrozenSet[str] = frozenset({"switch", "change", "speak", "talk", "reply"})
+
+# name_tokens/verb_tokens are matched via SUBSTRING containment against
+# the normalized utterance (see _contains_any), never whitespace-token
+# equality and never \b-anchored regex -- both were tried and confirmed
+# broken against real Indic STT output this session:
+#   - Whitespace tokenization silently misses a name/verb a postposition
+#     or case-marker has glued directly onto with no space -- e.g.
+#     Gujarati "અંગ્રેજી" (English) + "માં" (to) -> "અંગ્રેજીમાં", never its
+#     own token.
+#   - \b-anchored regex is unreliable right after a word ending in a
+#     combining vowel-sign matra (Unicode category Mc/Mn, which Python's
+#     \w excludes) -- confirmed live: `\bબદલો\b` failed to match "બદલો" as
+#     the LAST word of a real transcript, purely because neither the
+#     matra nor the following space/end-of-string counts as \w, so no
+#     \w-to-non-\w transition exists there for \b to fire on.
+# Substring containment has no word-boundary protection at all -- a real
+# precision trade-off, accepted here because the lexicon is short and
+# curated, and a bare language-name substring alone never triggers by
+# itself (a verb signal must also be present -- see
+# detect_language_switch_trigger).
+LANGUAGE_LEXICON: Dict[str, Dict[str, FrozenSet[str]]] = {
+    "multi": {
+        # VERIFIED (direct Sarvam API testing, this session): how
+        # "English"/"Hindi" actually render once a DIFFERENT Tier-2
+        # language's STT is locked in and transliterates the loanword
+        # phonetically, plus how "Hindi" itself appears in other scripts.
+        "name_tokens": frozenset({
+            "english", "hindi",
+            "இங்கிலீஷ்", "ஆங்கிலம்",              # Tamil renderings of "English"
+            "ఇంగ్లీష్",                           # Telugu rendering of "English"
+            "इंग्लिश", "अंग्रेज़ी", "अंग्रेजी",         # Hindi/Devanagari renderings
+            "અંગ્રેજી",                           # Gujarati rendering
+            "இந்தி", "హిందీ", "હિન્દી",             # "Hindi" itself, other scripts
+        }),
+        "verb_tokens": frozenset({"बदलो", "बोलो"}),  # Hindi native verb forms
+    },
+    "ta-IN": {
+        "name_tokens": frozenset({"tamil", "thamizh", "தமிழ்"}),
+        "verb_tokens": frozenset({
+            "மாறு", "மாறவும்", "மாறுவோம்", "பேசலாமா",
+            # Bare root "to speak" -- confirmed live (incident-64) as the
+            # form that actually appears in "X பேச முடியுமா?" ("can you
+            # speak X?"), a distinct, very common construction from
+            # பேசலாமா -- both needed, the inflected form doesn't cover it.
+            "பேச",
+            # Transliterated English "switch" -- BOTH spellings observed
+            # for Tamil specifically: சுவிட்ச் in the real incident-64
+            # transcript, ஸ்விட்ச் in repeated direct API testing. Tamil
+            # orthography has no single fixed spelling for this loanword.
+            "சுவிட்ச்", "ஸ்விட்ச்",
+        }),
+    },
+    "te-IN": {
+        "name_tokens": frozenset({"telugu", "తెలుగు"}),
+        "verb_tokens": frozenset({
+            "మారు", "మారండి", "మార్చు",
+            "స్విచ్", "సచ్",  # transliterated "switch" -- both variants seen live
+        }),
+    },
+    "gu-IN": {
+        "name_tokens": frozenset({"gujarati", "ગુજરાતી"}),
+        "verb_tokens": frozenset({"બદલો", "બદલાવો", "સ્વીચ"}),
+    },
+    # ---------------------------------------------------------------
+    # UNVERIFIED below this line: best-effort native spellings, never
+    # confirmed against a real Sarvam STT transcript the way the four
+    # languages above were (see sarvam_switch_test*.py's methodology --
+    # TTS-generate genuine audio, feed through STT locked to the target
+    # language_code, inspect the actual transcript). Stage 2 (fuzzy) and
+    # Stage 3 (confirmation loop, below) exist specifically to keep these
+    # usable even if a spelling here doesn't match what Sarvam actually
+    # produces -- but don't treat these as demo-verified until tested.
+    # ---------------------------------------------------------------
+    "kn-IN": {
+        "name_tokens": frozenset({"kannada", "ಕನ್ನಡ"}),
+        "verb_tokens": frozenset({"ಬದಲಾಯಿಸು", "ಬದಲಿಸಿ", "ಸ್ವಿಚ್"}),
+    },
+    "bn-IN": {
+        "name_tokens": frozenset({"bengali", "bangla", "বাংলা"}),
+        "verb_tokens": frozenset({"পরিবর্তন", "বদলাও", "সুইচ"}),
+    },
+    "mr-IN": {
+        "name_tokens": frozenset({"marathi", "मराठी"}),
+        "verb_tokens": frozenset({"बदला", "बदलवा", "स्विच"}),
+    },
+    "pa-IN": {
+        "name_tokens": frozenset({"punjabi", "ਪੰਜਾਬੀ"}),
+        "verb_tokens": frozenset({"ਬਦਲੋ", "ਸਵਿੱਚ"}),
+    },
+    "ml-IN": {
+        "name_tokens": frozenset({"malayalam", "മലയാളം"}),
+        "verb_tokens": frozenset({"മാറ്റുക", "മാറൂ", "സ്വിച്ച്"}),
+    },
+    "or-IN": {
+        "name_tokens": frozenset({"odia", "oriya", "ଓଡ଼ିଆ"}),
+        "verb_tokens": frozenset({"ବଦଳାନ୍ତୁ", "ସ୍ୱିଚ୍"}),
+    },
 }
 
-_LANGUAGE_TRIGGER_PATTERN = re.compile(
-    r"\b(?:switch(?:ing)? to|(?:can|could) we (?:talk|speak) in|speak in|reply in)\s+"
-    r"(" + "|".join(_LANGUAGE_TRIGGER_MAP.keys()) + r")\b",
-    re.IGNORECASE,
-)
+# Stage 3's yes/no lexicon -- far smaller and more tractable than full
+# switch-phrase detection, since "yes"/"no" is a tiny closed set per
+# language. Matched the same way as everything else here (substring
+# containment, via detect_confirmation_response). Only multi/ta-IN/te-IN/
+# gu-IN entries share the same live-testing confidence as their
+# LANGUAGE_LEXICON counterparts above; the rest are best-effort.
+YES_TOKENS: FrozenSet[str] = frozenset({
+    "yes", "yeah", "yep", "sure", "correct", "right",
+    "haan", "han", "ha",
+    "ஆமாம்", "ஆம்", "అవును", "હા",
+    "ಹೌದು", "হ্যাঁ", "होय", "ਹਾਂ", "അതെ", "ହଁ",
+})
+NO_TOKENS: FrozenSet[str] = frozenset({
+    "no", "nah", "nope", "not", "nahi", "nahin",
+    "இல்லை", "వద్దు", "ના",
+    "ಇಲ್ಲ", "না", "नाही", "ਨਹੀਂ", "ഇല്ല", "ନା",
+})
+
+# How long a Stage-3 confirmation stays live before it silently expires --
+# same cooldown-marker discipline as MISSING_INFO_NUDGE_COOLDOWN_S/
+# DIRECT_ADDRESS_REPLY_COOLDOWN_S elsewhere in this file. Short on
+# purpose: a stray "yes" said minutes later, in an unrelated context,
+# must never retroactively commit a switch nobody was still confirming.
+LANGUAGE_CONFIRMATION_TIMEOUT_S = 15
+
+# Stage 2 fuzzy-match acceptance threshold (difflib.SequenceMatcher
+# .ratio(), stdlib, no new dependency) -- catches small transcription
+# jitter on an exact Stage-1 miss. NOT expected to catch every miss:
+# confirmed this session that Sarvam sometimes produces a confidently
+# wrong but genuinely DIFFERENT real word (மாறவும் -> மறையவும்), which a
+# string-similarity metric may or may not clear depending on incidental
+# character overlap -- Stage 3's confirmation loop, not this threshold,
+# is the real backstop for that case. Starting point, not empirically
+# tuned against a large sample yet.
+FUZZY_MATCH_THRESHOLD = 0.78
 
 
-def detect_language_switch_trigger(text: str) -> Optional[str]:
+def _normalize_text(text: str) -> str:
     """
-    Returns the target language_code (Sarvam's own target_language_code
-    format, or "multi" for the Deepgram tier) if this turn's text contains
-    an explicit switch-language request, else None. Caller (iCall_api's
-    _process_turn) compares the result against the call's current
-    language_code before acting -- a match on the language already active
-    is not a real switch request.
+    Stage 0: Unicode NFC-normalize + lowercase. Indic scripts can encode
+    the same visible character as different underlying codepoint
+    sequences (matra composition order) -- skipping this causes silent,
+    invisible mismatches that look identical on screen but fail `==`/`in`.
+    Lowercasing only affects Latin text (Indic scripts have no case), so
+    it's safe to apply unconditionally.
     """
-    match = _LANGUAGE_TRIGGER_PATTERN.search(text)
-    if not match:
-        return None
-    return _LANGUAGE_TRIGGER_MAP.get(match.group(1).lower())
+    return unicodedata.normalize("NFC", text).lower()
+
+
+def _contains_any(normalized_text: str, tokens: FrozenSet[str]) -> bool:
+    """Stage 1's lookup mechanism -- see LANGUAGE_LEXICON's docstring for
+    why this is substring containment, not token-set equality or regex."""
+    return any(token in normalized_text for token in tokens)
+
+
+def _fuzzy_contains_any(normalized_text: str, tokens: FrozenSet[str]) -> bool:
+    """
+    Stage 2: only called on a Stage-1 miss (rare path -- the O(words x
+    tokens) cost here is amortized to near-zero on the hot path). Compares
+    each whitespace-delimited word against each candidate token. See
+    FUZZY_MATCH_THRESHOLD's docstring for why this is a partial fix, not
+    a guarantee.
+    """
+    words = normalized_text.split()
+    return any(
+        difflib.SequenceMatcher(None, word, token).ratio() >= FUZZY_MATCH_THRESHOLD
+        for word in words
+        for token in tokens
+    )
+
+
+class SwitchTriggerResult(NamedTuple):
+    """
+    target is the requested language_code, or None if nothing matched at
+    all. confident distinguishes two real outcomes: True means a verb
+    signal and a language-name signal were both found (directly, or
+    recovered via Stage 2 fuzzy matching) -- act immediately. False means
+    only a language-name signal fired with no verb anywhere -- genuinely
+    ambiguous (someone could just be talking ABOUT that language, not
+    asking to switch to it), so the caller asks for confirmation (Stage 3)
+    rather than switching outright or silently dropping it.
+    """
+    target: Optional[str]
+    confident: bool
+
+
+def detect_language_switch_trigger(text: str) -> SwitchTriggerResult:
+    """
+    Stages 1-2: does this turn's text contain an explicit switch-language
+    request? See LANGUAGE_LEXICON's module-level docstring for the full
+    rationale and the live testing this is built from.
+
+    Caller (iCall_api._process_turn) compares .target against the call's
+    current language_code before acting -- a match on the language
+    already active is not a real switch request, confident or not.
+    """
+    normalized = _normalize_text(text)
+    has_verb = any(v in normalized for v in GLOBAL_VERB_TOKENS)
+
+    matched_lang: Optional[str] = None
+    for code, lex in LANGUAGE_LEXICON.items():
+        if matched_lang is None and _contains_any(normalized, lex["name_tokens"]):
+            matched_lang = code
+        if _contains_any(normalized, lex["verb_tokens"]):
+            has_verb = True
+
+    all_verb_tokens = frozenset(GLOBAL_VERB_TOKENS)
+    for lex in LANGUAGE_LEXICON.values():
+        all_verb_tokens |= lex["verb_tokens"]
+
+    # Stage 2, name half: only tried when Stage 1 found no exact
+    # language-name match anywhere -- confirmed live (incident-64,
+    # "ஆங்கிலே திருக்கு மாறுவோம்") that a garbled name token can clear a
+    # reasonable similarity threshold against the correct one
+    # (ஆங்கிலே -> ஆங்கிலம் scored 0.80) even when it wouldn't survive
+    # exact substring containment. Tried before giving up entirely, since
+    # without a matched_lang at all there's no Stage 3 confirmation to
+    # fall back to either -- the turn would otherwise be a complete,
+    # silent miss.
+    if matched_lang is None:
+        for code, lex in LANGUAGE_LEXICON.items():
+            if _fuzzy_contains_any(normalized, lex["name_tokens"]):
+                matched_lang = code
+                break
+
+    if matched_lang is None:
+        return SwitchTriggerResult(None, False)
+    if has_verb:
+        return SwitchTriggerResult(matched_lang, True)
+
+    # Stage 2, verb half: a language was matched (exactly or fuzzily) but
+    # no verb anywhere, exactly -- check for a near-miss verb form (STT
+    # noise) before falling back to a Stage 3 confirmation question.
+    if _fuzzy_contains_any(normalized, all_verb_tokens):
+        return SwitchTriggerResult(matched_lang, True)
+
+    return SwitchTriggerResult(matched_lang, False)
+
+
+def detect_confirmation_response(text: str) -> Optional[bool]:
+    """
+    Stage 3, second half: on the turn after a confirmation question was
+    asked, does this turn read as affirmative or negative? Returns None
+    for neither -- caller treats that the same as a decline, since an
+    unrelated reply or silence is not consent to switch languages mid
+    incident call.
+    """
+    normalized = _normalize_text(text)
+    if _contains_any(normalized, YES_TOKENS):
+        return True
+    if _contains_any(normalized, NO_TOKENS):
+        return False
+    return None
+
+
+def build_language_switch_confirmation_prompt(target_code: str) -> str:
+    """
+    Stage 3's question, spoken when a language was named but no clear
+    switch-verb accompanied it -- same "don't let the model freely
+    narrate a state change" discipline as build_language_switch_ack/
+    CLOSING_LINE. Caller stores a pending_language_confirmation flag (see
+    iCall_service.record_language_switch_confirmation_pending) and checks
+    the NEXT turn's text with detect_confirmation_response.
+    """
+    display_name = LANGUAGE_DISPLAY_NAMES.get(target_code, target_code)
+    return f"Did you want to switch to {display_name}?"
 
 
 def build_language_switch_ack(target_code: str) -> str:
