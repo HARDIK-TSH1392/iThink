@@ -261,8 +261,13 @@ For the multilingual pipeline (see its own section above): `SARVAM_API_KEY`
 is **required** for Tier 2 (the 9 non-English/Hindi languages) — without it,
 Sarvam STT/TTS calls fail outright for any call started in one of those
 languages. `WATCHER_GEOFENCE_INDIA` is optional/opt-in (any truthy value
-enables `geofence: {"area": "INDIA"}`) — leave it unset unless you've
-specifically measured the join-latency trade-off for your setup.
+enables `geofence: {"area": "INDIA"}`) — **measured, kept off**: a real
+side-by-side test (5 timed `/startAgent` calls each way, same machine, same
+session) showed no latency benefit (2.14s mean off vs. 2.46s mean on — if
+anything slightly slower, though the sample is small and noisy) and no join
+failures either way. Since it only costs you Agora's automatic cross-region
+failover with no upside shown, leave it unset unless you re-measure this
+yourself and see a real win.
 
 **Important:** the web client only produces a working voice agent when
 joined via a real `?channel=incident-N` link tied to an actual `IncidentCall`
@@ -282,7 +287,7 @@ custom-LLM endpoint. That's expected, not a bug.
 | Farewell handling | `farewell_config: {graceful_enabled: true, graceful_timeout_seconds: 5}` | Graceful call-end behavior |
 | Advanced features | `advanced_features: {enable_rtm: true, enable_tools: true}` | RTM messaging + native MCP tool-calling |
 | Native MCP tool-calling | `mcp_servers` list (GitHub, iLogs) | Live GitHub/log lookups mid-call — see its own section above |
-| Geofencing | `geofence: {"area": "INDIA"}`, opt-in via `WATCHER_GEOFENCE_INDIA` | Routes Agora infra within the India region; opt-in, not default, due to a real cross-region-failover latency trade-off |
+| Geofencing | `geofence: {"area": "INDIA"}`, opt-in via `WATCHER_GEOFENCE_INDIA` | Would route Agora infra within the India region — **measured and kept off**: a real side-by-side test (5 timed `/startAgent` calls each way) showed no latency benefit (2.14s mean off vs. 2.46s mean on) and no failures either way, so it's not worth giving up automatic cross-region failover for. See "Setup — voice agent" above for the numbers. |
 | Custom LLM proxy | Agent's LLM `base_url` pointed at `iCall`'s `chat/completions` endpoint | Every turn's reasoning happens in this repo's own Gemini-backed logic, not a managed LLM |
 | Agent handoff (no live ASR/TTS update exists) | `client.agents.get()` (status poll) + `stop_agent()` + a fresh `start()` with the same `agent_uid`/`user_uid` | Only way to change STT/TTS vendor mid-call — `UpdateAgentsRequestProperties` has exactly `token`/`llm`/`mllm`, confirmed from source, no `asr`/`tts` field at all |
 | Webhook events | `POST /webhooks/agora` receives all 7 event types; **only `agent_left` (102) is wired to real behavior** | The authoritative, client-independent "call ended" signal — the other 6 (`agent_joined`, `dialogue_history`, `agent_error`, `performance_metrics`, `incoming/outgoing_call_status`) are logged, not acted on |
