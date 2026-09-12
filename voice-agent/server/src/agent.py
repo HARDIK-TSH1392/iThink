@@ -342,7 +342,10 @@ class Agent:
             ilogs_server: Dict[str, Any] = {
                 "name": "ilogs",
                 "endpoint": ilogs_mcp_url,
-                "allowed_tools": ["get_recent_logs", "get_incident_status", "list_action_items"],
+                "allowed_tools": [
+                    "get_recent_logs", "get_incident_status", "list_action_items",
+                    "search_similar_incidents",
+                ],
                 "timeout_ms": 8000,
             }
             # Closes the "anyone with the tunnel URL can read our incident

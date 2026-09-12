@@ -50,6 +50,39 @@ def _check_shared_secret(ctx: Context) -> None:
         raise ToolError("Unauthorized: missing or incorrect shared secret.")
 
 
+async def require_incident_approved(channel_name: str) -> dict:
+    """
+    Gate for any FUTURE write-capable tool (e.g. a PagerDuty page, a
+    GitHub write action) -- raises ToolError unless this channel's
+    incident has actually been approved. Neither tool in this file today
+    takes a real action (get_recent_logs/get_incident_status/
+    list_action_items/search_similar_incidents are all read-only, and
+    GitHub's own MCP tools are scoped read-only too -- see agent.py's
+    allowed_tools), so nothing calls this yet. It exists so the next
+    write-capable tool has a ready, tested "no action without human
+    approval" check to call at its very first line, instead of that
+    discipline living only in a prompt instruction the model could ignore
+    or a human could forget to add.
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        call_response = await client.get(f"{ITHINK_BACKEND_BASE_URL}/icall/channel/{channel_name}")
+        if call_response.status_code == 404:
+            raise ToolError(f"No call found for channel '{channel_name}'.")
+        call_response.raise_for_status()
+        call = call_response.json()
+
+        incident_response = await client.get(f"{ITHINK_BACKEND_BASE_URL}/incidents/{call['incident_id']}")
+        incident_response.raise_for_status()
+        incident = incident_response.json()
+
+    if not incident.get("approved_by"):
+        raise ToolError(
+            f"Incident #{incident['id']} has not been approved yet -- this action requires "
+            "human approval first."
+        )
+    return incident
+
+
 @app.tool()
 async def get_recent_logs(
     service: str,
@@ -160,6 +193,68 @@ async def list_action_items(channel_name: str, ctx: Context) -> list[dict]:
         call = response.json()
 
     return call.get("structured_state", {}).get("action_items", [])
+
+
+@app.tool()
+async def search_similar_incidents(query: str, ctx: Context, service: str = "", limit: int = 5) -> list[dict]:
+    """
+    Search past CLOSED incidents by keyword against their title/summary,
+    optionally narrowed to one service. Use when someone asks "has this
+    happened before" or similar -- not a general incident list.
+
+    Generalizes the existing one-incident "related incident" note (see
+    backend's iCall_utils.format_related_incident_note, auto-injected at
+    call start for the same service/region) into something the model can
+    actively query across more incidents and services. Same discipline as
+    that note, deliberately: returns only title/summary/service/region/
+    priority/resolved_at, never the past incident's own facts or
+    decisions -- pulling those in verbatim risks treating an unrelated
+    past cause as this incident's own confirmed fact. Mention a result
+    only if it's actually relevant to what's being discussed, never
+    assume the same root cause without evidence from this call.
+
+    Filters on "closed", not the STATUS_RESOLVED constant that note uses
+    -- confirmed live that no code path ever actually sets an incident's
+    status to "resolved" (only "closed" is ever assigned), so filtering
+    on it the same way that note does would silently return nothing.
+    """
+    _check_shared_secret(ctx)
+
+    params: dict = {"status": "closed", "limit": 100}
+    if service:
+        params["service"] = service
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.get(f"{ITHINK_BACKEND_BASE_URL}/incidents/", params=params)
+        response.raise_for_status()
+        incidents = response.json()
+
+    keywords = [w for w in query.lower().split() if len(w) > 2]
+
+    def score(incident: dict) -> int:
+        text = f"{incident.get('title', '')} {incident.get('summary') or ''}".lower()
+        return sum(1 for kw in keywords if kw in text)
+
+    scored = sorted(incidents, key=score, reverse=True)
+    matched = [i for i in scored if score(i) > 0][:limit]
+    if not matched:
+        # No keyword hit -- fall back to the most recent resolved
+        # incidents (already newest-first from the backend) rather than
+        # returning nothing, same "something useful beats a false
+        # negative" reasoning as get_recent_logs' generous default window.
+        matched = incidents[:limit]
+
+    return [
+        {
+            "title": i["title"],
+            "summary": i.get("summary"),
+            "service": i["service"],
+            "region": i["region"],
+            "priority": i["priority"],
+            "resolved_at": i["resolved_at"],
+        }
+        for i in matched
+    ]
 
 
 if __name__ == "__main__":
