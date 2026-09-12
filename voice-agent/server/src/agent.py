@@ -1097,6 +1097,43 @@ class Agent:
                 # shorter and only spoken once, so the same echo path may
                 # just be less likely to land mid-sentence there.
                 interruption={"enable": False},
+                # Confirmed live (2026-09-12, debug=True dump of the actual
+                # resolved request): this agent was sending NO turn_detection
+                # config at all, so every VAD threshold ran on Agora's raw
+                # SDK defaults -- the exact same defaults Watcher's own
+                # turn_detection comment (above, in _start_locked) already
+                # documents as too twitchy: a brief noise burst reads as
+                # "start of speech" and the agent's own outgoing track gets
+                # briefly muted while it reacts, which "sounds identical to
+                # a broken/cut voice" -- Watcher's own words, from before
+                # THAT agent got the same tuning below. interruption.enable
+                # =False (above) only stops this agent from abandoning its
+                # reply on a detected interruption; it does nothing about
+                # the underlying VAD still firing and the track still
+                # blipping. Reusing Watcher's own proven values rather than
+                # re-deriving new ones -- language matches this agent's own
+                # STT (en-IN, see DeepgramSTT below), semantic end-of-speech
+                # kept off (mode="vad") since this agent has no structuring
+                # pipeline that needs "is this thought grammatically
+                # complete" judgment the way Watcher's does.
+                turn_detection={
+                    "language": "en-IN",
+                    "config": {
+                        "speech_threshold": 0.3,
+                        "start_of_speech": {
+                            "mode": "vad",
+                            "vad_config": {
+                                "interrupt_duration_ms": 350,
+                                "speaking_interrupt_duration_ms": 650,
+                                "prefix_padding_ms": 300,
+                            },
+                        },
+                        "end_of_speech": {
+                            "mode": "vad",
+                            "vad_config": {"silence_duration_ms": 800},
+                        },
+                    },
+                },
                 advanced_features={"enable_rtm": True},
             )
             .with_stt(stt)
