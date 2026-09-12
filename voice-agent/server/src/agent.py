@@ -1206,6 +1206,27 @@ class Agent:
             debug=True,
         )
 
+        # Registers this agent's own display name into the same uid->name
+        # map /getNames already serves (see server.py's set_name/_channel_names)
+        # -- the web client's tile/transcript label lookups already fall
+        # back to that map for any uid that isn't Watcher's own, so this
+        # needs no frontend change at all. Local import (not top-level)
+        # because server.py imports Agent from this module -- importing
+        # server.py back at module load time would be circular; deferring
+        # it to call time, after both modules have finished loading, is
+        # not. Registered BEFORE session.start(), not after -- confirmed
+        # live (2026-09-12) that doing it after left the earliest
+        # transcript lines stuck on "Participant <uid>": Agora starts the
+        # session (and the avatar can already be mid-greeting) the moment
+        # it processes the join, before this coroutine's own await even
+        # returns, so the client's next name poll could already be racing
+        # ahead of a name registered only afterward.
+        from server import _channel_names
+
+        _channel_names.setdefault(channel_name, {})[str(avatar_agent_uid)] = (
+            f"{approver_name}'s Avatar"
+        )
+
         logger.info(
             "Starting delegate avatar agent channel=%s agent_uid=%s", channel_name, avatar_agent_uid
         )
@@ -1213,20 +1234,6 @@ class Agent:
         self._sessions[agent_id] = session
         self._channel_delegate_agents[channel_name] = agent_id
         logger.info("Started delegate avatar agent agent_id=%s channel=%s", agent_id, channel_name)
-
-        # Registers this agent's own display name into the same uid->name
-        # map /getNames already serves (see server.py's set_name/_channel_names)
-        # -- the web client's tile-label lookup already falls back to that
-        # map for any uid that isn't Watcher's own, so this needs no
-        # frontend change at all. Local import (not top-level) because
-        # server.py imports Agent from this module -- importing server.py
-        # back at module load time would be circular; deferring it to call
-        # time, after both modules have finished loading, is not.
-        from server import _channel_names
-
-        _channel_names.setdefault(channel_name, {})[str(avatar_agent_uid)] = (
-            f"{approver_name}'s Avatar"
-        )
 
     async def stop(self, agent_id: str) -> None:
         """
