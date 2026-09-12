@@ -7,8 +7,12 @@ from app.config import get_settings
 from app.database import async_session
 from app.iNcidents.iNcidents_crudl import get_incident, record_approval_decision
 from app.iNcidents.iNcidents_utils import STATUS_AWAITING_APPROVAL
-from app.iCall.iCall_service import get_call
-from app.iCall.iCall_utils import review_ticket_content
+from app.iCall.iCall_service import (
+    get_call,
+    find_awaiting_delegate_review_call,
+    update_delegate_review_draft,
+)
+from app.iCall.iCall_utils import review_ticket_content, parse_delegate_reply
 
 from .iOrchestrate_utils import (
     verify_slack_signature,
@@ -17,6 +21,10 @@ from .iOrchestrate_utils import (
     format_call_summary,
     create_jira_ticket,
     post_jira_ticket_created_notification,
+    open_slack_delegate_modal,
+    reply_to_delegate_dm,
+    approve_incident_with_delegate_notes,
+    create_ticket_from_delegate_review,
 )
 
 router = APIRouter(prefix="/iorchestrate", tags=["iOrchestrate"])
@@ -36,17 +44,61 @@ async def _handle_incident_decision(db, action_id: str, incident_id: int, user_n
         )
         return
 
-    decision = "approve" if action_id == "approve_incident" else "reject"
+    decision = "approve" if action_id in ("approve_join", "approve_incident") else "reject"
     incident = await record_approval_decision(db, incident, decision, approved_by=user_name)
 
     if decision == "approve":
         await update_slack_message(
             response_url,
-            f"✅ *Incident #{incident_id} approved* by {user_name}. Status: `{incident.status}`.",
+            f"✅ *Incident #{incident_id} approved* by {user_name} — you'll join the call. "
+            f"Status: `{incident.status}`.",
         )
         await notify_incident_approved(db, incident)
     else:
         await update_slack_message(response_url, f"❌ *Incident #{incident_id} rejected* by {user_name}.")
+
+
+async def _handle_approve_delegate(db, incident_id: int, trigger_id: str, response_url: str):
+    """
+    Just opens the modal -- the incident is NOT approved yet. Approval and
+    delegate_notes both get set together on modal submission (see
+    _handle_delegate_modal_submission), so a lead who opens this and then
+    cancels the modal hasn't approved anything, same as never clicking a
+    button at all.
+    """
+    incident = await get_incident(db, incident_id)
+    if not incident:
+        await update_slack_message(response_url, f"⚠️ Incident #{incident_id} not found.")
+        return
+    if incident.status != STATUS_AWAITING_APPROVAL:
+        await update_slack_message(
+            response_url,
+            f"⚠️ Incident #{incident_id} is no longer awaiting approval "
+            f"(current status: `{incident.status}`) — no action taken.",
+        )
+        return
+    opened = await open_slack_delegate_modal(trigger_id, incident_id)
+    if not opened:
+        await update_slack_message(
+            response_url,
+            f"⚠️ Couldn't open the delegate form for incident #{incident_id} — try again, "
+            f"or use \"Approve — I'll join\" instead.",
+        )
+
+
+async def _handle_delegate_modal_submission(db, payload: dict) -> None:
+    """
+    Submitting with the text field left blank -- e.g. they used the voice
+    link instead and are just closing this form -- safely no-ops via
+    approve_incident_with_delegate_notes's own blank-notes guard, rather
+    than approving with empty notes.
+    """
+    incident_id = int(payload["view"]["private_metadata"])
+    values = payload["view"]["state"]["values"]
+    notes = values["delegate_notes_block"]["delegate_notes_input"].get("value") or ""
+    user_name = payload.get("user", {}).get("username") or payload.get("user", {}).get("name", "unknown")
+
+    await approve_incident_with_delegate_notes(db, incident_id, notes, user_name)
 
 
 async def _handle_jira_decision(db, action_id: str, call_id: int, user_name: str, response_url: str):
@@ -97,17 +149,41 @@ async def _handle_jira_decision(db, action_id: str, call_id: int, user_name: str
         )
 
 
-@router.post("/slack/interact")
-async def slack_interactivity_endpoint(request: Request):
+async def _handle_delegate_review_approve(db, call_id: int, user_name: str, response_url: str):
     """
-    Receives Slack's interactive-component payload for any button click --
-    incident approve/reject, or the second Jira-creation gate. Verifies the
-    request is genuinely from Slack, dispatches to the matching handler,
-    and updates the original message in place via its response_url.
+    The Approve as-is button on a delegate review DM (see
+    notify_delegate_review_needed) -- the button-driven twin of typing
+    "approve" in that same DM thread, both routed through the one shared
+    create_ticket_from_delegate_review so whichever path fires, the ticket
+    reflects whatever draft is current (including any correction already
+    sent by reply) rather than re-deriving from the call's raw state.
     """
-    raw_body = await request.body()
-    settings = get_settings()
+    call = await get_call(db, call_id)
+    if not call:
+        await update_slack_message(response_url, f"⚠️ Call #{call_id} not found.")
+        return
 
+    if not (call.structured_state or {}).get("delegate_review_draft"):
+        await update_slack_message(
+            response_url,
+            "⚠️ Nothing pending for this review anymore -- it may have already been approved.",
+        )
+        return
+
+    url, _draft, incident = await create_ticket_from_delegate_review(db, call)
+    if url:
+        await update_slack_message(response_url, f"✅ Approved by {user_name} — Jira ticket created: {url}")
+    else:
+        incident_ref = f"#{incident.id}" if incident else "unknown"
+        await update_slack_message(
+            response_url,
+            f"⚠️ Approved by {user_name}, but ticket creation failed for incident {incident_ref} — "
+            f"check JIRA_* config / server logs.",
+        )
+
+
+def _verify_slack_request(raw_body: bytes, request: Request) -> None:
+    settings = get_settings()
     if settings.slack_signing_secret:
         timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
         signature = request.headers.get("X-Slack-Signature", "")
@@ -115,6 +191,24 @@ async def slack_interactivity_endpoint(request: Request):
             raise HTTPException(status_code=401, detail="Invalid Slack signature")
     else:
         print("[iOrchestrate] SLACK_SIGNING_SECRET not set — accepting unverified (dev only)")
+
+
+@router.post("/slack/interact")
+async def slack_interactivity_endpoint(request: Request):
+    """
+    Receives Slack's interactive-component payload for a button click
+    (incident approve/reject/delegate, the Jira-creation gate) or a modal
+    submission (the delegate-notes form). Verifies the request is
+    genuinely from Slack, dispatches to the matching handler.
+
+    Two distinct Slack payload shapes land here, dispatched on
+    payload["type"]: "block_actions" (a button click -- carries
+    payload["actions"], updates the original message via response_url) and
+    "view_submission" (a modal's Submit button -- carries payload["view"],
+    no response_url; Slack just wants a 200 to close the modal).
+    """
+    raw_body = await request.body()
+    _verify_slack_request(raw_body, request)
 
     # Slack sends application/x-www-form-urlencoded with a `payload` field
     # containing the actual JSON.
@@ -124,18 +218,116 @@ async def slack_interactivity_endpoint(request: Request):
         raise HTTPException(status_code=422, detail="Missing Slack interaction payload")
 
     payload = json.loads(payload_raw)
-    action = payload["actions"][0]
-    action_id = action["action_id"]
-    value = int(action["value"])
-    response_url = payload["response_url"]
-    user_name = payload.get("user", {}).get("username") or payload.get("user", {}).get("name", "unknown")
+    payload_type = payload.get("type")
 
     async with async_session() as db:
-        if action_id in ("approve_incident", "reject_incident"):
+        if payload_type == "view_submission":
+            if payload.get("view", {}).get("callback_id") == "delegate_notes_modal":
+                await _handle_delegate_modal_submission(db, payload)
+            # Empty 200 closes the modal (Slack's default when no
+            # response_action is returned) -- no response_url exists for
+            # this payload type.
+            return {}
+
+        action = payload["actions"][0]
+        action_id = action["action_id"]
+        value = int(action["value"])
+        response_url = payload["response_url"]
+        user_name = payload.get("user", {}).get("username") or payload.get("user", {}).get("name", "unknown")
+
+        if action_id in ("approve_join", "approve_incident", "reject_incident"):
             await _handle_incident_decision(db, action_id, value, user_name, response_url)
+        elif action_id == "approve_delegate":
+            trigger_id = payload.get("trigger_id")
+            if trigger_id:
+                # Open the modal FIRST -- trigger_id expires in ~3s, and
+                # this is the only synchronous, immediate thing this
+                # handler does; everything else (recording the decision)
+                # happens later, on modal submission.
+                await _handle_approve_delegate(db, value, trigger_id, response_url)
+            else:
+                await update_slack_message(response_url, "⚠️ Missing trigger_id — try clicking again.")
         elif action_id in ("create_jira_ticket", "skip_jira_ticket"):
             await _handle_jira_decision(db, action_id, value, user_name, response_url)
+        elif action_id == "approve_delegate_review":
+            await _handle_delegate_review_approve(db, value, user_name, response_url)
         else:
             await update_slack_message(response_url, f"⚠️ Unknown action: {action_id}")
+
+    return {"status": "ok"}
+
+
+@router.post("/slack/events")
+async def slack_events_endpoint(request: Request):
+    """
+    Slack's Events API -- the free-text half of the delegate-review loop
+    (see notify_delegate_review_needed): the lead's DM reply carries no
+    action_id/value the way a button click does, so this is a genuinely
+    different Slack integration surface from /slack/interact's interactive
+    components.
+
+    Requires Event Subscriptions enabled in the Slack App config (api.slack.com
+    -> your app -> Event Subscriptions), subscribed to `message.im`, with
+    `im:history` added to Bot Token Scopes and the app reinstalled to pick
+    up the new scope -- none of this is needed for /slack/interact, and
+    isn't set up by anything in this codebase; it's an external dashboard
+    step. Request URL verification (the "challenge" handshake below) is
+    what that page checks when you first save this endpoint's public URL.
+    """
+    raw_body = await request.body()
+    _verify_slack_request(raw_body, request)
+
+    payload = json.loads(raw_body)
+
+    # One-time handshake when this URL is first registered in Slack's
+    # Event Subscriptions page -- echo the challenge back verbatim.
+    if payload.get("type") == "url_verification":
+        return {"challenge": payload.get("challenge")}
+
+    event = payload.get("event", {})
+    # Only real human DMs: skip bot messages (including this app's own DM
+    # replies, which would otherwise loop back into this same handler),
+    # message edits/deletes (message.im also delivers subtype "message_changed"
+    # etc.), and anything that isn't a plain DM.
+    if (
+        payload.get("type") != "event_callback"
+        or event.get("type") != "message"
+        or event.get("channel_type") != "im"
+        or event.get("subtype")
+        or event.get("bot_id")
+        or not event.get("user")
+        or not event.get("text")
+    ):
+        return {"status": "ok"}
+
+    slack_user_id = event["user"]
+    reply_text = event["text"]
+
+    async with async_session() as db:
+        call = await find_awaiting_delegate_review_call(db, slack_user_id)
+        if call is None:
+            # Not a reply we're expecting from this user right now -- most
+            # DM traffic to this bot, if any, isn't part of an active
+            # delegate review. Silently ignore rather than replying to
+            # every stray message.
+            return {"status": "ok"}
+
+        current_draft = (call.structured_state or {}).get("delegate_review_draft", "")
+        result = await parse_delegate_reply(current_draft, reply_text)
+
+        if result.decision == "approve":
+            url, _draft, _incident = await create_ticket_from_delegate_review(db, call)
+            if url:
+                await reply_to_delegate_dm(slack_user_id, f"{result.acknowledgement}\n📋 {url}")
+            else:
+                await reply_to_delegate_dm(
+                    slack_user_id,
+                    "Approved, but ticket creation failed — check JIRA_* config or try again shortly.",
+                )
+        elif result.decision == "edit":
+            await update_delegate_review_draft(db, call, result.updated_draft)
+            await reply_to_delegate_dm(slack_user_id, result.acknowledgement)
+        else:
+            await reply_to_delegate_dm(slack_user_id, result.acknowledgement)
 
     return {"status": "ok"}

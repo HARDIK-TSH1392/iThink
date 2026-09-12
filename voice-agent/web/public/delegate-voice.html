@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watcher — Speak your update</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0b0e14;
+    --bg-radial: #10141d;
+    --surface: #141924;
+    --surface-raised: #1a2130;
+    --border: #262e3f;
+    --border-soft: #1e2531;
+    --text: #e9edf3;
+    --text-muted: #8b96ab;
+    --text-faint: #5b6577;
+    --accent: #3fe0c5;
+    --accent-dim: #2a9c8a;
+    --accent-ink: #06201b;
+    --live: #ff6b5e;
+    --live-dim: #7a3730;
+    --danger-bg: #2a1416;
+    --danger-text: #ff9a90;
+    --success-bg: #10241f;
+    --success-border: #1f4a3d;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    font-family: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+    margin: 0;
+    padding: 48px 20px 64px;
+    min-height: 100vh;
+    color: var(--text);
+    background:
+      radial-gradient(120% 90% at 50% -10%, var(--bg-radial) 0%, var(--bg) 55%);
+    background-attachment: fixed;
+  }
+
+  .page {
+    max-width: 480px;
+    margin: 0 auto;
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin-bottom: 28px;
+  }
+  .brand-mark {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 10px 2px rgba(63, 224, 197, 0.55);
+  }
+  .brand-name {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  h1 {
+    font-family: "Fraunces", Georgia, serif;
+    font-weight: 600;
+    font-size: 30px;
+    line-height: 1.15;
+    letter-spacing: -0.01em;
+    margin: 0 0 8px;
+    text-align: center;
+    text-wrap: balance;
+  }
+  p.sub {
+    color: var(--text-muted);
+    font-size: 14.5px;
+    line-height: 1.55;
+    margin: 0 0 32px;
+    text-align: center;
+    text-wrap: balance;
+  }
+
+  .step {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent-dim);
+    text-align: center;
+    margin-bottom: 12px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-radius: 16px;
+    padding: 28px 24px;
+    margin-bottom: 16px;
+    box-shadow: 0 20px 40px -24px rgba(0, 0, 0, 0.6);
+  }
+  .center { text-align: center; }
+
+  .prompt {
+    font-size: 14px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    margin: 0 0 28px;
+  }
+
+  /* --- record button + waveform --- */
+  .record-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 18px;
+  }
+
+  button.record {
+    position: relative;
+    width: 108px;
+    height: 108px;
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent);
+    box-shadow: 0 0 0 1px rgba(63, 224, 197, 0.3), 0 12px 32px -8px rgba(63, 224, 197, 0.45);
+    transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.2s ease;
+  }
+  button.record:hover { transform: scale(1.03); }
+  button.record:active { transform: scale(0.97); }
+  button.record:disabled { cursor: not-allowed; opacity: 0.5; transform: none; }
+
+  button.record::before {
+    content: "";
+    position: absolute;
+    inset: -10px;
+    border-radius: 50%;
+    border: 1.5px solid rgba(63, 224, 197, 0.35);
+  }
+
+  .mic-icon {
+    width: 26px;
+    height: 26px;
+    fill: none;
+    stroke: var(--accent-ink);
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    position: relative;
+    z-index: 1;
+  }
+
+  button.record.recording {
+    background: var(--live);
+    box-shadow: 0 0 0 1px rgba(255, 107, 94, 0.35), 0 12px 32px -8px rgba(255, 107, 94, 0.5);
+  }
+  button.record.recording::before {
+    border-color: rgba(255, 107, 94, 0.4);
+    animation: ripple 1.6s ease-out infinite;
+  }
+  button.record.recording .mic-icon { stroke: #2a0d0a; }
+  @keyframes ripple {
+    0% { transform: scale(1); opacity: 0.9; }
+    100% { transform: scale(1.55); opacity: 0; }
+  }
+
+  .record-label {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text);
+  }
+
+  .bars {
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    gap: 4px;
+    height: 22px;
+    opacity: 0.35;
+  }
+  .bars span {
+    width: 3px;
+    border-radius: 2px;
+    background: var(--text-faint);
+    height: 6px;
+    transition: background 0.2s ease;
+  }
+  .recording ~ .bars,
+  .record-wrap:has(.recording) .bars { opacity: 1; }
+  .record-wrap:has(.recording) .bars span { background: var(--live); animation: wave 900ms ease-in-out infinite; }
+  .bars span:nth-child(1) { animation-delay: 0ms; }
+  .bars span:nth-child(2) { animation-delay: 120ms; }
+  .bars span:nth-child(3) { animation-delay: 240ms; }
+  .bars span:nth-child(4) { animation-delay: 360ms; }
+  .bars span:nth-child(5) { animation-delay: 480ms; }
+  @keyframes wave {
+    0%, 100% { height: 6px; }
+    50% { height: 22px; }
+  }
+
+  .timer {
+    font-family: "IBM Plex Mono", monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 15px;
+    color: var(--live);
+    letter-spacing: 0.02em;
+  }
+
+  /* --- review + form --- */
+  .field { margin-bottom: 18px; }
+  .field:last-of-type { margin-bottom: 0; }
+  label {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    display: block;
+    margin-bottom: 8px;
+  }
+  textarea, input[type=text] {
+    width: 100%;
+    font-family: inherit;
+    font-size: 14.5px;
+    line-height: 1.5;
+    color: var(--text);
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  textarea { min-height: 150px; resize: vertical; }
+  textarea:focus, input[type=text]:focus {
+    outline: none;
+    border-color: var(--accent-dim);
+    box-shadow: 0 0 0 3px rgba(63, 224, 197, 0.15);
+  }
+  textarea::placeholder, input::placeholder { color: var(--text-faint); }
+
+  .actions { display: flex; gap: 10px; margin-top: 22px; }
+  button {
+    font-family: inherit;
+    font-size: 14.5px;
+    font-weight: 500;
+    border: none;
+    border-radius: 10px;
+    padding: 13px 20px;
+    cursor: pointer;
+    transition: opacity 0.15s ease, transform 0.1s ease;
+  }
+  button:active { transform: scale(0.98); }
+  #confirm-btn {
+    flex: 1;
+    background: var(--accent);
+    color: var(--accent-ink);
+  }
+  #confirm-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  button.secondary {
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+  }
+  button.secondary:hover { color: var(--text); border-color: var(--text-faint); }
+
+  .error {
+    background: var(--danger-bg);
+    color: var(--danger-text);
+    border: 1px solid rgba(255, 107, 94, 0.25);
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 13.5px;
+    line-height: 1.5;
+    margin-bottom: 18px;
+  }
+
+  .success {
+    background: var(--success-bg);
+    border: 1px solid var(--success-border);
+  }
+  .success-icon {
+    width: 44px;
+    height: 44px;
+    margin: 0 auto 16px;
+    border-radius: 50%;
+    background: rgba(63, 224, 197, 0.12);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .success-icon svg {
+    width: 20px;
+    height: 20px;
+    stroke: var(--accent);
+    stroke-width: 2.5;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .success h2 {
+    font-family: "Fraunces", Georgia, serif;
+    font-weight: 600;
+    font-size: 20px;
+    margin: 0 0 8px;
+  }
+  .success p {
+    color: var(--text-muted);
+    font-size: 14px;
+    line-height: 1.55;
+    margin: 0;
+  }
+
+  [hidden] { display: none !important; }
+
+  @media (max-width: 400px) {
+    .card { padding: 22px 18px; }
+    h1 { font-size: 26px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+<div class="brand">
+  <span class="brand-mark"></span>
+  <span class="brand-name">Watcher</span>
+</div>
+
+<h1>Speak your update</h1>
+<p class="sub">Watcher will join the call in your place and open with this. Record, review, then confirm.</p>
+
+<div id="error-box" class="error" hidden></div>
+
+<div id="record-card" class="card center">
+  <div class="step">Step 1 of 3 — Record</div>
+  <p class="prompt">What have you done so far, and what should Watcher cover or ask about?</p>
+  <div class="record-wrap">
+    <button id="record-btn" class="record">
+      <span class="dot" hidden></span>
+      <svg class="mic-icon" viewBox="0 0 24 24">
+        <path d="M12 15a3.5 3.5 0 0 0 3.5-3.5V6a3.5 3.5 0 0 0-7 0v5.5A3.5 3.5 0 0 0 12 15Z"/>
+        <path d="M19 11.5a7 7 0 0 1-14 0"/>
+        <path d="M12 18.5V22"/>
+      </svg>
+    </button>
+    <span id="record-label" class="record-label">Start recording</span>
+    <div class="bars"><span></span><span></span><span></span><span></span><span></span></div>
+    <div id="timer" class="timer" hidden>0:00</div>
+  </div>
+</div>
+
+<div id="review-card" class="card" hidden>
+  <div class="step">Step 2 of 3 — Review</div>
+  <div class="field">
+    <label for="transcript">Your update (edit if anything's off)</label>
+    <textarea id="transcript"></textarea>
+  </div>
+  <div class="field">
+    <label for="approver-name">Your name</label>
+    <input type="text" id="approver-name" placeholder="e.g. Priya Sharma">
+  </div>
+  <div class="actions">
+    <button id="confirm-btn">Confirm &amp; approve</button>
+    <button id="rerecord-btn" class="secondary">Record again</button>
+  </div>
+</div>
+
+<div id="success-card" class="card success center" hidden>
+  <div class="success-icon"><svg viewBox="0 0 24 24"><path d="M4 12.5l5 5L20 7"/></svg></div>
+  <h2>You're all set</h2>
+  <p>The incident is approved and Watcher has your update.<br>You can close this page.</p>
+</div>
+
+</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const incidentId = params.get("incident");
+// Matches demo/dashboard.html's own convention: edit this constant if the
+// backend isn't running locally, or override per-link with ?api=<url>
+// (useful since a tunnel URL changes every restart).
+let API_BASE = params.get("api") || "http://127.0.0.1:8123/api/v1";
+
+const errorBox = document.getElementById("error-box");
+const recordCard = document.getElementById("record-card");
+const reviewCard = document.getElementById("review-card");
+const successCard = document.getElementById("success-card");
+const recordBtn = document.getElementById("record-btn");
+const recordLabel = document.getElementById("record-label");
+const timerEl = document.getElementById("timer");
+const transcriptEl = document.getElementById("transcript");
+const approverNameEl = document.getElementById("approver-name");
+const confirmBtn = document.getElementById("confirm-btn");
+const rerecordBtn = document.getElementById("rerecord-btn");
+
+function showError(msg) {
+  errorBox.textContent = msg;
+  errorBox.hidden = false;
+}
+function clearError() {
+  errorBox.hidden = true;
+}
+
+if (!incidentId) {
+  showError("Missing incident id in the link — ask whoever sent this to resend it.");
+  recordBtn.disabled = true;
+}
+
+let mediaRecorder = null;
+let chunks = [];
+let timerInterval = null;
+let startedAt = null;
+let recording = false;
+
+async function startRecording() {
+  clearError();
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    showError("This browser doesn't support in-browser recording — try a recent Chrome, Safari, or Edge.");
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    chunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop());
+      handleRecordingStopped();
+    };
+    mediaRecorder.start();
+    recording = true;
+    startedAt = Date.now();
+    recordBtn.classList.add("recording");
+    recordLabel.textContent = "Stop recording";
+    timerEl.hidden = false;
+    timerInterval = setInterval(() => {
+      const secs = Math.floor((Date.now() - startedAt) / 1000);
+      timerEl.textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+    }, 250);
+  } catch (err) {
+    showError("Couldn't access your microphone — check the browser's permission prompt and try again.");
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && recording) {
+    mediaRecorder.stop();
+    recording = false;
+    recordBtn.classList.remove("recording");
+    clearInterval(timerInterval);
+  }
+}
+
+recordBtn.addEventListener("click", () => {
+  if (recording) stopRecording();
+  else startRecording();
+});
+
+async function handleRecordingStopped() {
+  recordLabel.textContent = "Transcribing…";
+  recordBtn.disabled = true;
+  const mimeType = mediaRecorder.mimeType || "audio/webm";
+  const blob = new Blob(chunks, { type: mimeType });
+
+  const form = new FormData();
+  form.append("audio", blob, "delegate-note." + (mimeType.includes("mp4") ? "m4a" : "webm"));
+
+  try {
+    const res = await fetch(`${API_BASE}/icall/incidents/${incidentId}/delegate-voice-note`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || `Transcription failed (${res.status})`);
+    }
+    transcriptEl.value = data.data.transcript;
+    recordCard.hidden = true;
+    reviewCard.hidden = false;
+  } catch (err) {
+    showError(err.message || "Something went wrong transcribing that — try recording again.");
+    recordLabel.textContent = "Start recording";
+    recordBtn.disabled = false;
+    timerEl.hidden = true;
+  }
+}
+
+rerecordBtn.addEventListener("click", () => {
+  reviewCard.hidden = true;
+  recordCard.hidden = false;
+  recordLabel.textContent = "Start recording";
+  recordBtn.disabled = false;
+  timerEl.hidden = true;
+  timerEl.textContent = "0:00";
+});
+
+confirmBtn.addEventListener("click", async () => {
+  clearError();
+  const notes = transcriptEl.value.trim();
+  const approvedBy = approverNameEl.value.trim();
+  if (!notes) {
+    showError("The update is empty — record again or type something before confirming.");
+    return;
+  }
+  if (!approvedBy) {
+    showError("Add your name so the approval is attributed to you.");
+    return;
+  }
+  confirmBtn.disabled = true;
+  confirmBtn.textContent = "Confirming…";
+
+  const form = new FormData();
+  form.append("notes", notes);
+  form.append("approved_by", approvedBy);
+
+  try {
+    const res = await fetch(`${API_BASE}/icall/incidents/${incidentId}/delegate-approve`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || `Approval failed (${res.status})`);
+    }
+    reviewCard.hidden = true;
+    successCard.hidden = false;
+  } catch (err) {
+    showError(err.message || "Something went wrong approving — try again.");
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = "Confirm & approve";
+  }
+});
+</script>
+
+</body>
+</html>

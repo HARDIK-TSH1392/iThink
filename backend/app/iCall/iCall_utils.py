@@ -20,6 +20,7 @@ from .iCall_schema import (
     ActionItemOwnerAssignments,
     UnresolvedRisksSummary,
     ReviewedTicketContent,
+    DelegateReplyResult,
 )
 
 # -----------------------------------------------------------------------------
@@ -585,6 +586,77 @@ CLOSING_LINE = (
     "call. With your approval, I'll share a full summary on Slack and open "
     "tracking tickets on Jira."
 )
+
+
+# Pattern-based, not a keyword blocklist -- these match the *shape* of a
+# real credential (AWS/GitHub/OpenAI/Slack key formats, JWTs, a generic
+# "key/token/secret/password: <value>" phrase) rather than trying to
+# enumerate every service name someone might read aloud during an
+# incident. Deliberately whole-message replacement on a match, not a
+# surgical strip of just the matched substring -- same design as Agora's
+# own content-filter recipe ("filtered content is spoken aloud as
+# 'Content filtered.'"): cutting only the secret out of a sentence can
+# still leave a broken, confusing half-sentence, and there's no safe way
+# to guess how much surrounding context is also compromised (e.g. "the
+# key is AKIA... just rotate that one" -- redacting only the key leaves
+# "the key is  just rotate that one", which reads as a transcription
+# glitch, not a deliberate safety action).
+_SENSITIVE_CONTENT_PATTERNS = [
+    re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key id
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),  # GitHub token (ghp_/gho_/ghu_/ghs_/ghr_)
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),  # OpenAI-style secret key
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),  # Slack token
+    re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),  # JWT
+    re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]{20,}=*", re.IGNORECASE),
+    re.compile(
+        r"(?:api[_-]?key|secret|token|password|credential)s?\s*[:=]\s*\S{6,}",
+        re.IGNORECASE,
+    ),
+]
+
+REDACTED_REPLY = "That last part isn't safe to repeat aloud -- it looked like a credential or secret. Please rotate it if it's real."
+
+
+def redact_sensitive_reply(spoken_reply: str) -> str:
+    """
+    Last-line safety net before anything is spoken or persisted:
+    incident calls routinely involve someone reading a config value,
+    error message, or log line out loud, and any of those can contain a
+    real credential. Applied uniformly to every non-empty spoken_reply in
+    _decide_spoken_reply (see iCall_api.py) right before it's recorded
+    and returned -- covers the direct-quote paths (a tool/log result read
+    back verbatim) and the deterministic-template paths alike, since a
+    template's inputs (facts, hypotheses) still ultimately come from
+    something said on the call.
+    """
+    if not spoken_reply:
+        return spoken_reply
+    for pattern in _SENSITIVE_CONTENT_PATTERNS:
+        if pattern.search(spoken_reply):
+            return REDACTED_REPLY
+    return spoken_reply
+
+
+def format_related_incident_note(past_incident: Any) -> str:
+    """
+    One-line context note for a resolved incident on the same service/
+    region, looked up once at call creation (see iCall_service.
+    get_or_create_call) and stored in structured_state["related_incident_note"]
+    -- every incident call starts with zero memory of past incidents on
+    the exact same service/region today, even when one exists. Deliberately
+    just a pointer (title/priority/when), not the past incident's own
+    facts/decisions -- pulling those in verbatim risks the model treating
+    an unrelated past cause as this incident's own confirmed fact, the
+    same "never invent/assume" discipline as everywhere else in this file.
+    """
+    when = past_incident.resolved_at or past_incident.created_at
+    when_str = when.strftime("%Y-%m-%d") if when else "an earlier date"
+    priority = f"{past_incident.priority} " if past_incident.priority else ""
+    return (
+        f"Note: this service/region had a resolved {priority}incident on {when_str} "
+        f"(\"{past_incident.title}\"). Mention this only if directly relevant to what's "
+        "being discussed -- don't assume the same cause without evidence from this call."
+    )
 
 
 def build_correction_callout(update: StructuringUpdate) -> str:
@@ -1171,6 +1243,7 @@ def _build_structuring_prompt(
     service: Optional[str] = None,
     region: Optional[str] = None,
     incident_age_minutes: Optional[int] = None,
+    channel_name: Optional[str] = None,
 ) -> str:
     conversation = "\n".join(f"{m.role}: {m.content or ''}" for m in messages)
     deploy_summary = deploy_check_result.get("summary") if deploy_check_result else None
@@ -1210,12 +1283,18 @@ def _build_structuring_prompt(
             if incident_age_minutes is not None
             else ""
         )
+        channel_line = (
+            f"This call's channel_name is `{channel_name}` -- use this exact value as the channel_name "
+            "argument for get_incident_status or list_action_items, never a guessed or numeric id.\n"
+            if channel_name
+            else ""
+        )
         incident_context_section = (
             f"\nThis incident's service is `{service}`"
             + (f" in region `{region}`" if region else "")
             + " -- use this exact value (not something inferred from conversation) as the service/region argument for "
             "any log or GitHub lookup tool you call.\n"
-            f"{repo_line}\n{age_line}"
+            f"{repo_line}\n{age_line}{channel_line}"
         )
     # tool_result_text: this turn is the follow-up after the model itself
     # called an Agora-native MCP tool (see chat_completions_endpoint) --
@@ -1226,10 +1305,28 @@ def _build_structuring_prompt(
         if tool_result_text
         else ""
     )
+    # Looked up once at call creation, not every turn (see
+    # iCall_service.get_or_create_call) -- just read back from
+    # existing_state here, no extra query per turn.
+    related_note = existing_state.get("related_incident_note") if existing_state else None
+    related_section = f"\n{related_note}\n" if related_note else ""
+    # Delegate mode (see iCall_service.get_or_create_call): the resolved
+    # approver couldn't join and left notes on what they've done / want
+    # covered. Framed as background the model should ground its opening
+    # and missing_info probing in, not as a fact to restate verbatim every
+    # turn -- the greeting (see voice-agent/server's delegate fetch)
+    # already speaks it once at call start.
+    delegate_notes = existing_state.get("delegate_notes") if existing_state else None
+    delegate_section = (
+        f"\nThe resolved approver couldn't join and left this update -- treat it as "
+        f"background, already communicated to the room at the start of the call: {delegate_notes}\n"
+        if delegate_notes
+        else ""
+    )
     return f"""Incident state recorded so far (facts/hypotheses/decisions already
 confirmed in this call — use this to detect contradictions, not to repeat):
 {existing_state}
-{incident_context_section}{deploy_section}{tool_section}
+{incident_context_section}{related_section}{delegate_section}{deploy_section}{tool_section}
 Conversation so far:
 {conversation}
 
@@ -1290,6 +1387,7 @@ async def generate_structuring_update(
     tool_result_text: Optional[str] = None,
     region: Optional[str] = None,
     incident_age_minutes: Optional[int] = None,
+    channel_name: Optional[str] = None,
 ) -> StructuringResult:
     """
     One turn of live structuring: given the conversation and what's already
@@ -1333,6 +1431,7 @@ async def generate_structuring_update(
     prompt = _build_structuring_prompt(
         messages, existing_state, deploy_check_result, tool_result_text,
         service=service, region=region, incident_age_minutes=incident_age_minutes,
+        channel_name=channel_name,
     )
     config = types.GenerateContentConfig(
         system_instruction=build_structuring_system_instruction(language_code),
@@ -2301,6 +2400,163 @@ async def review_ticket_content(structured_state: dict) -> ReviewedTicketContent
     except Exception as exc:
         print(f"[iCall] Ticket-content review response didn't match schema, using unedited content: {exc}")
         return fallback
+
+
+DELEGATE_REPLY_SYSTEM_INSTRUCTION = """You are helping a team lead who
+couldn't personally join an incident call review the draft that will
+become a Jira ticket, entirely by free-text DM reply. You're shown the
+current draft and their one message. Classify it:
+
+- "approve": they're satisfied with the draft as-is (e.g. "looks good",
+  "approve", "go ahead", "ship it", or no substantive objection).
+- "edit": they want something changed. Produce updated_draft as the FULL
+  revised draft text, not just the changed lines. Copy every unrelated
+  section byte-for-byte from the current draft, including its exact
+  markdown (matching *asterisk pairs*, bullet characters, line breaks) --
+  only the specific lines they asked to change should differ at all. Never
+  invent a new fact, decision, or action item they didn't mention -- if
+  they say "add an action item for Priya to check the cache," add exactly
+  that, don't guess additional detail.
+- "unclear": their message doesn't clearly say approve or specify a
+  change (e.g. a question back, or ambiguous). Leave updated_draft unset
+  and ask a short clarifying question in acknowledgement instead.
+
+acknowledgement is always required: a short, human reply confirming what
+you understood -- for "approve", confirm the ticket is being created; for
+"edit", summarize what changed and ask them to reply "approve" to confirm
+or keep editing; for "unclear", ask specifically what they meant.
+"""
+
+
+def _build_delegate_reply_prompt(current_draft: str, user_reply: str) -> str:
+    return f"""Current draft (will become the Jira ticket description if approved):
+{current_draft}
+
+The team lead's reply:
+{user_reply}
+
+Classify their reply and produce your response per the schema.
+"""
+
+
+async def parse_delegate_reply(current_draft: str, user_reply: str) -> DelegateReplyResult:
+    """
+    One round of the post-call delegate-review DM loop (see
+    iOrchestrate_api's Slack Events handler). Degrades to "unclear" (never
+    silently approves or silently discards their message) when there's no
+    API key or the model call fails -- an unresolvable reply should ask
+    the human to try again, not guess.
+    """
+    fallback = DelegateReplyResult(
+        decision="unclear",
+        acknowledgement="Sorry, I couldn't process that just now -- could you try rephrasing?",
+    )
+    if not user_reply or not user_reply.strip() or not get_settings().gemini_api_key:
+        return fallback
+
+    client = _get_client()
+    prompt = _build_delegate_reply_prompt(current_draft, user_reply)
+    config = types.GenerateContentConfig(
+        system_instruction=DELEGATE_REPLY_SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=DelegateReplyResult,
+    )
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.models.generate_content,
+                model=PRIMARY_MODEL,
+                contents=prompt,
+                config=config,
+            ),
+            timeout=GEMINI_CALL_TIMEOUT_S,
+        )
+    except Exception as exc:
+        print(f"[iCall] Delegate-reply parse primary call failed/timed out, trying fallback: {exc}")
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=FALLBACK_MODEL,
+                    contents=prompt,
+                    config=config,
+                ),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc2:
+            print(f"[iCall] Delegate-reply parse failed on both attempts: {exc2}")
+            return fallback
+
+    try:
+        result = DelegateReplyResult.model_validate_json(response.text)
+    except Exception as exc:
+        print(f"[iCall] Delegate-reply response didn't match schema: {exc}")
+        return fallback
+
+    # Fail-safe against a malformed "edit" with no actual draft -- treat it
+    # as unclear rather than silently wiping the draft to empty/None.
+    if result.decision == "edit" and not result.updated_draft:
+        return DelegateReplyResult(
+            decision="unclear",
+            acknowledgement="I wasn't sure exactly what to change -- could you be more specific?",
+        )
+    return result
+
+
+TRANSCRIBE_VOICE_NOTE_SYSTEM_INSTRUCTION = """Transcribe the spoken audio
+into clean, readable text -- this becomes a team lead's written update on
+an incident (what they've done, what to cover), read by both a person and
+an LLM afterward. Light cleanup only: fix obvious stutters/false starts
+and add punctuation, but never add, remove, or reinterpret content -- this
+is a transcript, not a summary. If the audio contains no discernible
+speech (silence, noise, non-speech sound), respond with exactly
+NO_SPEECH_DETECTED and nothing else.
+"""
+
+
+async def transcribe_delegate_voice_note(audio_bytes: bytes, mime_type: str) -> Optional[str]:
+    """
+    Voice alternative to typing delegate notes into the Slack modal (see
+    the web recorder page linked from open_slack_delegate_modal). Returns
+    None on failure OR when Gemini reports no speech was found -- callers
+    must show the human an error either way, never silently proceed with
+    empty/garbage notes the way a malformed edit reply is guarded against
+    above.
+    """
+    if not audio_bytes or not get_settings().gemini_api_key:
+        return None
+
+    client = _get_client()
+    content = types.Content(
+        role="user",
+        parts=[
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+            types.Part.from_text(text="Transcribe this recording per the system instruction."),
+        ],
+    )
+    config = types.GenerateContentConfig(system_instruction=TRANSCRIBE_VOICE_NOTE_SYSTEM_INSTRUCTION)
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(client.models.generate_content, model=PRIMARY_MODEL, contents=[content], config=config),
+            timeout=GEMINI_CALL_TIMEOUT_S,
+        )
+    except Exception as exc:
+        print(f"[iCall] Voice-note transcription primary call failed/timed out, trying fallback: {exc}")
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(client.models.generate_content, model=FALLBACK_MODEL, contents=[content], config=config),
+                timeout=GEMINI_CALL_TIMEOUT_S,
+            )
+        except Exception as exc2:
+            print(f"[iCall] Voice-note transcription failed on both attempts: {exc2}")
+            return None
+
+    text = (response.text or "").strip()
+    if not text or text == "NO_SPEECH_DETECTED":
+        return None
+    return text
 
 
 # -----------------------------------------------------------------------------

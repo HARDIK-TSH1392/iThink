@@ -6,13 +6,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from typing import Dict, List, Optional
 
-from app.iNcidents.iNcidents_crudl import get_incident
+from app.iNcidents.iNcidents_crudl import get_incident, list_incidents
+from app.iNcidents.iNcidents_utils import STATUS_RESOLVED
 from app.iDirectory.iDirectory_crudl import find_employee_by_name
 
 from .iCall_model import IncidentCall, CallUtterance, AgentUtterance
 from .iCall_schema import CallUtteranceCreate, StructuringUpdate
 from .iCall_utils import (
     generate_channel_name,
+    format_related_incident_note,
     classify_participant_roles,
     assign_action_item_owners,
     summarize_unresolved_risks,
@@ -102,11 +104,35 @@ async def get_or_create_call(
         if incident is None:
             raise IncidentNotFoundError(f"Incident {incident_id} not found")
 
+        # Cross-incident memory: every call starts fresh today even when
+        # the exact same service/region had a resolved incident before --
+        # looked up once here (not every turn, unlike service/region
+        # grounding above which is cheap and already refetched per turn)
+        # since a call's whole duration won't change which past incident
+        # is most recent, and stored directly on the new row so later
+        # turns just read it back with no extra query.
+        initial_state: dict = {}
+        past_incidents = await list_incidents(
+            db, status=STATUS_RESOLVED, region=incident.region, service=incident.service, limit=5,
+        )
+        related = next((i for i in past_incidents if i.id != incident_id), None)
+        if related is not None:
+            initial_state["related_incident_note"] = format_related_incident_note(related)
+
+        # Delegate mode: the resolved approver approved but can't
+        # personally join (see iOrchestrate_api's approve_delegate/modal
+        # flow) -- their notes ride into the call the same way
+        # related_incident_note does, read by _build_structuring_prompt
+        # and by voice-agent/server's greeting/avatar fetch (see
+        # iCall_api's GET .../delegate endpoint).
+        if incident.delegate_notes:
+            initial_state["delegate_notes"] = incident.delegate_notes
+
         call = IncidentCall(
             incident_id=incident_id,
             channel_name=generate_channel_name(incident_id),
             status=CALL_STATUS_SCHEDULED,
-            structured_state={},
+            structured_state=initial_state,
             language_code=language_code or "multi",
         )
         db.add(call)
@@ -564,6 +590,67 @@ async def update_call_status(db: AsyncSession, call: IncidentCall, status: str) 
     return call
 
 
+DELEGATE_REVIEW_AWAITING = "awaiting_reply"
+
+
+async def start_delegate_review(db: AsyncSession, call: IncidentCall, draft: str) -> IncidentCall:
+    """
+    Stores the reviewed draft (see iOrchestrate_utils.notify_delegate_review_needed)
+    separately from call.structured_state's own recorded fields -- shallow-copied
+    dict, so this key survives every later apply_structuring_update call
+    exactly like related_incident_note does, without that function needing
+    to know anything about it.
+    """
+    state = dict(call.structured_state or {})
+    state["delegate_review_draft"] = draft
+    call.structured_state = state
+    call.delegate_review_status = DELEGATE_REVIEW_AWAITING
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def update_delegate_review_draft(db: AsyncSession, call: IncidentCall, draft: str) -> IncidentCall:
+    state = dict(call.structured_state or {})
+    state["delegate_review_draft"] = draft
+    call.structured_state = state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def clear_delegate_review(db: AsyncSession, call: IncidentCall) -> IncidentCall:
+    call.delegate_review_status = None
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def find_awaiting_delegate_review_call(db: AsyncSession, slack_user_id: str) -> Optional[IncidentCall]:
+    """
+    Correlates an incoming Slack DM (which carries only a Slack user id, no
+    action_id/value the way a button click does) back to the call it's
+    about. Scoped to calls actually awaiting a reply -- small by
+    construction (one per delegate incident mid-review at a time), so a
+    linear scan + re-resolving each incident's approver is simple and
+    plenty fast at this scale; no need for a dedicated index on the join.
+    """
+    from app.iNcidents.iNcidents_crudl import get_incident
+    from app.iDirectory.iDirectory_crudl import resolve_approver
+
+    result = await db.execute(
+        select(IncidentCall).where(IncidentCall.delegate_review_status == DELEGATE_REVIEW_AWAITING)
+    )
+    for call in result.scalars().all():
+        incident = await get_incident(db, call.incident_id)
+        if not incident:
+            continue
+        approver = await resolve_approver(db, incident.service)
+        if approver and approver.slack_user_id == slack_user_id:
+            return call
+    return None
+
+
 async def record_utterance(
     db: AsyncSession, call_id: int, event: CallUtteranceCreate
 ) -> CallUtterance:
@@ -783,6 +870,12 @@ async def _reconcile_action_item_owners(
                 new_item["owner_uid"] = uid
                 new_item["owner_role"] = entry.get("final_role")
                 new_item["owner_source"] = "name_match"
+                # Normalize the display text to the roster's canonical name too --
+                # otherwise a stale/raw extraction (e.g. an STT mishearing) stays
+                # in owner even though owner_uid now correctly identifies someone
+                # else entirely, which reads as a bug in any UI that shows owner.
+                if entry.get("name"):
+                    new_item["owner"] = entry["name"]
                 changed = True
 
     # Pass 2: role match for whatever's still unassigned
@@ -812,6 +905,10 @@ async def _reconcile_action_item_owners(
             new_items[global_index]["owner_role"] = roster_entry.get("final_role")
             new_items[global_index]["owner_source"] = "role_match"
             new_items[global_index]["owner_rationale"] = assignment.rationale
+            # Same normalization as Pass 1 -- role-match still resolves to a
+            # real roster person, so owner should say who that actually is.
+            if roster_entry.get("name"):
+                new_items[global_index]["owner"] = roster_entry["name"]
             changed = True
 
     if changed:

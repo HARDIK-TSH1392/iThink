@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import time
 import httpx
 from datetime import datetime
@@ -157,6 +158,258 @@ async def notify_jira_approval_needed(db, incident, call) -> bool:
     if ok:
         print(f"[iOrchestrate] Non-actionable Jira-approval notice posted to channel for call {call.id}")
     return ok
+
+
+async def approve_incident_with_delegate_notes(db, incident_id: int, notes: str, approved_by: str) -> bool:
+    """
+    Shared by the Slack delegate-notes modal (iOrchestrate_api's
+    view_submission handler) and the voice-note web page's confirm step
+    (iCall_api's delegate-approve endpoint) -- typing into Slack and
+    speaking into a browser both end up here, so there's exactly one
+    place that decides what "approve with delegate notes" actually does.
+
+    A blank/whitespace-only notes string is treated as a cancel, not an
+    approval with empty notes -- lets a caller "submit" without notes
+    (e.g. closing the Slack modal after already using the voice link, or
+    a stray empty POST) safely no-op rather than silently approving.
+    Returns False for both "already decided" and "empty notes" -- callers
+    that need to tell those apart should check incident.status themselves
+    first, same as the existing button-click handlers already do.
+    """
+    from app.iNcidents.iNcidents_crudl import get_incident, record_approval_decision
+    from app.iNcidents.iNcidents_utils import STATUS_AWAITING_APPROVAL
+
+    if not notes or not notes.strip():
+        return False
+
+    incident = await get_incident(db, incident_id)
+    if not incident or incident.status != STATUS_AWAITING_APPROVAL:
+        return False
+
+    incident.delegate_notes = notes.strip()
+    await db.commit()
+    incident = await record_approval_decision(db, incident, "approve", approved_by=approved_by)
+    await notify_incident_approved(db, incident)
+    return True
+
+
+def _build_delegate_review_blocks(call_id: int, text: str) -> list:
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {
+            "type": "actions",
+            "block_id": f"delegate_review_{call_id}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Approve as-is"},
+                    "style": "primary",
+                    "action_id": "approve_delegate_review",
+                    "value": str(call_id),
+                },
+            ],
+        },
+    ]
+
+
+async def notify_delegate_review_needed(db, incident, call) -> bool:
+    """
+    Replaces notify_jira_approval_needed for a delegated incident (see
+    _apply_status_transition, iCall_api.py) -- the lead who couldn't join
+    reviews the same reviewed-for-Jira content, either way it's easiest for
+    them: click Approve as-is (a button, matching the initial incident
+    approval's own UX -- added after the plain conversational-only version
+    turned out easy to miss, since it looked like nothing was actionable
+    compared to that first step's buttons), or reply here first with
+    corrections (add/remove/reassign an action item, fix a fact) before
+    approving -- handled by iOrchestrate_api's Slack Events handler.
+    Either path ends up at create_ticket_from_delegate_review, so the
+    button always reflects whatever draft is current at click time,
+    including any correction already sent. review_ticket_content is the
+    exact same auto-cleanup pass _handle_jira_decision already runs right
+    before ticket creation -- this just also shows the human that reviewed
+    draft before it becomes a real ticket, instead of only the buttons-
+    based approve/skip choice the non-delegate path uses.
+
+    Same "DM-only, no actionable content in the shared channel" discipline
+    as notify_jira_approval_needed -- a delegated incident has no one to
+    fall back to for this specific ask (only the absent lead can review
+    their own delegated call), so unlike that function's channel-post
+    fallback, an unreachable lead here just logs a notice; the public
+    channel summary (post_call_summary_notification, called unconditionally
+    alongside this) still tells the team the call happened either way.
+    """
+    from app.iCall.iCall_service import start_delegate_review
+    from app.iCall.iCall_utils import review_ticket_content
+    from app.iDirectory.iDirectory_crudl import resolve_approver
+
+    approver = await resolve_approver(db, incident.service)
+    if not approver or not approver.slack_user_id:
+        print(f"[iOrchestrate] No reachable approver for delegate review, call {call.id} -- "
+              f"the public channel summary still posted; ticket needs manual follow-up.")
+        return False
+
+    reviewed = await review_ticket_content(call.structured_state or {})
+    ticket_state = dict(call.structured_state or {})
+    ticket_state.update(reviewed.model_dump())
+    draft = format_call_summary(ticket_state, call.participant_roles)
+
+    await start_delegate_review(db, call, draft)
+
+    text = (
+        f"*Call wrapped up — your review needed: Incident #{incident.id}* :memo:\n"
+        f"*{incident.title}*  |  `{incident.service}` in `{incident.region}`\n"
+        f"Watcher stood in for you and here's what was captured:\n\n"
+        f"{draft}\n\n"
+        f"Click *Approve as-is* below to create the Jira ticket now, or reply here with "
+        f"any corrections first (add/remove/reassign an action item, fix a fact, whatever's "
+        f"off) -- the button always reflects your latest correction, whichever comes first."
+    )
+    blocks = _build_delegate_review_blocks(call.id, text)
+    ok = await _post_dm_to_slack_user(approver.slack_user_id, text, blocks=blocks)
+    if ok:
+        print(f"[iOrchestrate] Delegate-review DM sent to {approver.slack_user_id} for call {call.id}")
+    else:
+        print(f"[iOrchestrate] Delegate-review DM failed for call {call.id}")
+    return ok
+
+
+async def create_ticket_from_delegate_review(db, call):
+    """
+    Shared core of approving a delegate review's draft as-is -- creates the
+    Jira ticket from whatever draft is currently stored (reflecting any
+    corrections already sent via DM reply) and clears the review state.
+    The ONE place that decides what "approve the delegate review" actually
+    does, used by both entry points that can trigger it: the Slack Events
+    handler's text-reply "approve" path, and the Approve as-is button on
+    the review DM itself (iOrchestrate_api._handle_delegate_review_approve)
+    -- same shared-function discipline as approve_incident_with_delegate_notes
+    for the earlier approval step.
+
+    Returns (ticket_url_or_None, draft_text, incident_or_None).
+    """
+    from app.iNcidents.iNcidents_crudl import get_incident
+    from app.iCall.iCall_service import clear_delegate_review
+
+    current_draft = (call.structured_state or {}).get("delegate_review_draft", "")
+    incident = await get_incident(db, call.incident_id)
+    url = await create_jira_ticket(incident.id, incident.title, current_draft) if incident else None
+    await clear_delegate_review(db, call)
+    if url and incident:
+        await post_jira_ticket_created_notification(
+            incident.id, incident.title, incident.priority, incident.service,
+            incident.region, "delegate review (Slack DM)", url, current_draft,
+        )
+    return url, current_draft, incident
+
+
+async def reply_to_delegate_dm(slack_user_id: str, text: str) -> bool:
+    """
+    Public wrapper around _post_dm_to_slack_user for the Slack Events
+    handler (iOrchestrate_api.py) -- keeps that module going through this
+    file's own DM-sending path (same signature/error handling as every
+    other Slack message this file sends) instead of reaching into the
+    private helper directly.
+    """
+    return await _post_dm_to_slack_user(slack_user_id, text)
+
+
+async def open_slack_delegate_modal(trigger_id: str, incident_id: int) -> bool:
+    """
+    Opens the "what should Watcher cover for you" modal in response to the
+    approve_delegate button click. Must be called with the SAME trigger_id
+    Slack included in that click's payload, within Slack's ~3-second
+    validity window -- callers must call this before doing anything else
+    (recording the approval decision, updating the original message), not
+    after, or the trigger_id will have expired.
+
+    private_metadata carries incident_id through to the view_submission
+    payload (see iOrchestrate_api's modal handler) -- Slack echoes it back
+    verbatim, no server-side state needed to remember which incident this
+    modal was opened for.
+    """
+    settings = get_settings()
+    if not settings.slack_bot_token:
+        print("[iOrchestrate] SLACK_BOT_TOKEN not set, cannot open delegate modal")
+        return False
+
+    # voice_agent_web_base_url is already tunneled/public in --tunnels mode
+    # (it's the same base the call join_url uses) -- demo/dashboard.html's
+    # own directory is explicitly local-only even then, so the voice-note
+    # page lives under voice-agent/web/public/ instead, a plain static
+    # file Next.js serves with no build step, reached through the same
+    # public URL a remote team lead can actually open.
+    voice_note_url = f"{settings.voice_agent_web_base_url.rstrip('/')}/delegate-voice.html?incident={incident_id}"
+
+    view = {
+        "type": "modal",
+        "callback_id": "delegate_notes_modal",
+        "private_metadata": str(incident_id),
+        "title": {"type": "plain_text", "text": "Delegate to Watcher"},
+        "submit": {"type": "plain_text", "text": "Submit"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Watcher will join in your place and open with your update. "
+                        "What have you done so far, and what should it cover or ask about?"
+                    ),
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "delegate_notes_block",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Your update"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "delegate_notes_input",
+                    "multiline": True,
+                    "placeholder": {
+                        "type": "plain_text",
+                        # Slack caps plain_text_input placeholders at 150
+                        # chars (confirmed live -- the original text was
+                        # 175 and made views.open reject the whole modal).
+                        "text": "e.g. I've rolled back the deploy, error rates are dropping. "
+                        "Ask the team to confirm the CDN cache is clear.",
+                    },
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"Prefer to speak instead of type? <{voice_note_url}|Record your update here> — "
+                    "it approves the incident for you once you confirm, so you can just close this form "
+                    "without submitting after you're done there.",
+                },
+            },
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                "https://slack.com/api/views.open",
+                headers={"Authorization": f"Bearer {settings.slack_bot_token}"},
+                json={"trigger_id": trigger_id, "view": view},
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("ok"):
+                # error alone (e.g. "invalid_arguments") doesn't say which
+                # field -- response_metadata.messages carries the actual
+                # per-field validation detail Slack computed, when present.
+                detail = data.get("response_metadata", {}).get("messages")
+                print(f"[iOrchestrate] views.open error: {data.get('error')} detail={detail}")
+                return False
+        return True
+    except Exception as exc:
+        print(f"[iOrchestrate] Failed to open delegate modal: {exc}")
+        return False
 
 
 def _summary_to_adf(summary_text: str) -> dict:
@@ -379,9 +632,18 @@ async def post_approval_request_notification(
         f"*Approval needed: Incident #{incident_id}* :rotating_light:\n"
         f"{headline}\n"
         f"When: {detected_at.isoformat()}  |  Where: `{service}` in `{region}`  |  Priority: *{priority or 'unset'}*\n"
-        f"Approver: {who}"
+        f"Approver: {who}\n\n"
+        f"If you approve, can you personally join the call?"
     )
 
+    # Combines the approve/reject decision with "can you join" in one
+    # message rather than a separate follow-up -- rejecting means no call
+    # happens at all, so attendance only ever matters alongside approval,
+    # never on its own. approve_delegate opens a modal (see
+    # open_slack_delegate_modal) instead of deciding immediately -- the
+    # incident is only actually approved once that modal is submitted
+    # (see iOrchestrate_api's view_submission handler), so a lead who opens
+    # the modal and then cancels hasn't approved anything.
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": text}},
         {
@@ -390,9 +652,15 @@ async def post_approval_request_notification(
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "✅ Approve"},
+                    "text": {"type": "plain_text", "text": "✅ Approve — I'll join"},
                     "style": "primary",
-                    "action_id": "approve_incident",
+                    "action_id": "approve_join",
+                    "value": str(incident_id),
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🎙️ Approve — I can't join"},
+                    "action_id": "approve_delegate",
                     "value": str(incident_id),
                 },
                 {
@@ -577,11 +845,25 @@ async def update_slack_message(response_url: str, text: str) -> bool:
             )
             response.raise_for_status()
             # Slack's response_url endpoint can return HTTP 200 with a
-            # non-"ok" body (e.g. an expired/already-used response_url) --
-            # raise_for_status alone would treat that as success. Confirmed
-            # worth checking after a ticket-creation success silently didn't
-            # show up as updated in Slack with no error in the logs.
-            if response.text.strip() != "ok":
+            # body that isn't actually success (e.g. an expired/already-used
+            # response_url) -- raise_for_status alone would treat that as
+            # success. Confirmed worth checking after a ticket-creation
+            # success silently didn't show up as updated in Slack with no
+            # error in the logs.
+            #
+            # The body shape itself isn't consistent: some response_urls
+            # return the bare string "ok", others return JSON {"ok": true}
+            # (confirmed live -- the original text-only check flagged every
+            # successful update here as a failure, since this Slack message
+            # type returns the JSON form). Accept either.
+            body = response.text.strip()
+            succeeded = body == "ok"
+            if not succeeded:
+                try:
+                    succeeded = bool(response.json().get("ok"))
+                except (json.JSONDecodeError, ValueError):
+                    succeeded = False
+            if not succeeded:
                 print(f"[iOrchestrate] Slack message update returned non-ok body: {response.text}")
                 return False
         return True

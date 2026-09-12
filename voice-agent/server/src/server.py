@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from agora_agent.agentkit.token import generate_convo_ai_token
 from agent import Agent
+from shared_state import channel_names as _channel_names
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -119,7 +120,13 @@ class RemoveNameRequest(BaseModel):
 # participant on a call see everyone else's display name without needing
 # RTM presence or any coordination ahead of time. Cleared implicitly when
 # the process restarts -- fine for a live call, not meant to persist.
-_channel_names: Dict[str, Dict[str, str]] = {}
+# Defined in shared_state.py (imported above), not here -- agent.py needs
+# to write into this same dict too, and this file runs as __main__ when
+# started via `python src/server.py`, so `from server import
+# _channel_names` from inside agent.py would silently resolve to a
+# second, disconnected copy instead of this one (confirmed live,
+# 2026-09-12: the delegate avatar's registered name never showed up
+# because of exactly this).
 
 
 class ChatMessageSend(BaseModel):

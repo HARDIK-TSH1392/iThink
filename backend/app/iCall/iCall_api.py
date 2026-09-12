@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -71,7 +71,9 @@ from .iCall_utils import (
     detect_health_score_drop,
     build_health_recap,
     build_correction_callout,
+    redact_sensitive_reply,
     build_keyterms,
+    transcribe_delegate_voice_note,
     detect_language_switch_trigger,
     detect_confirmation_response,
     build_language_switch_ack,
@@ -87,8 +89,14 @@ from .iCall_utils import (
     MALFORMED_RESPONSE_FALLBACK,
 )
 from app.iNcidents.iNcidents_crudl import get_incident
+from app.iNcidents.iNcidents_utils import STATUS_AWAITING_APPROVAL
 from app.iLogs.iLogs_crudl import list_logs
-from app.iOrchestrate.iOrchestrate_utils import post_call_summary_notification, notify_jira_approval_needed
+from app.iOrchestrate.iOrchestrate_utils import (
+    post_call_summary_notification,
+    notify_jira_approval_needed,
+    notify_delegate_review_needed,
+    approve_incident_with_delegate_notes,
+)
 
 router = APIRouter(prefix="/icall", tags=["iCall"])
 
@@ -138,6 +146,23 @@ async def get_call_endpoint(
     return IncidentCallRead.model_validate(call)
 
 
+@router.get("/channel/{channel_name}", response_model=IncidentCallRead)
+async def get_call_by_channel_endpoint(
+    channel_name: str,
+    db: AsyncSession = Depends(get_db),
+) -> IncidentCallRead:
+    """
+    Channel-keyed twin of GET /{call_id} -- same shape, for callers that
+    only know the channel name (e.g. get_incident_status/list_action_items
+    in ilogs_mcp_service, which the model calls with the channel_name it
+    was given in its own prompt context, never a numeric id).
+    """
+    call = await get_call_by_channel_name(db, channel_name)
+    if not call:
+        raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
+    return IncidentCallRead.model_validate(call)
+
+
 async def _apply_status_transition(db: AsyncSession, call: IncidentCall, new_status: str) -> IncidentCall:
     """
     Shared by both status endpoints (numeric and channel-keyed). Guards the
@@ -159,8 +184,13 @@ async def _apply_status_transition(db: AsyncSession, call: IncidentCall, new_sta
         if not was_already_completed:
             incident = await get_incident(db, call.incident_id)
             if incident:
+                # Public channel summary always posts either way -- only
+                # the private Jira-approval path branches on delegate mode.
                 await post_call_summary_notification(incident, call)
-                await notify_jira_approval_needed(db, incident, call)
+                if incident.delegate_notes:
+                    await notify_delegate_review_needed(db, incident, call)
+                else:
+                    await notify_jira_approval_needed(db, incident, call)
 
     return call
 
@@ -374,6 +404,102 @@ async def translate_line_endpoint(payload: TranslateLineRequest):
     return {"code": 0, "data": {"translated": translated}, "msg": "success"}
 
 
+@router.get("/channel/{channel_name}/delegate")
+async def get_delegate_endpoint(
+    channel_name: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delegate-mode notes for this call, if the resolved approver approved
+    but couldn't join (see iOrchestrate_api's approve_delegate/modal flow).
+    Called by voice-agent/server right before it starts the agent, so it
+    can enrich the opening greeting -- and, when an avatar vendor is
+    configured, front the session with a visual stand-in -- with what the
+    absent lead wants covered. Same best-effort shape as /keyterms: no
+    delegate notes is the common case, not an error.
+    """
+    call = await get_call_by_channel_name(db, channel_name)
+    if not call:
+        raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
+
+    incident = await get_incident(db, call.incident_id)
+    notes = incident.delegate_notes if incident else None
+    approver_name = None
+    if notes:
+        from app.iDirectory.iDirectory_crudl import resolve_approver
+
+        approver = await resolve_approver(db, incident.service)
+        approver_name = approver.name if approver else None
+
+    return {
+        "code": 0,
+        "data": {"delegate_notes": notes, "approver_name": approver_name},
+        "msg": "success",
+    }
+
+
+@router.post("/incidents/{incident_id}/delegate-voice-note")
+async def transcribe_delegate_voice_note_endpoint(
+    incident_id: int,
+    audio: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Voice alternative to typing delegate notes into the Slack modal (see
+    demo/delegate-voice.html, linked from open_slack_delegate_modal).
+    Transcribe-only -- no side effects, never touches approval state.
+    The page shows the transcript back for review/edit before the human
+    explicitly confirms via POST .../delegate-approve below, same "see it
+    before it's final" discipline as the Slack modal's own text field.
+    """
+    incident = await get_incident(db, incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+    if incident.status != STATUS_AWAITING_APPROVAL:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Incident {incident_id} is no longer awaiting approval (status: {incident.status})",
+        )
+
+    audio_bytes = await audio.read()
+    transcript = await transcribe_delegate_voice_note(audio_bytes, audio.content_type or "audio/webm")
+    if not transcript:
+        raise HTTPException(
+            status_code=422,
+            detail="Couldn't make out any speech in that recording -- try again, speaking clearly.",
+        )
+    return {"code": 0, "data": {"transcript": transcript}, "msg": "success"}
+
+
+@router.post("/incidents/{incident_id}/delegate-approve")
+async def delegate_approve_endpoint(
+    incident_id: int,
+    notes: str = Form(...),
+    approved_by: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Confirms delegate notes (typed, spoken-then-transcribed, or edited
+    after either) and approves the incident in one step -- the same
+    shared action the Slack modal's Submit button triggers (see
+    iOrchestrate_utils.approve_incident_with_delegate_notes), just reached
+    from a plain web form instead of Slack. Blank notes safely no-op
+    rather than approving with nothing -- see that function's own guard.
+    """
+    ok = await approve_incident_with_delegate_notes(db, incident_id, notes, approved_by)
+    if not ok:
+        incident = await get_incident(db, incident_id)
+        if not incident:
+            raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+        if incident.status != STATUS_AWAITING_APPROVAL:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Incident {incident_id} is no longer awaiting approval (status: {incident.status})",
+            )
+        raise HTTPException(status_code=422, detail="Notes can't be empty")
+    return {"code": 0, "msg": "success"}
+
+
 @router.get("/{call_id}/utterances", response_model=List[CallUtteranceRead])
 async def list_utterances_endpoint(
     call_id: int,
@@ -480,6 +606,7 @@ async def _decide_spoken_reply(
     old_facts: List[str],
     latest_user_message: Optional[str],
     health_score: int,
+    force_speak: bool = False,
 ) -> str:
     """
     Given a StructuringUpdate already merged into call.structured_state,
@@ -516,7 +643,7 @@ async def _decide_spoken_reply(
         # right for it. CLOSING_LINE's own promise about Slack/Jira stays
         # exactly as accurate as before; this just says what actually
         # happened before promising where the fuller version goes.
-        spoken_reply = f"{build_health_recap(call.structured_state)} {CLOSING_LINE}"
+        spoken_reply = redact_sensitive_reply(f"{build_health_recap(call.structured_state)} {CLOSING_LINE}")
         spoken_reply = await translate_fixed_line(spoken_reply, call.language_code)
         call = await record_wrapped_up(db, call)
         await record_agent_utterance(db, call.id, spoken_reply, "is_wrapping_up")
@@ -541,13 +668,31 @@ async def _decide_spoken_reply(
     # correction actually applied (old_facts contained the exact text) --
     # see apply_structuring_update's fail-safe exact-match requirement.
     if update.corrects_fact and update.corrects_fact in old_facts:
-        spoken_reply = build_correction_callout(update)
+        spoken_reply = redact_sensitive_reply(build_correction_callout(update))
         await record_agent_utterance(db, call.id, spoken_reply, "correction")
+        return spoken_reply
+
+    # A tool-result turn is always the answer to something the model itself
+    # just chose to go look up -- confirmed live that the generic gate's
+    # direct-address cooldown (meant to stop the SAME utterance getting
+    # answered twice by fragmented STT turns) also silently ate the actual
+    # answer here: the ack ("Pulling up the logs...") starts the cooldown,
+    # and the tool round-trip routinely finishes inside that window, so the
+    # real report-back got gated as if it were a duplicate of the ack. Same
+    # "bypass the generic gate with a dedicated deterministic path" pattern
+    # as is_wrapping_up/corrects_fact above -- this just always speaks
+    # whatever the model actually has to report, when it has anything to say.
+    if force_speak and update.spoken_reply:
+        # Highest-risk path for this: it's a direct readback of a tool/log
+        # result the model just fetched, which is exactly the kind of raw
+        # content a real credential could be sitting inside.
+        spoken_reply = redact_sensitive_reply(update.spoken_reply)
+        await record_agent_utterance(db, call.id, spoken_reply, "tool_result")
         return spoken_reply
 
     if should_speak_aloud(update, latest_user_message, call.structured_state):
         reason = describe_speak_reason(update, latest_user_message, call.structured_state)
-        spoken_reply = build_gated_spoken_reply(update, reason, call.structured_state)
+        spoken_reply = redact_sensitive_reply(build_gated_spoken_reply(update, reason, call.structured_state))
         if reason == "missing_info":
             call = await record_missing_info_nudge(db, call)
         elif reason == "direct_address":
@@ -562,13 +707,16 @@ async def _decide_spoken_reply(
     # more directly relevant to what was just said.
     pattern = evaluate_call_patterns(call.structured_state)
     if pattern:
-        spoken_reply = pattern["message"]
-        call = await record_pattern_nudge(db, call, pattern["pattern"], pattern["message"])
+        # record_pattern_nudge's own message param is itself persisted to
+        # the timeline (see its docstring) -- pass the redacted text there
+        # too, not just what's returned/spoken.
+        spoken_reply = redact_sensitive_reply(pattern["message"])
+        call = await record_pattern_nudge(db, call, pattern["pattern"], spoken_reply)
         await record_agent_utterance(db, call.id, spoken_reply, f"pattern:{pattern['pattern']}")
         return spoken_reply
 
     if detect_health_score_drop(call.structured_state):
-        spoken_reply = build_health_recap(call.structured_state)
+        spoken_reply = redact_sensitive_reply(build_health_recap(call.structured_state))
         await record_pattern_nudge(db, call, "health_score_drop", spoken_reply, score=health_score)
         await record_agent_utterance(db, call.id, spoken_reply, "health_score_drop")
         return spoken_reply
@@ -685,6 +833,7 @@ async def _process_tool_result_turn(
     result = await generate_structuring_update(
         payload.messages, call.structured_state or {}, service, language_code=call.language_code,
         tool_result_text=tool_result_text, region=region, incident_age_minutes=incident_age_minutes,
+        channel_name=channel_name,
     )
     update = result.update
     call = await apply_structuring_update(db, call, update)
@@ -700,7 +849,9 @@ async def _process_tool_result_turn(
         "channel=%s tool-result turn latest_user_message=%r",
         channel_name, latest_user_message,
     )
-    spoken_reply = await _decide_spoken_reply(db, call, update, old_facts, latest_user_message, health_score)
+    spoken_reply = await _decide_spoken_reply(
+        db, call, update, old_facts, latest_user_message, health_score, force_speak=True,
+    )
     return spoken_reply, None
 
 
@@ -846,6 +997,7 @@ async def _process_turn(
     result = await generate_structuring_update(
         payload.messages, call.structured_state or {}, service, language_code=call.language_code,
         tools=payload.tools, region=region, incident_age_minutes=incident_age_minutes,
+        channel_name=channel_name,
     )
     if result.tool_call is not None:
         # The model decided to call a native MCP tool instead of answering
