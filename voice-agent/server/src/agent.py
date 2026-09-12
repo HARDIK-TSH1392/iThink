@@ -1096,7 +1096,25 @@ class Agent:
                 # doesn't show the same symptom, but its greeting is much
                 # shorter and only spoken once, so the same echo path may
                 # just be less likely to land mid-sentence there.
-                interruption={"enable": False},
+                #
+                # disabled_config.strategy="ignore" was missing entirely --
+                # confirmed against Agora's own real API schema that this
+                # field exists specifically to say what happens when
+                # something IS detected while enable=False (values: append
+                # -- queue it and process after the current reply ends, or
+                # ignore -- discard it, never stored in context). Left
+                # unset, this ran on an undocumented default this whole
+                # time; every debugging round on the mid-utterance
+                # audio/video blip happened without ever configuring the
+                # one field that governs exactly this scenario. "ignore" is
+                # the more defensive choice for a monologue this long --
+                # "append" would still queue and act on a false-positive
+                # echo/noise trigger once the greeting ends, which is its
+                # own kind of wrong reply we don't want either.
+                interruption={
+                    "enable": False,
+                    "disabled_config": {"strategy": "ignore"},
+                },
                 # Confirmed live (2026-09-12, debug=True dump of the actual
                 # resolved request): this agent was sending NO turn_detection
                 # config at all, so every VAD threshold ran on Agora's raw
