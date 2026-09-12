@@ -1021,9 +1021,33 @@ class Agent:
         delegate_notes = delegate_info["delegate_notes"]
 
         greeting = (
-            f"Hi, I'm standing in for {approver_name} today, who couldn't join. "
-            f"Here's their update: {delegate_notes} Now, who's working on what?"
+            f"Hi, standing in for {approver_name}. Update: {delegate_notes} "
+            "Who's working on what?"
         )
+        # The brevity instruction below is not just style -- it's a real
+        # mitigation for a confirmed-live bug that has no clean fix.
+        # Watcher subscribes to every participant including this agent
+        # (remote_uids=["*"], the only way it can hear an unbounded number
+        # of real humans -- confirmed against Agora's own API docs that
+        # remote_rtc_uids supports either a wildcard or exactly one
+        # explicit uid, nothing in between, so there is no way to have
+        # Watcher listen to "everyone except this agent"). Agora's Custom
+        # LLM message format also carries no per-speaker field at all, so
+        # Watcher has no way to tell this agent's own speech apart from a
+        # real human's. Confirmed live (2026-09-12): while this agent was
+        # actively talking, Watcher's own transcription repeatedly
+        # reprocessed the same stale utterance instead of capturing new
+        # human speech -- a real, reproduced symptom that no config value,
+        # timeout tuning, or turn_detection change can fix, since the
+        # platform gives no way to exclude one participant's audio from
+        # another agent's subscription or attribute a message to its real
+        # speaker. What DOES reduce it: the less continuous time this
+        # agent spends actively talking, the smaller the window during
+        # which Watcher's own transcription can be disrupted by it --
+        # hence the shortened greeting above and the much more concrete
+        # brevity instruction below (the old "keep turns brief and
+        # conversational" was vague enough to still produce multi-sentence
+        # replies in practice; quantified explicitly this time).
         system_prompt = (
             f"You are a stand-in representative for {approver_name}, who approved this "
             f"incident but couldn't personally join the call. Their own update on what "
@@ -1034,8 +1058,11 @@ class Agent:
             "Respond naturally when addressed, as if relaying on their behalf. You are "
             "NOT responsible for tracking facts, decisions, or action items -- a separate "
             "system on this call already does that; your only job is representing "
-            f"{approver_name} and keeping the conversation moving. Keep turns brief and "
-            "conversational, not a formal report."
+            f"{approver_name} and keeping the conversation moving.\n\n"
+            "Keep every reply to at most one or two short sentences, never a paragraph. "
+            "Ask one question at a time rather than several at once, and then stop "
+            "talking and let the room answer -- you are not giving a report, you are "
+            "prompting a conversation you mostly listen to."
         )
 
         avatar_agent_uid = random.randint(10000000, 99999999)
