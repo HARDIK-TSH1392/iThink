@@ -43,6 +43,7 @@ from .iCall_service import (
     list_agent_utterances,
     record_missing_info_nudge,
     record_direct_address_reply,
+    record_last_seen_user_message,
     record_silence_streak,
     record_wrapped_up,
     record_language_switch_pending,
@@ -80,6 +81,7 @@ from .iCall_utils import (
     build_language_switch_confirmation_prompt,
     LANGUAGE_CONFIRMATION_TIMEOUT_S,
     translate_fixed_line,
+    resolve_multi_tier_fixed_line_target,
     trigger_language_handoff,
     CALL_STATUS_COMPLETED,
     EVENT_AGENT_LEFT,
@@ -644,7 +646,9 @@ async def _decide_spoken_reply(
         # exactly as accurate as before; this just says what actually
         # happened before promising where the fuller version goes.
         spoken_reply = redact_sensitive_reply(f"{build_health_recap(call.structured_state)} {CLOSING_LINE}")
-        spoken_reply = await translate_fixed_line(spoken_reply, call.language_code)
+        spoken_reply = await translate_fixed_line(
+            spoken_reply, resolve_multi_tier_fixed_line_target(call.language_code, latest_user_message)
+        )
         call = await record_wrapped_up(db, call)
         await record_agent_utterance(db, call.id, spoken_reply, "is_wrapping_up")
         return spoken_reply
@@ -655,7 +659,9 @@ async def _decide_spoken_reply(
             MODEL_UNAVAILABLE_REPLY: "MODEL_UNAVAILABLE_REPLY",
             MALFORMED_RESPONSE_FALLBACK: "MALFORMED_RESPONSE_FALLBACK",
         }
-        spoken_reply = await translate_fixed_line(update.spoken_reply, call.language_code)
+        spoken_reply = await translate_fixed_line(
+            update.spoken_reply, resolve_multi_tier_fixed_line_target(call.language_code, latest_user_message)
+        )
         await record_agent_utterance(
             db, call.id, spoken_reply, f"fallback:{fallback_names[update.spoken_reply]}"
         )
@@ -837,6 +843,10 @@ async def _process_tool_result_turn(
     )
     update = result.update
     call = await apply_structuring_update(db, call, update)
+    latest_user_message = next(
+        (m.content for m in reversed(payload.messages) if m.role == "user" and m.content), None
+    )
+    call = await record_last_seen_user_message(db, call, latest_user_message)
     call = await _maybe_push_tool_result_screen(db, call, channel_name, tool_name, tool_result_text)
 
     health_score = compute_coordination_health_score(call.structured_state)
@@ -922,7 +932,8 @@ async def _process_turn(
             else:
                 call = await record_language_switch_confirmation_pending(db, call, result.target)
                 spoken_reply = await translate_fixed_line(
-                    build_language_switch_confirmation_prompt(result.target), call.language_code
+                    build_language_switch_confirmation_prompt(result.target),
+                    resolve_multi_tier_fixed_line_target(call.language_code, trigger_text),
                 )
                 await record_agent_utterance(db, call.id, spoken_reply, "language_switch_confirm")
                 return spoken_reply, None
@@ -1025,6 +1036,7 @@ async def _process_turn(
         "channel=%s real turn latest_user_message=%r facts_this_turn=%r",
         channel_name, latest_user_message, update.facts,
     )
+    call = await record_last_seen_user_message(db, call, latest_user_message)
     spoken_reply = await _decide_spoken_reply(db, call, update, old_facts, latest_user_message, health_score)
     return spoken_reply, None
 

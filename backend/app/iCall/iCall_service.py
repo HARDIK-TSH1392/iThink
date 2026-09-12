@@ -372,6 +372,33 @@ async def record_missing_info_nudge(db: AsyncSession, call: IncidentCall) -> Inc
     return call
 
 
+async def record_last_seen_user_message(db: AsyncSession, call: IncidentCall, text: Optional[str]) -> IncidentCall:
+    """
+    Stamps the raw text of this turn's latest user message so the NEXT
+    turn can diff against it (see iCall_utils._new_content_since) --
+    confirmed live (incident-68) that Agora accumulates unanswered speech
+    onto one growing message rather than starting a fresh one each turn,
+    so a stale Hindi fragment from several exchanges ago can still be
+    sitting in the raw text a brand-new English question arrives glued
+    onto. Without this stored reference, there's nothing to diff against
+    and the whole accumulated blob has to be treated as "the latest
+    message," which is exactly what caused that bug.
+
+    A no-op when text is None/empty (e.g. a tool-result follow-up turn
+    with no real new user speech) -- never overwrites a real prior value
+    with nothing.
+    """
+    if not text:
+        return call
+    old = call.structured_state or {}
+    new_state = dict(old)
+    new_state["last_seen_raw_user_message"] = text
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
 async def record_direct_address_reply(db: AsyncSession, call: IncidentCall) -> IncidentCall:
     """
     Stamps when a direct-address reply was last actually spoken --
