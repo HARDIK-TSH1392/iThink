@@ -28,6 +28,101 @@ the module names (`iLogs`, `iNcidents`, `iTriage`, `iCall`, `iDirectory`,
 `voice-agent/` (repo root, alongside `backend/`) is **Agora's own official
 ConvoAI quickstart**, not code we wrote — see its own section below.
 
+## System architecture
+
+Five processes, each independently runnable, none sharing a database or
+memory space — everything crosses process boundaries over plain HTTP (or,
+for Agora's own cloud, its REST API and webhooks):
+
+| Process | Port | What it is |
+|---|---|---|
+| `backend/` | `:8123` | FastAPI — the six modules above, the custom-LLM endpoint Agora calls every turn, the Agora webhook receiver |
+| `voice-agent/server` | `:8000` | Python — owns the actual Agora agent lifecycle (start/stop/switch-language), one process per machine, talks to Agora's REST API directly |
+| `voice-agent/web` | `:3000` | Next.js — the browser client a human actually joins the call through (RTC/RTM, transcript panel, MCP-results tile, delegate voice-note page) |
+| `backend/github_mcp_service` | `:8003` | Isolated MCP bridge to GitHub's official remote MCP server — separate process/venv only because its `mcp` SDK version conflicts with the main backend's pinned FastAPI |
+| `backend/ilogs_mcp_service` | `:8004` | This repo's own MCP server wrapping `GET /ilogs/` — `get_recent_logs`, `get_incident_status`, `list_action_items`, `search_similar_incidents`; shared-secret-gated once it's on a public tunnel |
+
+`backend` and the two MCP services never talk to each other directly except
+over HTTP — no shared imports, no shared DB session. The two MCP services in
+particular must be independently, publicly reachable, because it's **Agora's
+cloud**, not this backend, that calls them mid-call (see "Native MCP
+tool-calling" below) — this is why local dev needs a tunnel per service, and
+why each shows up as its own row in the port table above rather than being
+folded into the main backend process.
+
+```mermaid
+flowchart TB
+    Human((Human<br/>participant))
+    Slack[Slack]
+    Jira[Jira]
+    GH[(GitHub)]
+
+    subgraph BE["backend :8123 (FastAPI)"]
+        iLogs[iLogs]
+        iTriage[iTriage]
+        iNcidents[iNcidents]
+        iCall[iCall<br/>custom-LLM endpoint]
+        iDirectory[iDirectory]
+        iOrchestrate[iOrchestrate]
+    end
+
+    subgraph VA["voice-agent"]
+        Web["web :3000<br/>(browser client)"]
+        Server["server :8000<br/>(agent lifecycle)"]
+    end
+
+    subgraph MCP["MCP bridges (own venv, publicly tunneled)"]
+        GHMCP["github_mcp_service :8003"]
+        ILMCP["ilogs_mcp_service :8004"]
+    end
+
+    subgraph Agora["Agora Conversational AI Engine (managed cloud)"]
+        Engine["STT / LLM-router / TTS / avatar<br/>orchestration per agent"]
+    end
+
+    subgraph Vendors["STT / LLM / TTS / avatar vendors"]
+        Gemini[(Gemini)]
+        Deepgram[(Deepgram)]
+        MiniMax[(MiniMax)]
+        Sarvam[(Sarvam)]
+        Anam[(Anam avatar)]
+    end
+
+    iLogs -->|ingest signal| iTriage
+    iTriage -->|creates, awaiting approval| iNcidents
+    iNcidents -.-> iOrchestrate
+    iOrchestrate -.->|DM approve/reject| Slack
+    Slack -.->|approve/reject| iOrchestrate
+    iOrchestrate --> iNcidents
+    iNcidents -->|approved| iCall
+    iCall -->|creates channel| Server
+    Human -->|joins link| Web
+    Web <-->|RTC/RTM join| Agora
+    Server -->|POST /startAgent config| Agora
+    Agora <-->|chat/completions,<br/>every turn| iCall
+    iCall -.->|facts/decisions/<br/>action items| iOrchestrate
+    iOrchestrate -->|summary + ticket ask| Slack
+    iOrchestrate -->|create ticket| Jira
+    iCall <--> iDirectory
+    Agora <-->|STT/LLM/TTS/avatar| Vendors
+    Agora -->|native tool calls,<br/>mid-turn| GHMCP
+    Agora -->|native tool calls,<br/>mid-turn| ILMCP
+    GHMCP <--> GH
+    ILMCP -->|GET /ilogs/| iLogs
+    Agora -->|agent_left webhook| iCall
+```
+
+Two paths judges sometimes conflate, worth being explicit about:
+
+- **The custom-LLM loop** (`Agora <--> iCall`, every turn) is where facts,
+  hypotheses, decisions, and conflicts actually get extracted — this repo's
+  own Gemini-backed reasoning, not a managed LLM Agora runs on our behalf.
+- **Native MCP tool-calling** (`Agora -> GHMCP` / `Agora -> ILMCP`) is a
+  *separate* mechanism: Agora's cloud calls these two services **directly**,
+  mid-turn, when the model itself decides a question needs a live lookup —
+  the result comes back to `iCall` as a follow-up turn, but the tool call
+  itself never passes through this backend at all.
+
 ## How a request actually flows, end to end
 
 1. A signal arrives → `POST /api/v1/ilogs/ingest` (**iLogs**).
