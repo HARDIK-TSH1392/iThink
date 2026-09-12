@@ -1126,24 +1126,40 @@ class Agent:
                 # briefly muted while it reacts, which "sounds identical to
                 # a broken/cut voice" -- Watcher's own words, from before
                 # THAT agent got the same tuning below. interruption.enable
-                # =False (above) only stops this agent from abandoning its
-                # reply on a detected interruption; it does nothing about
-                # the underlying VAD still firing and the track still
-                # blipping. Reusing Watcher's own proven values rather than
-                # re-deriving new ones -- language matches this agent's own
-                # STT (en-IN, see DeepgramSTT below), semantic end-of-speech
-                # kept off (mode="vad") since this agent has no structuring
-                # pipeline that needs "is this thought grammatically
-                # complete" judgment the way Watcher's does.
+                # =False + disabled_config.strategy="ignore" (above) stop
+                # this agent from ever ACTING on a detected interruption --
+                # they do NOT establish that VAD firing at all is itself
+                # silent; whatever transport-level reaction happens the
+                # moment VAD fires (the actual mechanism behind the blip)
+                # happens before "ignore" ever gets consulted.
+                #
+                # speech_threshold and the two interrupt-duration values
+                # below were initially just copied from Watcher's own
+                # tuning, but that tuning solves a DIFFERENT problem: 0.3
+                # was deliberately lowered so Watcher (mostly listening,
+                # occasionally speaking) doesn't miss a quiet HUMAN
+                # speaker. This agent's actual risk profile is the
+                # opposite -- it is the one talking, for one long
+                # monologue, and needs to be robust AGAINST false triggers
+                # (echo, headset noise, ambient sound) while doing so, not
+                # sensitive to a quiet human it isn't even listening for
+                # most of the time. Raised speech_threshold well above
+                # Watcher's (less likely to register ambient noise as
+                # speech at all -- the most direct lever, since a duration
+                # threshold only matters after VAD has already fired) and
+                # the interrupt-duration windows further still, since fast
+                # responsiveness to a genuine interruption is moot once
+                # interruption itself is disabled -- there's no reason for
+                # either window to be short here.
                 turn_detection={
                     "language": "en-IN",
                     "config": {
-                        "speech_threshold": 0.3,
+                        "speech_threshold": 0.7,
                         "start_of_speech": {
                             "mode": "vad",
                             "vad_config": {
-                                "interrupt_duration_ms": 350,
-                                "speaking_interrupt_duration_ms": 650,
+                                "interrupt_duration_ms": 1200,
+                                "speaking_interrupt_duration_ms": 2000,
                                 "prefix_padding_ms": 300,
                             },
                         },
