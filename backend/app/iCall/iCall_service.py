@@ -774,6 +774,12 @@ async def _reconcile_action_item_owners(
                 new_item["owner_uid"] = uid
                 new_item["owner_role"] = entry.get("final_role")
                 new_item["owner_source"] = "name_match"
+                # Normalize the display text to the roster's canonical name too --
+                # otherwise a stale/raw extraction (e.g. an STT mishearing) stays
+                # in owner even though owner_uid now correctly identifies someone
+                # else entirely, which reads as a bug in any UI that shows owner.
+                if entry.get("name"):
+                    new_item["owner"] = entry["name"]
                 changed = True
 
     # Pass 2: role match for whatever's still unassigned
@@ -803,6 +809,10 @@ async def _reconcile_action_item_owners(
             new_items[global_index]["owner_role"] = roster_entry.get("final_role")
             new_items[global_index]["owner_source"] = "role_match"
             new_items[global_index]["owner_rationale"] = assignment.rationale
+            # Same normalization as Pass 1 -- role-match still resolves to a
+            # real roster person, so owner should say who that actually is.
+            if roster_entry.get("name"):
+                new_items[global_index]["owner"] = roster_entry["name"]
             changed = True
 
     if changed:
