@@ -289,6 +289,55 @@ flowchart LR
     Handoff --> Greet[Translated greeting\nin new target language]
 ```
 
+### Correctness fixes found via live testing (incident-66)
+
+A real Tier-1 call surfaced two separate bugs, both root-caused against the
+actual transcript rather than guessed, both fixed with a deterministic
+check rather than trusting the model further:
+
+- **Tier-1 spoken replies drifted to Hindi even on a purely-English turn.**
+  The first fix (mirror "whichever language the user's latest message was
+  in," leaving detection to the model) worked in isolation but failed live
+  on a real, Hindi-heavy multi-turn call: by a later, purely-English turn,
+  the model still replied in Hindi — it was weighing the conversation's
+  overall tone over the literal instruction to mirror only the latest
+  message. Replaced with a deterministic check instead
+  (`iCall_utils._contains_devanagari` — Deepgram consistently renders real
+  Hindi speech in Devanagari script on this pipeline, confirmed 14/14
+  against every real transcript captured this session, zero false
+  positives/negatives): if the user's most recent message has zero
+  Devanagari characters, the model is told flatly to reply in English
+  regardless of earlier turns; otherwise it's told to reply in Hindi,
+  Devanagari script only (not romanized) since that's the script this
+  pipeline's TTS is confirmed to render correctly. Re-verified against the
+  exact failing transcript (now stays English) and the original Hindi case
+  it was built for (still replies Hindi) before shipping.
+- **Fixed lines (the closing recap, fallback replies, the Stage-3
+  confirmation question) always spoke English, even mid-Hindi-conversation.**
+  `translate_fixed_line` already no-ops for the `"multi"` tier by design —
+  there's no single target language for a tier that deliberately bundles
+  two. Fixed by reusing that same existing function unchanged: the caller
+  now resolves a per-moment target via
+  `resolve_multi_tier_fixed_line_target` (same Devanagari check as above,
+  applied to the same last-message signal) and passes `"hi"` — a
+  registered pseudo-code in `LANGUAGE_DISPLAY_NAMES`, not a real
+  switchable tier — instead of `"multi"` when appropriate. Zero new
+  translation logic; the cache and every existing Tier-2 call path are
+  untouched (verified: Tamil's fixed-line translation still returns
+  byte-identical output after this change). Deliberately *not* a
+  multi-message rolling window — that was considered and rejected as
+  unneeded complexity for a failure mode never actually observed, given a
+  natural Hindi wrap-up line is itself normally still in Hindi/mixed
+  script, not purely English.
+- **"logs" kept transcribing as "loads"** (confirmed live, 4 separate
+  attempts in one call). Intent detection (`wants_log_screen`) stayed
+  robust to the mishearing every time — this only affected the raw
+  transcript text a human actually reads. Added `"logs"` to
+  `BASE_KEYTERMS`, the same Deepgram boosting mechanism already used for
+  "Watcher" and other incident vocabulary — not guaranteed to fully fix it
+  (boosting has never hit 100% even for the wake word on this pipeline),
+  but a low-risk, single-word addition worth trying at the source.
+
 ## Setup — backend
 
 ```bash
@@ -356,8 +405,13 @@ For the multilingual pipeline (see its own section above): `SARVAM_API_KEY`
 is **required** for Tier 2 (the 9 non-English/Hindi languages) — without it,
 Sarvam STT/TTS calls fail outright for any call started in one of those
 languages. `WATCHER_GEOFENCE_INDIA` is optional/opt-in (any truthy value
-enables `geofence: {"area": "INDIA"}`) — leave it unset unless you've
-specifically measured the join-latency trade-off for your setup.
+enables `geofence: {"area": "INDIA"}`) — **measured, kept off**: a real
+side-by-side test (5 timed `/startAgent` calls each way, same machine, same
+session) showed no latency benefit (2.14s mean off vs. 2.46s mean on — if
+anything slightly slower, though the sample is small and noisy) and no join
+failures either way. Since it only costs you Agora's automatic cross-region
+failover with no upside shown, leave it unset unless you re-measure this
+yourself and see a real win.
 
 **Important:** the web client only produces a working voice agent when
 joined via a real `?channel=incident-N` link tied to an actual `IncidentCall`
@@ -377,7 +431,7 @@ custom-LLM endpoint. That's expected, not a bug.
 | Farewell handling | `farewell_config: {graceful_enabled: true, graceful_timeout_seconds: 5}` | Graceful call-end behavior |
 | Advanced features | `advanced_features: {enable_rtm: true, enable_tools: true}` | RTM messaging + native MCP tool-calling |
 | Native MCP tool-calling | `mcp_servers` list (GitHub, iLogs) | Live GitHub/log lookups mid-call — see its own section above |
-| Geofencing | `geofence: {"area": "INDIA"}`, opt-in via `WATCHER_GEOFENCE_INDIA` | Routes Agora infra within the India region; opt-in, not default, due to a real cross-region-failover latency trade-off |
+| Geofencing | `geofence: {"area": "INDIA"}`, opt-in via `WATCHER_GEOFENCE_INDIA` | Would route Agora infra within the India region — **measured and kept off**: a real side-by-side test (5 timed `/startAgent` calls each way) showed no latency benefit (2.14s mean off vs. 2.46s mean on) and no failures either way, so it's not worth giving up automatic cross-region failover for. See "Setup — voice agent" above for the numbers. |
 | Custom LLM proxy | Agent's LLM `base_url` pointed at `iCall`'s `chat/completions` endpoint | Every turn's reasoning happens in this repo's own Gemini-backed logic, not a managed LLM |
 | Agent handoff (no live ASR/TTS update exists) | `client.agents.get()` (status poll) + `stop_agent()` + a fresh `start()` with the same `agent_uid`/`user_uid` | Only way to change STT/TTS vendor mid-call — `UpdateAgentsRequestProperties` has exactly `token`/`llm`/`mllm`, confirmed from source, no `asr`/`tts` field at all |
 | Webhook events | `POST /webhooks/agora` receives all 7 event types; **only `agent_left` (102) is wired to real behavior** | The authoritative, client-independent "call ended" signal — the other 6 (`agent_joined`, `dialogue_history`, `agent_error`, `performance_metrics`, `incoming/outgoing_call_status`) are logged, not acted on |
