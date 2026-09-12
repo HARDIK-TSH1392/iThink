@@ -1151,6 +1151,15 @@ class Agent:
                 # responsiveness to a genuine interruption is moot once
                 # interruption itself is disabled -- there's no reason for
                 # either window to be short here.
+                #
+                # speaking_interrupt_duration_ms=2000 was confirmed live
+                # (2026-09-12) to be flatly rejected by Agora's own API --
+                # a real 400, "must be less than or equal to 1200" -- which
+                # silently failed the whole delegate-avatar start (Watcher
+                # itself still joined fine, since it's a fully independent
+                # agent/request; only the avatar never showed up, with no
+                # visible error on the call itself). Capped at the
+                # documented max instead of guessing a smaller number.
                 turn_detection={
                     "language": "en-IN",
                     "config": {
@@ -1159,7 +1168,7 @@ class Agent:
                             "mode": "vad",
                             "vad_config": {
                                 "interrupt_duration_ms": 1200,
-                                "speaking_interrupt_duration_ms": 2000,
+                                "speaking_interrupt_duration_ms": 1200,
                                 "prefix_padding_ms": 300,
                             },
                         },
