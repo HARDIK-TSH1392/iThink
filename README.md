@@ -324,11 +324,7 @@ check rather than trusting the model further:
   switchable tier — instead of `"multi"` when appropriate. Zero new
   translation logic; the cache and every existing Tier-2 call path are
   untouched (verified: Tamil's fixed-line translation still returns
-  byte-identical output after this change). Deliberately *not* a
-  multi-message rolling window — that was considered and rejected as
-  unneeded complexity for a failure mode never actually observed, given a
-  natural Hindi wrap-up line is itself normally still in Hindi/mixed
-  script, not purely English.
+  byte-identical output after this change).
 - **"logs" kept transcribing as "loads"** (confirmed live, 4 separate
   attempts in one call). Intent detection (`wants_log_screen`) stayed
   robust to the mishearing every time — this only affected the raw
@@ -337,6 +333,48 @@ check rather than trusting the model further:
   "Watcher" and other incident vocabulary — not guaranteed to fully fix it
   (boosting has never hit 100% even for the wake word on this pipeline),
   but a low-risk, single-word addition worth trying at the source.
+
+### Two more, found by a second live call (incident-68)
+
+- **The Hindi-drift bug above recurred** — English question, Hindi reply —
+  even with the Devanagari check already live. Root-caused precisely by
+  reading the actual backend request log (not guessed): Agora accumulates
+  unanswered speech onto ONE growing "user" message by exact string
+  append, whenever our own reply to a turn came back empty. A Hindi turn
+  that never triggered a reply stayed glued to the front of the very next,
+  unrelated English question — confirmed exactly this shape from the real
+  log (`"...service."` → `"...service. <hindi turn>"` → `"...service.
+  <hindi turn> Watcher, what is the current status?"`, one exact prefix
+  inside the next each time) — so the whole-message Devanagari check saw
+  the stale Hindi fragment and (correctly, given what it was told to
+  check) decided the turn was Hindi. Fixed with `_new_content_since`:
+  exact-prefix diffing against the previous turn's own raw message
+  (persisted via `iCall_service.record_last_seen_user_message`), not a
+  sentence split or a last-N-characters window — both were considered and
+  rejected, the former because real Deepgram output here often has no
+  punctuation to split on, the latter because Hindi tech speech routinely
+  embeds English jargon mid-sentence while ending on a Hindi
+  postposition/verb, so a trailing window risks misreading a genuinely-
+  Hindi sentence as English. Exact-prefix diffing has neither failure
+  mode: it isolates precisely the new substance, nothing more. Falls back
+  to the old whole-message check whenever the prefix doesn't match (no
+  stored previous turn, or a fresh accumulation right after a real reply)
+  — never worse than before, only better when the diff applies. Re-
+  verified against the exact incident-68 request shapes (three accumulated
+  messages, byte-for-byte from the real log) through the real, deployed
+  `_process_turn` — now correctly stays English on the final turn.
+- **Hindi replies used masculine grammar spoken by a female voice.**
+  Tier 1's configured TTS is `MiniMax(voice_id="English_captivating_female1")`
+  — a female voice — but ungendered Hindi generation defaults to
+  masculine conjugation (`रहा हूँ`, `करता हूँ`) with no persona specified.
+  Confirmed live and fixed in two places, since they're independent
+  Gemini calls with independent prompts: `build_structuring_system_
+  instruction`'s Hindi branch, and `translate_fixed_line`'s translation
+  prompt (gated to its `"hi"` pseudo-target specifically — verified this
+  addition doesn't change Tamil's or any other Tier-2 language's
+  translation output at all). Missing either one would have left an
+  inconsistency — normal conversation sounding female, the closing
+  summary suddenly sounding male.
 
 ## Setup — backend
 
