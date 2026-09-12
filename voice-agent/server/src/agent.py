@@ -1214,6 +1214,20 @@ class Agent:
         self._channel_delegate_agents[channel_name] = agent_id
         logger.info("Started delegate avatar agent agent_id=%s channel=%s", agent_id, channel_name)
 
+        # Registers this agent's own display name into the same uid->name
+        # map /getNames already serves (see server.py's set_name/_channel_names)
+        # -- the web client's tile-label lookup already falls back to that
+        # map for any uid that isn't Watcher's own, so this needs no
+        # frontend change at all. Local import (not top-level) because
+        # server.py imports Agent from this module -- importing server.py
+        # back at module load time would be circular; deferring it to call
+        # time, after both modules have finished loading, is not.
+        from server import _channel_names
+
+        _channel_names.setdefault(channel_name, {})[str(avatar_agent_uid)] = (
+            f"{approver_name}'s Avatar"
+        )
+
     async def stop(self, agent_id: str) -> None:
         """
         Stop a running agent. Falls back to the stateless client path.
