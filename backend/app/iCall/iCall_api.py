@@ -80,6 +80,7 @@ from .iCall_utils import (
     build_language_switch_confirmation_prompt,
     LANGUAGE_CONFIRMATION_TIMEOUT_S,
     translate_fixed_line,
+    resolve_multi_tier_fixed_line_target,
     trigger_language_handoff,
     CALL_STATUS_COMPLETED,
     EVENT_AGENT_LEFT,
@@ -644,7 +645,9 @@ async def _decide_spoken_reply(
         # exactly as accurate as before; this just says what actually
         # happened before promising where the fuller version goes.
         spoken_reply = redact_sensitive_reply(f"{build_health_recap(call.structured_state)} {CLOSING_LINE}")
-        spoken_reply = await translate_fixed_line(spoken_reply, call.language_code)
+        spoken_reply = await translate_fixed_line(
+            spoken_reply, resolve_multi_tier_fixed_line_target(call.language_code, latest_user_message)
+        )
         call = await record_wrapped_up(db, call)
         await record_agent_utterance(db, call.id, spoken_reply, "is_wrapping_up")
         return spoken_reply
@@ -655,7 +658,9 @@ async def _decide_spoken_reply(
             MODEL_UNAVAILABLE_REPLY: "MODEL_UNAVAILABLE_REPLY",
             MALFORMED_RESPONSE_FALLBACK: "MALFORMED_RESPONSE_FALLBACK",
         }
-        spoken_reply = await translate_fixed_line(update.spoken_reply, call.language_code)
+        spoken_reply = await translate_fixed_line(
+            update.spoken_reply, resolve_multi_tier_fixed_line_target(call.language_code, latest_user_message)
+        )
         await record_agent_utterance(
             db, call.id, spoken_reply, f"fallback:{fallback_names[update.spoken_reply]}"
         )
@@ -922,7 +927,8 @@ async def _process_turn(
             else:
                 call = await record_language_switch_confirmation_pending(db, call, result.target)
                 spoken_reply = await translate_fixed_line(
-                    build_language_switch_confirmation_prompt(result.target), call.language_code
+                    build_language_switch_confirmation_prompt(result.target),
+                    resolve_multi_tier_fixed_line_target(call.language_code, trigger_text),
                 )
                 await record_agent_utterance(db, call.id, spoken_reply, "language_switch_confirm")
                 return spoken_reply, None

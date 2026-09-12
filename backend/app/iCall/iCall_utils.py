@@ -229,7 +229,59 @@ LANGUAGE_DISPLAY_NAMES: Dict[str, str] = {
     "pa-IN": "Punjabi",
     "ml-IN": "Malayalam",
     "or-IN": "Odia",
+    # Not a real switchable tier -- "multi" (Tier 1) bundles English+Hindi
+    # together on purpose, so there's no dedicated "hi-IN" call state. This
+    # entry exists only so translate_fixed_line(text, "hi") -- used to
+    # translate a fixed line into Hindi for a *moment* within a multi-tier
+    # call, not to actually change the call's tier -- gets a real display
+    # name instead of falling back to the bare code "hi" in its prompt.
+    # Confirmed via grep this dict is only ever read with .get(), never
+    # iterated as "the list of switchable languages" -- safe to add a
+    # non-tier key here without it leaking into switch-detection logic
+    # (which reads its own separate LANGUAGE_LEXICON, not this dict).
+    "hi": "Hindi",
 }
+
+# Deepgram transcribes genuine Hindi speech in Devanagari script, not
+# romanized Hindi -- confirmed against every real Hindi/mixed utterance
+# captured live this session (incidents 63, 64, 66: 14/14 correctly
+# classified by this exact check, zero false positives/negatives). Used
+# to decide, per turn, whether the user's most recent message was in
+# Hindi -- deterministic, no LLM call, O(1) regardless of conversation
+# length.
+_DEVANAGARI_PATTERN = re.compile(r"[ऀ-ॿ]")
+
+
+def _contains_devanagari(text: Optional[str]) -> bool:
+    return bool(text) and bool(_DEVANAGARI_PATTERN.search(text))
+
+
+def resolve_multi_tier_fixed_line_target(call_language_code: str, latest_user_text: Optional[str]) -> str:
+    """
+    For a Tier-2 call this is a no-op (returns call_language_code
+    unchanged, exactly as before). For a Tier-1 ("multi") call, decides
+    whether a *fixed* line (CLOSING_LINE, a fallback reply, the Stage-3
+    confirmation prompt) should be spoken in Hindi this particular time,
+    using the SAME deterministic signal as build_structuring_system_
+    instruction's per-turn reply mirroring -- deliberately not a separate,
+    fancier heuristic (a multi-message window was considered and rejected:
+    it adds real new edge cases -- window size, tie-breaking, which
+    message roles count -- for a narrow scenario never actually observed,
+    when the existing single-message check already handles the common
+    case correctly, since a natural Hindi wrap-up line is itself usually
+    still in Hindi/mixed script, not purely English).
+
+    Returns "hi" (a pseudo-target -- see LANGUAGE_DISPLAY_NAMES -- that
+    translate_fixed_line treats exactly like any other target language,
+    no special-casing inside that function) when the last message
+    contains Devanagari, else the call's own language_code unchanged
+    (which is a no-op for "multi" via translate_fixed_line's existing
+    early return, keeping today's English-only behavior intact when the
+    last message was English).
+    """
+    if call_language_code != "multi":
+        return call_language_code
+    return "hi" if _contains_devanagari(latest_user_text) else call_language_code
 
 # --- Token-presence matching (replaces the old single English-phrasing
 # regex) -----------------------------------------------------------------
@@ -739,6 +791,18 @@ BASE_KEYTERMS = [
     "Jira",
     "Slack",
     "PagerDuty",
+    # Confirmed live (incident-66): Deepgram consistently misheard "logs"
+    # as "loads" across 4 separate attempts in one call ("fetch the loads
+    # from the it" / "fetch the loads from the GitHub") -- the underlying
+    # intent-detection (wants_log_screen) is LLM-judged and stayed robust
+    # to the mishearing every time, but the raw transcript itself stayed
+    # wrong, which is what a human reading the transcript panel actually
+    # sees. Same boosting mechanism already used for "Watcher" and the
+    # other terms here -- not guaranteed to fully fix it (keyterm boosting
+    # on this pipeline has never hit 100% even for the wake word), but a
+    # low-risk, single common word worth trying at the source rather than
+    # only patching the transcript display after the fact.
+    "logs",
 ]
 
 
@@ -1038,7 +1102,9 @@ Hard constraints:
 """
 
 
-def build_structuring_system_instruction(language_code: Optional[str]) -> str:
+def build_structuring_system_instruction(
+    language_code: Optional[str], latest_user_text: Optional[str] = None
+) -> str:
     """
     STRUCTURING_SYSTEM_INSTRUCTION is kept as a module-level constant
     (backend/eval/measure_groq_latency.py and measure_te_config_variants.py
@@ -1054,14 +1120,35 @@ def build_structuring_system_instruction(language_code: Optional[str]) -> str:
     confirmed live (incident-63): with no language guidance at all, Gemini
     defaulted to English even when the user spoke Hindi, since the base
     STRUCTURING_SYSTEM_INSTRUCTION is itself written in English and says
-    nothing about matching the speaker. Deliberately NOT a fixed target
-    language the way Tier 2 is (there is no single "the language" for this
-    tier) -- instead it asks the model to mirror whichever language the
-    user's own latest message was actually in, since Gemini already sees
-    the full conversation text and inferring "was that Hindi or English"
-    from it needs no separate detection step or extra model call.
+    nothing about matching the speaker.
+
+    A softer version of this ("mirror whichever language the user's
+    latest message was in," leaving the actual detection to the model)
+    shipped first and was confirmed live (incident-66) to fail on a real,
+    Hindi-heavy multi-turn call: by the time of a later, purely-English
+    turn, the model reverted to Hindi anyway -- it was weighing the
+    conversation's overall tone over the literal instruction to mirror
+    only the latest message. Replaced with a deterministic check
+    (_contains_devanagari on latest_user_text) instead of asking the model
+    to infer it -- same "compute it in code, don't trust the model to
+    self-report" discipline this codebase already applies everywhere else
+    (health scores, speak-gating, silence triggers). Re-verified against
+    the exact failing incident-66 transcript (now correctly stays English)
+    and against the original incident-63 Hindi case (still correctly
+    replies Hindi) before this replaced the softer version.
     """
     if not language_code or language_code == "multi":
+        if not _contains_devanagari(latest_user_text):
+            return STRUCTURING_SYSTEM_INSTRUCTION + """
+- This call is running in Watcher's English/Hindi tier (Deepgram's
+  native code-switching mode). The user's most recent message contains
+  NO Hindi/Devanagari script at all -- it is entirely in English. Reply
+  in English for this turn, regardless of what language earlier turns in
+  this conversation or your own earlier replies used -- do not switch to
+  Hindi just because earlier turns were in Hindi. Keep
+  facts/hypotheses/decisions/action_items/missing_info in English as
+  usual (internal record-keeping, not spoken content).
+"""
         return STRUCTURING_SYSTEM_INSTRUCTION + """
 - This call is running in Watcher's English/Hindi tier (Deepgram's
   native code-switching mode) -- participants may speak English, Hindi,
@@ -1069,17 +1156,16 @@ def build_structuring_system_instruction(language_code: Optional[str]) -> str:
   see may itself be mixed-script for that reason (e.g. Devanagari Hindi
   with English technical terms/proper nouns left in Latin script) -- that
   is expected, not a transcription error, so don't treat mixed-script
-  input as unclear or ask the room to repeat it. Match spoken_reply's
-  language to the user's most recent message: if they spoke mostly in
-  Hindi, reply in natural, conversational Hindi (Devanagari script) the
-  way someone would actually say it out loud -- not a literal
-  word-for-word translation of English incident jargon (keep proper
-  nouns, service names, and jargon like "rollback"/"PR"/"API" in their
-  usual English/Latin form even inside an otherwise-Hindi reply, since
-  that's how they're actually said in real Hindi tech conversation). If
-  they spoke in English, reply in English as usual. If they genuinely
-  mixed both in one sentence, mirror that same natural code-switching in
-  your reply rather than force it into a single language. Keep
+  input as unclear or ask the room to repeat it. The user's most recent
+  message contains Hindi (possibly mixed with English) -- reply in
+  natural, conversational Hindi the way someone would actually say it out
+  loud, not a literal word-for-word translation of English incident
+  jargon (keep proper nouns, service names, and jargon like
+  "rollback"/"PR"/"API" in their usual English/Latin form even inside an
+  otherwise-Hindi reply, since that's how they're actually said in real
+  Hindi tech conversation). Write any Hindi words in Devanagari script --
+  NOT romanized/Latin-script Hindi -- since Devanagari is the script this
+  pipeline's voice synthesis is confirmed to handle correctly. Keep
   facts/hypotheses/decisions/action_items/missing_info in English as
   usual (internal record-keeping, not spoken content) -- only
   spoken_reply's language changes.
@@ -1433,8 +1519,15 @@ async def generate_structuring_update(
         service=service, region=region, incident_age_minutes=incident_age_minutes,
         channel_name=channel_name,
     )
+    # The most recent thing the USER actually said -- not the tool result
+    # that may sit after it in `messages` on a tool-result follow-up turn
+    # (see _process_tool_result_turn), since it's the user's own language
+    # that matters for this decision, not a tool's raw output.
+    latest_user_text = next(
+        (m.content for m in reversed(messages) if m.role == "user" and m.content), None
+    )
     config = types.GenerateContentConfig(
-        system_instruction=build_structuring_system_instruction(language_code),
+        system_instruction=build_structuring_system_instruction(language_code, latest_user_text),
         response_mime_type="application/json",
         response_schema=StructuringUpdate,
         tools=[gemini_tool] if gemini_tool else None,
