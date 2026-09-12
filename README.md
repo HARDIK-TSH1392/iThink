@@ -97,6 +97,103 @@ keyword-triggered ("did we deploy/ship/commit recently?") lookup used by
 mapping, not the model deciding when to call it. Both this and the native
 GitHub MCP tool above can be enabled at once; they don't conflict.
 
+## Multilingual voice pipeline
+
+Two tiers, chosen after live-testing every realistic vendor option against
+Agora's actual integration (not vendor docs alone — see the hurdles table
+below for where docs and real behavior diverged):
+
+- **Tier 1 — `multi` (English + Hindi), zero-switch.** Deepgram
+  `language="multi"` code-switches between English and Hindi automatically,
+  mid-sentence, with no spoken command needed — this is the always-on
+  default tier.
+- **Tier 2 — 9 Indic languages, explicit-trigger only** (`ta-IN`, `te-IN`,
+  `kn-IN`, `bn-IN`, `mr-IN`, `gu-IN`, `pa-IN`, `ml-IN`, `or-IN`), via Sarvam
+  (`saaras:v3` STT, `bulbul:v3` TTS). Entered/exited only by an explicit
+  spoken request ("switch to Tamil," "angrejima badalo") — never passive
+  detection, since neither vendor can reliably detect a language it has no
+  model for.
+
+### How switch detection works (`iCall_utils.detect_language_switch_trigger`)
+
+A single English-phrasing regex ("switch to X") was the original approach
+and failed on real transcripts — Sarvam renders code-switched speech in
+unpredictable ways (see the incident-64/Gujarati findings below), not
+consistent English sentence structure. Replaced with a 3-stage,
+order-independent detector:
+
+1. **Normalize** (Unicode NFC + lowercase) — Indic scripts can encode the
+   same visible character as different codepoint sequences.
+2. **Token-presence match**: does the utterance contain a switch-verb
+   signal (a shared set of English loanwords — `switch`/`change`/`speak`/
+   `talk`/`reply` — that survive code-switching almost unchanged, plus
+   each language's own native verb forms) **and** a language-name signal
+   (English name, native name, and how that name renders once a
+   *different* language's STT transliterates it)? Both matched via
+   **substring containment**, not `\b`-regex or whitespace tokenization —
+   both of those were tried and confirmed broken: Indic postpositions
+   glue directly onto nouns with no space (Gujarati `અંગ્રેજી` + `માં` →
+   `અંગ્રેજીમાં`, never its own token), and `\b` is unreliable right after a
+   word ending in a combining vowel-sign matra (Unicode category Mc/Mn,
+   which Python's `\w` excludes).
+3. **Fuzzy fallback** (stdlib `difflib`, only on an exact miss) recovers
+   small transcription jitter — not guaranteed to catch a confidently
+   *wrong-but-real* word (`மாறவும்` → `மறையவும்`, a genuine different Tamil
+   word).
+4. **Confirmation loop**: a bare language mention with no verb signal
+   never auto-switches or silently drops — the agent asks ("Did you want
+   to switch to Tamil?"), and a yes/no reply on the *next* turn (small,
+   tractable per-language lexicon) commits or drops it. Expires after 15s
+   so a stray "yes" minutes later can't retroactively trigger a switch.
+
+**Worked example** (real, from direct Sarvam API testing, not simulated):
+saying "angrejima badalo" while Gujarati is active is transcribed by
+Sarvam as `અંગ્રેજીમાં બદલો` — both the language-name substring (`અંગ્રેજી`)
+and the verb substring (`બદલો`) are present, so this fires a confident
+switch back to the `multi` tier.
+
+**Verified vs. best-effort**: `multi`, `ta-IN`, `te-IN`, and `gu-IN`'s
+lexicons are built from real, repeated Sarvam TTS→STT round-trip testing
+(generate genuine audio, transcribe it locked to the target language,
+inspect the actual output). `kn-IN`, `bn-IN`, `mr-IN`, `pa-IN`, `ml-IN`,
+`or-IN` are best-effort native spellings — not yet verified the same way.
+
+### How the actual handoff works
+
+The switch itself is one generic, symmetric operation over all 10
+language states (`multi` + the 9 Tier-2 codes) — any state to any other,
+not routed through English as a hub. There is no live "change the STT/TTS
+vendor" API call — `UpdateAgentsRequestProperties` (the only live-update
+endpoint) has exactly `token`/`llm`/`mllm`, no `asr`/`tts` field at all —
+so a switch is a full agent handoff: stop the current agent, poll its
+status (bounded ~10s, proceeds regardless after timeout) until it's
+actually released the channel, then start a fresh agent with the **same**
+`agent_uid`/`user_uid` so the room's "Watcher" identity doesn't change.
+
+### What gets spoken, in which language
+
+| Moment | Text | Spoken in | Verified live? |
+|---|---|---|---|
+| Pre-handoff acknowledgment | "Switching to X now, one moment." | Always English text, synthesized by **whichever TTS is still active** at that instant | **Not verified for the Tier-2-exit case** — when leaving e.g. Tamil, this English sentence is spoken by Sarvam TTS still configured for `ta-IN`, before the handoff happens. Untested whether that sounds acceptable or garbled — a known, open risk, not a confirmed-safe design point. |
+| Stage-3 confirmation question | "Did you want to switch to X?" | Translated into the **currently active** language (`translate_fixed_line`) | Text-level translation verified via direct calls; full spoken-audio naturalness not verified for most languages |
+| Post-handoff greeting | "I'm back — now listening in X." | Translated into the **target** (new) language | Text-level translation verified; audio naturalness only spot-checked for Tamil |
+
+```mermaid
+flowchart LR
+    Mic[Participant speech] --> STT{Which tier?}
+    STT -->|multi| DG[Deepgram nova-3, language=multi]
+    STT -->|Tier 2| SV[Sarvam saaras:v3, language=&lt;code&gt;]
+    DG --> Trig{Switch trigger\ndetected?}
+    SV --> Trig
+    Trig -->|no| LLM[iCall Custom LLM\nchat/completions]
+    Trig -->|confident| Handoff[stop -> poll -> start\nsame agent_uid/user_uid]
+    Trig -->|ambiguous| Confirm[Ask: confirm?] --> Trig
+    LLM --> TTS{Which tier?}
+    TTS -->|multi| MM[MiniMax speech_2_6_turbo]
+    TTS -->|Tier 2| SVT[Sarvam bulbul:v3]
+    Handoff --> Greet[Translated greeting\nin new target language]
+```
+
 ## Setup — backend
 
 ```bash
@@ -160,11 +257,77 @@ crash either way. `ILOGS_MCP_URL` needs `backend/ilogs_mcp_service/`
 running (`python3 server.py`, separate process, own `.venv` — see its
 module docstring for why it's isolated) and tunneled publicly.
 
+For the multilingual pipeline (see its own section above): `SARVAM_API_KEY`
+is **required** for Tier 2 (the 9 non-English/Hindi languages) — without it,
+Sarvam STT/TTS calls fail outright for any call started in one of those
+languages. `WATCHER_GEOFENCE_INDIA` is optional/opt-in (any truthy value
+enables `geofence: {"area": "INDIA"}`) — leave it unset unless you've
+specifically measured the join-latency trade-off for your setup.
+
 **Important:** the web client only produces a working voice agent when
 joined via a real `?channel=incident-N` link tied to an actual `IncidentCall`
 row (see the demo dashboard below) — opening `localhost:3000` bare generates
 a random room with no backing incident, which will 404 against `iCall`'s
 custom-LLM endpoint. That's expected, not a bug.
+
+## Agora features used
+
+| Feature | Config / parameter | Purpose |
+|---|---|---|
+| Deepgram code-switching | `DeepgramSTT(model="nova-3", language="multi", keyterm=...)` | Tier 1 zero-switch English+Hindi transcription |
+| Deepgram keyterm boosting | `keyterm` string, **spaces `%20`-encoded** | Wake-word ("Watcher") + incident vocabulary recognition boost |
+| Sarvam STT | `SarvamSTT(model="saaras:v3", language=<code>)` | Tier 2 transcription for 9 Indic languages |
+| Sarvam TTS | `SarvamTTS(target_language_code=<code>, speaker=<name>)`, `model="bulbul:v3"` via a raw-dict override (`agora_agent._tts["params"]["model"]`) | Tier 2 speech synthesis |
+| Turn detection | `turn_detection.language`, set per active tier | End-of-speech detection; falls back to `en-IN` for the 4 languages absent from Agora's real turn-detection whitelist (`mr-IN`/`pa-IN`/`ml-IN`/`or-IN`) |
+| Farewell handling | `farewell_config: {graceful_enabled: true, graceful_timeout_seconds: 5}` | Graceful call-end behavior |
+| Advanced features | `advanced_features: {enable_rtm: true, enable_tools: true}` | RTM messaging + native MCP tool-calling |
+| Native MCP tool-calling | `mcp_servers` list (GitHub, iLogs) | Live GitHub/log lookups mid-call — see its own section above |
+| Geofencing | `geofence: {"area": "INDIA"}`, opt-in via `WATCHER_GEOFENCE_INDIA` | Routes Agora infra within the India region; opt-in, not default, due to a real cross-region-failover latency trade-off |
+| Custom LLM proxy | Agent's LLM `base_url` pointed at `iCall`'s `chat/completions` endpoint | Every turn's reasoning happens in this repo's own Gemini-backed logic, not a managed LLM |
+| Agent handoff (no live ASR/TTS update exists) | `client.agents.get()` (status poll) + `stop_agent()` + a fresh `start()` with the same `agent_uid`/`user_uid` | Only way to change STT/TTS vendor mid-call — `UpdateAgentsRequestProperties` has exactly `token`/`llm`/`mllm`, confirmed from source, no `asr`/`tts` field at all |
+| Webhook events | `POST /webhooks/agora` receives all 7 event types; **only `agent_left` (102) is wired to real behavior** | The authoritative, client-independent "call ended" signal — the other 6 (`agent_joined`, `dialogue_history`, `agent_error`, `performance_metrics`, `incoming/outgoing_call_status`) are logged, not acted on |
+
+## Agora hurdles: tried vs. accepted
+
+Two of these cost real, avoidable debugging time by trying plausible
+variants before checking a primary source exactly — noted here so the
+lesson doesn't get re-learned:
+
+| Issue | Tried | Result |
+|---|---|---|
+| **Deepgram keyterm boosting → empty transcripts.** Boosting "Watcher" broke transcription outright on most turns (not misheard — no text at all). | Literal space-separated string (naive docs reading); comma-separated; semicolon-separated; JSON array. | All four failed identically. Root cause: Agora's relay needs the *exact* documented encoding — spaces as `%20`, not a literal space — matched byte-for-byte to Agora's own example. Verified: single-term 3/3 live; `%20`-encoded multi-word confirmed working. |
+| **`saaras:v3-realtime` (the "obviously correct" name for a live pipeline) → broken transcription.** | Used `saaras:v3-realtime` as the STT model string. | Broke transcription entirely through Agora's relay, confirmed twice, independently, live. `saaras:v3` (**without** `-realtime`) is the only value that works here — undocumented as a gotcha, only found by testing both. Related: no partial/interim transcripts exist on this Sarvam path at all, confirmed at the wire-protocol level via a second, independent production codebase hitting the identical wall — the vendor protocol only emits VAD events and a complete-segment message, nothing in between. |
+| `bulbul:v2` deprecated, but Agora kept sending it regardless of the model requested. | Checked `SarvamTTSOptions` for a `model`/`additional_params` field — none exists (`extra="forbid"`). Checked SDK 2.8.0 (latest) — identical, unfixed. | Found the underlying raw type (`SarvamTtsParams`) has `extra="allow"` and `Agent._tts` is a plain mutable dict — override via `agora_agent._tts["params"]["model"] = "bulbul:v3"` after `.with_tts()`. Confirmed structurally and live. |
+| `sal_mode: "recognition"` (speaker-adaptive TTS) — advertised as not requiring picking one speaker. | Enabled it plain. | Live 400: requires non-empty `sample_urls` even in recognition mode — contradicts the framing. Rejected — pre-registering ad hoc incident-call participants' voices isn't realistic. |
+| MiniMax `language_boost` for Tier-1 Hindi-code-switched replies. | `language_boost="hi"` (ISO code, by analogy with Deepgram's own `language` field). | Live TTS error 2013 — MiniMax's real accepted values are full language names (`"English"`, etc.) from a fixed enum, not ISO codes. Removed rather than guess an unverified value. |
+| Live-updating STT/TTS vendor mid-call. | Searched `UpdateAgentsRequestProperties` for an `asr`/`tts` field. | Confirmed from source: doesn't exist. Full agent handoff (stop → poll → start) is the only mechanism — see the multilingual pipeline section above. |
+| English-only phrasing regex for language-switch detection. | `\b(?:switch to\|can we talk in\|...)\s+(tamil\|...)\b`, English sentence structure only. | Failed on real STT output once a non-English tier was active (Tanglish word order, native grammar, transliterated loanwords). Replaced with the token-presence + fuzzy + confirmation detector — see the multilingual pipeline section above. |
+
+**Currently open, unresolved as of this writing** (not a closed hurdle,
+flagged separately so it isn't mistaken for settled): live agent starts
+have begun failing with `401 Invalid token` from Agora's own API, using
+credentials that worked repeatedly earlier in the same development
+session. Root cause unconfirmed — most likely an App Certificate rotation
+on the Agora Console side — needs a teammate with console access to
+verify before this can be marked resolved.
+
+## Voice AI API reference: room creation → call end
+
+Backend paths below are relative to `/api/v1/icall`; voice-agent-server
+paths are relative to wherever `voice-agent/server` is running (`:8000`
+locally).
+
+| Step | Call | Purpose |
+|---|---|---|
+| 1. Room creation | `POST /incidents/{incident_id}/call` | Creates (or fetches) the incident's channel — the only place the channel name is decided |
+| 2. Agent-start config | `GET /channel/{channel_name}/keyterms` | Voice-agent server fetches keyterms + `language_code` before starting the agent |
+| 3. Agent joins | `POST /startAgent` (voice-agent-server) | Starts the Agora agent for the channel with the resolved tier's STT/TTS config |
+| 4. Every turn | `POST /channel/{channel_name}/llm/chat/completions` | Agora's Custom LLM hook — facts/hypotheses/decisions extraction, spoken-reply decision, language-switch trigger detection |
+| 5. Language switch (as needed) | `GET/PATCH /channel/{channel_name}/language-status`, `POST /switchLanguage` (voice-agent-server), `PATCH /channel/{channel_name}/language`, `POST /translate-line` | The detection → ack → handoff → confirmed-applied → translated-greeting loop described above |
+| 6. Live session events | `POST /webhooks/agora` | Agora-pushed events; `agent_left` is the authoritative call-end signal |
+| 7. Agent leaves | `POST /stopAgent` (voice-agent-server) | Stops the Agora agent (also called internally by the switch handoff) |
+| 8. Call status | `PATCH /channel/{channel_name}/status` | Advances the call's lifecycle status (e.g., to `completed`) |
+| Supporting, throughout | `GET /channel/{channel_name}/recap`, `GET /channel/{channel_name}/chat-notes`, `GET/POST /channel/{channel_name}/utterances` | Late-joiner catch-up, agent chat notes, transcript recording |
 
 ## Demo control panel
 
@@ -203,9 +366,29 @@ channel, even as a fallback; an LLM-reviewed cleanup pass on a call's
 content before it becomes a Jira ticket (strips logistics noise, merges
 transcription-garbled duplicate hypotheses, never invents a resolution to a
 question the call never actually answered); an Agora webhook as a second,
-authoritative "call ended" signal independent of the client.
+authoritative "call ended" signal independent of the client; the two-tier
+multilingual pipeline itself (Deepgram Tier 1 zero-switch English/Hindi,
+Sarvam Tier 2 for 9 further languages), its token-presence + fuzzy +
+confirmation switch-trigger detector, and the generic any-state-to-any-state
+handoff mechanism — see "Multilingual voice pipeline" above for the honest
+scope: only `multi`/`ta-IN`/`te-IN`/`gu-IN` are empirically verified against
+real Sarvam STT output, the pre-handoff acknowledgment's cross-language TTS
+behavior is untested, and 6 of the 9 Tier-2 languages' switch-trigger
+lexicons are best-effort, not yet verified.
 
 **Real, currently-open gaps:**
+- **Agora agent-start currently failing with `401 Invalid token`** as of
+  this writing, using credentials that worked repeatedly earlier in
+  development — unconfirmed root cause, most likely an App Certificate
+  rotation; needs Console access to verify. This blocks live testing of
+  everything above until resolved.
+- 6 of the 9 Tier-2 language lexicons (`kn-IN`/`bn-IN`/`mr-IN`/`pa-IN`/
+  `ml-IN`/`or-IN`) are best-effort native spellings, not verified against
+  real Sarvam STT output the way `ta-IN`/`te-IN`/`gu-IN` were.
+- The pre-handoff switch acknowledgment is never translated — when
+  leaving a Tier-2 language, its English text is synthesized by that
+  language's still-active Sarvam TTS voice before the handoff happens.
+  Untested whether this sounds acceptable.
 - **PagerDuty isn't actually integrated.** It exists only as a Deepgram STT
   keyterm (a word to transcribe correctly), zero real API calls anywhere.
   PagerDuty has an official remote MCP server (`mcp.pagerduty.com/mcp`,
