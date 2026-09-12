@@ -156,7 +156,14 @@ class Agent:
     # so it speaks after Watcher's own short default greeting instead of
     # over it (see _start_delegate_avatar_agent) -- a rough heuristic, not
     # a measured value, since Agora has no native cross-agent turn signal.
-    DELEGATE_AVATAR_START_DELAY_SECONDS = 6
+    # DEFAULT_GREETING is ~21 words -- at a natural TTS pace that's ~8-9s
+    # of actual speech, plus 1-2s of connection/TTS-startup latency before
+    # the first audio even begins. 6s was confirmed live (2026-09-12) to
+    # be too short -- the avatar started talking over Watcher's own
+    # greeting. Bumped with real margin rather than a small nudge, since
+    # a slightly-late avatar reads fine in a demo but talking over Watcher
+    # reads as broken.
+    DELEGATE_AVATAR_START_DELAY_SECONDS = 11
 
     def __init__(self):
         self.app_id = os.getenv("AGORA_APP_ID")
@@ -1137,6 +1144,16 @@ class Agent:
                     # on Anam's documented default (24000) happening to
                     # match whatever MiniMax would have used unset.
                     "sample_rate": 24000,
+                    # Confirmed live (2026-09-12): the avatar's voice broke
+                    # up repeatedly. Left unset, this defaults to "high"
+                    # (per Agora's own Anam integration doc) -- real-time
+                    # H264 video plus synced audio at high quality is a
+                    # meaningfully heavier bandwidth/rendering load than
+                    # audio alone, and this network has been the recurring
+                    # root cause behind other flakiness all session (tunnel
+                    # drops, etc). Stepped down explicitly rather than
+                    # leaving it to the heavier default.
+                    "quality": "medium",
                 },
             ))
         )
