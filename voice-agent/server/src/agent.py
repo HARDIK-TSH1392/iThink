@@ -1162,6 +1162,11 @@ class Agent:
             enable_string_uid=False,
             idle_timeout=30,
             expires_in=3600,
+            # Temporary, for diagnosing the mid-utterance audio/video
+            # break -- prints the exact resolved request Agora sends
+            # (secrets redacted) to this process's own stdout, i.e.
+            # .dev/voice-agent-backend.log. Remove once root-caused.
+            debug=True,
         )
 
         logger.info(
