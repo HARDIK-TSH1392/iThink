@@ -1040,39 +1040,27 @@ class Agent:
         avatar_agent_uid = random.randint(10000000, 99999999)
 
         stt = DeepgramSTT(model="nova-3", language="en-IN")
-        # url overridden to Gemini's non-streaming generateContent endpoint
-        # (dropping streamGenerateContent?alt=sse, which this vendor class
-        # hardcodes by default). Root cause per Agora's own optimize-latency
-        # doc: streaming forwards each sentence to TTS/avatar rendering as
-        # soon as it's ready, which is exactly the mute/unmute-every-chunk
-        # pattern confirmed live in the browser console (audio+video both
-        # cut out and back in together every ~2-3s, matching a per-sentence
-        # publish cycle). Non-streaming waits for Gemini's complete response
-        # before handing it to TTS/avatar, trading a bit of initial latency
-        # (acceptable here -- this agent already waits
-        # DELEGATE_AVATAR_START_DELAY_SECONDS before even starting) for one
-        # continuous render instead of many.
-        #
-        # NOT independently verified against a live listener as of this
-        # change (no human available to confirm smoothness) -- confirmed
-        # only that Gemini's plain generateContent endpoint itself returns a
-        # normal, complete response with our real key and this model.
-        # style="gemini" is hardcoded by this vendor's to_config()
-        # regardless of URL; whether Agora's backend parses a non-streaming
-        # body the same way is the one part genuinely unverified. Bounded
-        # risk: this agent is fully independent of Watcher's own session
-        # (wrapped in try/except in the caller), so a bad interaction here
-        # cannot affect Watcher -- worst case is the delegate avatar failing
-        # to start at all, which Agora's own agent-status API (GET
-        # /v2/projects/{appid}/agents/{agent_id}) can confirm or rule out
-        # after the fact via its stop reason.
+        # Reverted the earlier non-streaming generateContent override
+        # (2026-09-12): the theory was that streaming forwards each
+        # sentence to TTS/avatar rendering as soon as it's ready, causing
+        # a mute/unmute-every-chunk pattern -- but confirmed live, on a
+        # fresh test with non-streaming already in place, the avatar's
+        # audio+video still cut out (a genuine server-side unpublish,
+        # confirmed via the browser's own Agora-SDK debug log showing
+        # "receive mute message ... unpublished audio") only ~2.6s into a
+        # much longer greeting -- a mid-utterance cutoff, not a between-
+        # sentence pause, and identical to the symptom this override was
+        # meant to fix. That, plus Agora's own optimize-latency doc
+        # explicitly recommending `stream: true` ("so the agent can start
+        # speaking as soon as possible") with no mention of a per-sentence
+        # publish downside, means the non-streaming theory doesn't hold up
+        # -- reverted to this vendor's own default (streamGenerateContent),
+        # Agora's documented, tested path, rather than an unverified custom
+        # URL override that was never actually confirmed to change Agora's
+        # own request behavior in the first place.
         llm = Gemini(
             api_key=gemini_api_key,
             model="gemini-flash-lite-latest",
-            url=(
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                "gemini-flash-lite-latest:generateContent?key=" + gemini_api_key
-            ),
             system_messages=[{"role": "user", "parts": [{"text": system_prompt}]}],
             greeting_message=greeting,
         )
