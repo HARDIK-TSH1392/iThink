@@ -994,13 +994,35 @@ export default function ConversationComponent({
 	// only after the "Click to enable audio playback" banner shows and
 	// is noticed, usually succeeds silently since most browsers only
 	// gate the *first* autoplay attempt per tab on a user gesture.
+	//
+	// Confirmed live (2026-09-12): depending on `remoteUsers` itself was
+	// the actual cause of the avatar's audio breaking up repeatedly, not
+	// a server/network issue. useRemoteUsers() returns a new array
+	// identity on essentially every render, so this effect re-ran far
+	// more often than "a user joined/left" -- and since track.play() is
+	// async, isPlaying can still read false while a previous play() call
+	// is mid-flight, so a re-run mid-flight called play() AGAIN on the
+	// same already-starting track. The browser's own console debug log
+	// showed exactly that: two RemoteAudioTrack.play() calls a millisecond
+	// apart on the same track, immediately preceded by the audio element's
+	// state machine going "abort -> emptied" -- a second play() call
+	// aborting and restarting the first, audibly, over and over.
+	// remoteUserKey below changes only when the actual thing this effect
+	// cares about changes (who's present, and whether their audio track
+	// has arrived yet), not on every incidental re-render, so this no
+	// longer fires on renders unrelated to that.
+	const remoteUserKey = remoteUsers
+		.map((user) => `${user.uid}:${user.audioTrack ? "1" : "0"}`)
+		.join(",");
+	// biome-ignore lint/correctness/useExhaustiveDependencies: remoteUsers
+	// intentionally excluded; remoteUserKey is the real, stable dependency.
 	useEffect(() => {
 		for (const user of remoteUsers) {
 			if (user.audioTrack && !user.audioTrack.isPlaying) {
 				user.audioTrack.play();
 			}
 		}
-	}, [remoteUsers]);
+	}, [remoteUserKey]);
 
 	const handleEndConversation = useCallback(async () => {
 		const track = localMicrophoneTrack;
