@@ -21,9 +21,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import httpx
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 ITHINK_BACKEND_BASE_URL = os.getenv("ITHINK_BACKEND_BASE_URL", "http://127.0.0.1:8123/api/v1")
+# This service is exposed to the public internet (Agora's cloud calls it
+# directly, see voice-agent/server/agent.py's mcp_servers registration) --
+# TransportSecuritySettings' Host/Origin allowlisting only guards against
+# DNS-rebinding-style browser attacks, not a direct client that already
+# has the tunnel URL (its request naturally carries the matching Host
+# header). A shared secret is the actual access control: unset means the
+# check is skipped entirely, matching dev-without-a-tunnel usage.
+ILOGS_SHARED_SECRET = os.getenv("ILOGS_SHARED_SECRET")
 
 app = MCPServer(
     name="ilogs",
@@ -34,6 +43,7 @@ app = MCPServer(
 @app.tool()
 async def get_recent_logs(
     service: str,
+    ctx: Context,
     region: str = "",
     since_minutes: int = 1440,
     severity: str = "",
@@ -55,6 +65,12 @@ async def get_recent_logs(
     investigation tool. The caller can still pass a smaller value
     explicitly when it actually wants a tight recent window.
     """
+    if ILOGS_SHARED_SECRET:
+        headers = ctx.headers or {}
+        provided = headers.get("x-ilogs-shared-secret")
+        if provided != ILOGS_SHARED_SECRET:
+            raise ToolError("Unauthorized: missing or incorrect shared secret.")
+
     from datetime import datetime, timedelta, timezone
 
     since = (datetime.now(timezone.utc) - timedelta(minutes=since_minutes)).isoformat()

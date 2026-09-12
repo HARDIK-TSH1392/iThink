@@ -339,12 +339,20 @@ class Agent:
             })
         ilogs_mcp_url = os.getenv("ILOGS_MCP_URL")
         if ilogs_mcp_url:
-            mcp_servers.append({
+            ilogs_server: Dict[str, Any] = {
                 "name": "ilogs",
                 "endpoint": ilogs_mcp_url,
                 "allowed_tools": ["get_recent_logs"],
                 "timeout_ms": 8000,
-            })
+            }
+            # Closes the "anyone with the tunnel URL can read our incident
+            # logs" gap -- the tool itself rejects a missing/wrong secret
+            # (see ilogs_mcp_service/server.py). Optional: matches that
+            # service's own "unset means no check" dev-local default.
+            ilogs_shared_secret = os.getenv("ILOGS_SHARED_SECRET")
+            if ilogs_shared_secret:
+                ilogs_server["headers"] = {"X-Ilogs-Shared-Secret": ilogs_shared_secret}
+            mcp_servers.append(ilogs_server)
 
         # filler_words was removed entirely (see the interruption block below)
         # because its only mode at the time -- a static phrase list, fired
