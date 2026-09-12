@@ -76,12 +76,19 @@ async def get_call_by_incident(db: AsyncSession, incident_id: int) -> Optional[I
     return result.scalar_one_or_none()
 
 
-async def get_or_create_call(db: AsyncSession, incident_id: int) -> IncidentCall:
+async def get_or_create_call(
+    db: AsyncSession, incident_id: int, language_code: Optional[str] = None
+) -> IncidentCall:
     """
     The one place a channel name is decided. Orchestration (calendar/email
     invite) and the voice agent (RTC join) both call this instead of
     independently computing a channel name, so there is exactly one source
     of truth per incident rather than two formulas that could drift apart.
+
+    language_code is only applied on the create branch -- an existing call
+    ignores it, same idempotent-creation semantics as channel_name itself.
+    "multi" (Deepgram, English+Hindi native code-switching) is the default
+    when unset.
 
     Raises IncidentNotFoundError if incident_id doesn't exist — the API
     layer turns that into a 404 rather than letting a bad foreign key
@@ -126,6 +133,7 @@ async def get_or_create_call(db: AsyncSession, incident_id: int) -> IncidentCall
             channel_name=generate_channel_name(incident_id),
             status=CALL_STATUS_SCHEDULED,
             structured_state=initial_state,
+            language_code=language_code or "multi",
         )
         db.add(call)
         await db.commit()
@@ -412,6 +420,94 @@ async def record_wrapped_up(db: AsyncSession, call: IncidentCall) -> IncidentCal
     old = call.structured_state or {}
     new_state = dict(old)
     new_state["wrapped_up"] = True
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def record_language_switch_pending(
+    db: AsyncSession, call: IncidentCall, target_code: str
+) -> IncidentCall:
+    """
+    Marks that a spoken language-switch trigger was detected and a handoff
+    was fired at the voice-agent server -- iCall_api._process_turn checks
+    this so the frontend's language-status poll can show a "switching..."
+    banner instead of the handoff (which has real, measured latency) just
+    looking like the agent went silent. Cleared by
+    record_language_switch_applied once the voice-agent server confirms
+    the new agent is up.
+    """
+    old = call.structured_state or {}
+    new_state = dict(old)
+    new_state["language_switch_pending"] = True
+    new_state["language_switch_target"] = target_code
+    new_state["language_switch_started_at"] = datetime.now(timezone.utc).isoformat()
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def record_language_switch_applied(
+    db: AsyncSession, call: IncidentCall, new_code: str
+) -> IncidentCall:
+    """
+    Called once the voice-agent server confirms the handoff completed --
+    updates the durable language_code (read fresh by the next agent start)
+    and clears the transient pending flags record_language_switch_pending
+    set.
+    """
+    old = call.structured_state or {}
+    new_state = dict(old)
+    new_state.pop("language_switch_pending", None)
+    new_state.pop("language_switch_target", None)
+    new_state.pop("language_switch_started_at", None)
+    call.structured_state = new_state
+    call.language_code = new_code
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def record_language_switch_confirmation_pending(
+    db: AsyncSession, call: IncidentCall, target_code: str
+) -> IncidentCall:
+    """
+    Stage 3 of the language-switch detector (see iCall_utils.
+    detect_language_switch_trigger): a language was named but no clear
+    switch-verb accompanied it, so instead of switching outright or
+    silently dropping it, the agent asks and this flag records what it's
+    waiting for. Checked (and its expiry enforced) by iCall_api._process_
+    turn against LANGUAGE_CONFIRMATION_TIMEOUT_S before trusting a later
+    "yes" -- same rebuild-fresh-dict discipline as every other record_*
+    function here.
+    """
+    old = call.structured_state or {}
+    new_state = dict(old)
+    new_state["pending_language_confirmation"] = {
+        "target": target_code,
+        "asked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    call.structured_state = new_state
+    await db.commit()
+    await db.refresh(call)
+    return call
+
+
+async def clear_language_switch_confirmation_pending(
+    db: AsyncSession, call: IncidentCall
+) -> IncidentCall:
+    """
+    Clears the Stage-3 confirmation flag once it's been resolved (an
+    affirmative/negative reply was seen) or has expired -- see
+    record_language_switch_confirmation_pending.
+    """
+    old = call.structured_state or {}
+    if "pending_language_confirmation" not in old:
+        return call
+    new_state = dict(old)
+    new_state.pop("pending_language_confirmation", None)
     call.structured_state = new_state
     await db.commit()
     await db.refresh(call)

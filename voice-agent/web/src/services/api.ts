@@ -285,3 +285,29 @@ export async function getRecap(channelName: string): Promise<LiveRecap> {
     sharedScreens: result.data?.shared_screens ?? [],
   }
 }
+
+export interface LanguageStatus {
+  languageCode: string
+  switchPending: boolean
+  switchTarget: string | null
+}
+
+// Polled by the transcript panel to show a "switching to Tamil..." banner
+// while a language handoff is in flight -- the handoff has real, measured
+// latency (voice-agent server's switch_language does a stop -> poll ->
+// start round trip), so pretending it's instant would just look like the
+// agent went silent.
+export async function getLanguageStatus(channelName: string): Promise<LanguageStatus> {
+  const response = await fetch(`/api/languageStatus/${encodeURIComponent(channelName)}`)
+
+  if (!response.ok) {
+    return { languageCode: "multi", switchPending: false, switchTarget: null }
+  }
+
+  const result = await response.json()
+  return {
+    languageCode: result.data?.language_code ?? "multi",
+    switchPending: Boolean(result.data?.switch_pending),
+    switchTarget: result.data?.switch_target ?? null,
+  }
+}

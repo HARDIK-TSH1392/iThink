@@ -72,6 +72,10 @@ const nextConfig: NextConfig = {
           source: '/api/recap/:channel',
           destination: `${ithinkUrl}/icall/channel/:channel/recap`,
         },
+        {
+          source: '/api/languageStatus/:channel',
+          destination: `${ithinkUrl}/icall/channel/:channel/language-status`,
+        },
       )
     }
 

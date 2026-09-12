@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -18,6 +19,9 @@ from .iCall_model import IncidentCall
 from .iCall_schema import (
     IncidentCallRead,
     CallStatusUpdate,
+    CallCreateRequest,
+    LanguageSwitchUpdate,
+    TranslateLineRequest,
     CallUtteranceCreate,
     CallUtteranceRead,
     AgentUtteranceRead,
@@ -41,6 +45,10 @@ from .iCall_service import (
     record_direct_address_reply,
     record_silence_streak,
     record_wrapped_up,
+    record_language_switch_pending,
+    record_language_switch_applied,
+    record_language_switch_confirmation_pending,
+    clear_language_switch_confirmation_pending,
     get_call_turn_lock,
     infer_and_store_participant_roles,
     IncidentNotFoundError,
@@ -66,6 +74,13 @@ from .iCall_utils import (
     redact_sensitive_reply,
     build_keyterms,
     transcribe_delegate_voice_note,
+    detect_language_switch_trigger,
+    detect_confirmation_response,
+    build_language_switch_ack,
+    build_language_switch_confirmation_prompt,
+    LANGUAGE_CONFIRMATION_TIMEOUT_S,
+    translate_fixed_line,
+    trigger_language_handoff,
     CALL_STATUS_COMPLETED,
     EVENT_AGENT_LEFT,
     CLOSING_LINE,
@@ -97,6 +112,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 @router.post("/incidents/{incident_id}/call", response_model=IncidentCallRead)
 async def get_or_create_call_endpoint(
     incident_id: int,
+    payload: CallCreateRequest = CallCreateRequest(),
     db: AsyncSession = Depends(get_db),
 ) -> IncidentCallRead:
     """
@@ -104,9 +120,13 @@ async def get_or_create_call_endpoint(
     doesn't exist yet. Orchestration calls this to get the channel name for
     the meeting invite; the voice agent calls this to know which channel to
     join. Both get the same answer because there's one row, not two guesses.
+
+    payload.language_code is only applied on first creation (see
+    get_or_create_call) -- demo/dashboard.html's bodyless POST still works,
+    defaulting to "multi" (English/Hindi).
     """
     try:
-        call = await get_or_create_call(db, incident_id)
+        call = await get_or_create_call(db, incident_id, language_code=payload.language_code)
     except IncidentNotFoundError:
         raise HTTPException(status_code=404, detail="Incident not found")
     return IncidentCallRead.model_validate(call)
@@ -283,11 +303,14 @@ async def get_keyterms_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Deepgram keyterm-prompting string for this call (see
-    iCall_utils.build_keyterms). Called by the voice-agent service right
-    before it starts the STT vendor for a call -- channel-keyed for the
-    same reason as recap/chat-notes, the caller only knows the channel
-    name at that point, not the incident id.
+    Voice-pipeline config for this call: Deepgram keyterm-prompting string
+    (see iCall_utils.build_keyterms) plus language_code, the durable
+    Tier-1/Tier-2 selection agent.py branches STT/TTS/turn_detection on.
+    Called by the voice-agent service right before it starts the STT
+    vendor for a call -- channel-keyed for the same reason as recap/
+    chat-notes, the caller only knows the channel name at that point, not
+    the incident id. URL path kept as-is (voice-agent already calls it) --
+    only the response grew a field, not a second round trip.
     """
     call = await get_call_by_channel_name(db, channel_name)
     if not call:
@@ -295,7 +318,73 @@ async def get_keyterms_endpoint(
 
     incident = await get_incident(db, call.incident_id)
     service = incident.service if incident else None
-    return {"code": 0, "data": {"keyterm": build_keyterms(service)}, "msg": "success"}
+    return {
+        "code": 0,
+        "data": {"keyterm": build_keyterms(service), "language_code": call.language_code},
+        "msg": "success",
+    }
+
+
+@router.get("/channel/{channel_name}/language-status")
+async def get_language_status_endpoint(
+    channel_name: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Polled by the frontend transcript panel to show a "switching to
+    Tamil..." banner while a handoff is in flight -- the handoff has real,
+    measured latency (see voice-agent server's switch_language), so
+    pretending it's instant would just look like the agent went silent.
+    """
+    call = await get_call_by_channel_name(db, channel_name)
+    if not call:
+        raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
+
+    state = call.structured_state or {}
+    return {
+        "code": 0,
+        "data": {
+            "language_code": call.language_code,
+            "switch_pending": bool(state.get("language_switch_pending")),
+            "switch_target": state.get("language_switch_target"),
+        },
+        "msg": "success",
+    }
+
+
+@router.patch("/channel/{channel_name}/language")
+async def update_language_endpoint(
+    channel_name: str,
+    payload: LanguageSwitchUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Called by the voice-agent server once a language-switch handoff
+    completes (new agent confirmed running) -- clears the pending flags
+    record_language_switch_pending set and commits the new durable
+    language_code, read fresh by the next agent start for this channel.
+    """
+    call = await get_call_by_channel_name(db, channel_name)
+    if not call:
+        raise HTTPException(status_code=404, detail=f"No call found for channel '{channel_name}'")
+
+    await record_language_switch_applied(db, call, payload.code)
+    return {"code": 0, "msg": "success"}
+
+
+@router.post("/translate-line")
+async def translate_line_endpoint(payload: TranslateLineRequest):
+    """
+    Translates one deterministic spoken string into the target Tier-2
+    language -- called by voice-agent server's switch_language for the
+    post-handoff "I'm back -- now listening in X" greeting, since that
+    voice is the one actually built for the target language (unlike the
+    pre-handoff acknowledgment, which stays in English deliberately -- see
+    translate_fixed_line's own docstring and the language_code=="multi"
+    no-op case it already handles).
+    """
+    translated = await translate_fixed_line(payload.text, payload.language_code)
+    return {"code": 0, "data": {"translated": translated}, "msg": "success"}
 
 
 @router.get("/channel/{channel_name}/delegate")
@@ -538,19 +627,20 @@ async def _decide_spoken_reply(
         # exactly as accurate as before; this just says what actually
         # happened before promising where the fuller version goes.
         spoken_reply = redact_sensitive_reply(f"{build_health_recap(call.structured_state)} {CLOSING_LINE}")
+        spoken_reply = await translate_fixed_line(spoken_reply, call.language_code)
         call = await record_wrapped_up(db, call)
         await record_agent_utterance(db, call.id, spoken_reply, "is_wrapping_up")
         return spoken_reply
 
     if update.spoken_reply in (FALLBACK_REPLY, MODEL_UNAVAILABLE_REPLY, MALFORMED_RESPONSE_FALLBACK):
-        spoken_reply = update.spoken_reply
         fallback_names = {
             FALLBACK_REPLY: "FALLBACK_REPLY",
             MODEL_UNAVAILABLE_REPLY: "MODEL_UNAVAILABLE_REPLY",
             MALFORMED_RESPONSE_FALLBACK: "MALFORMED_RESPONSE_FALLBACK",
         }
+        spoken_reply = await translate_fixed_line(update.spoken_reply, call.language_code)
         await record_agent_utterance(
-            db, call.id, spoken_reply, f"fallback:{fallback_names[spoken_reply]}"
+            db, call.id, spoken_reply, f"fallback:{fallback_names[update.spoken_reply]}"
         )
         return spoken_reply
 
@@ -724,8 +814,8 @@ async def _process_tool_result_turn(
     old_facts = list((call.structured_state or {}).get("facts", []))
 
     result = await generate_structuring_update(
-        payload.messages, call.structured_state or {}, service, tool_result_text=tool_result_text,
-        region=region, incident_age_minutes=incident_age_minutes,
+        payload.messages, call.structured_state or {}, service, language_code=call.language_code,
+        tool_result_text=tool_result_text, region=region, incident_age_minutes=incident_age_minutes,
     )
     update = result.update
     call = await apply_structuring_update(db, call, update)
@@ -765,6 +855,59 @@ async def _process_turn(
     last_message = payload.messages[-1] if payload.messages else None
     if last_message is not None and last_message.role == "tool":
         return await _process_tool_result_turn(db, call, channel_name, payload, last_message)
+
+    # Explicit spoken language-switch request ("switch to Tamil", "can we
+    # talk in Hindi") -- checked before the silence-trigger branch, cheap
+    # and deterministic, same discipline as _is_silence_trigger: this
+    # isn't a turn to run through generate_structuring_update at all.
+    # Matched against whatever the currently-active STT vendor already
+    # transcribed (English/Hindi via Deepgram to enter Tier 2, or the
+    # active Tier-2 language itself to switch again) -- see
+    # detect_language_switch_trigger's docstring for why this is
+    # order-independent token-presence matching, not English-only phrase
+    # matching, and why a bare language mention with no verb goes through
+    # a confirmation question (Stage 3) rather than switching outright or
+    # being silently dropped.
+    trigger_text = next(
+        (m.content for m in reversed(payload.messages) if m.role == "user" and m.content), None
+    )
+    if trigger_text:
+        pending = (call.structured_state or {}).get("pending_language_confirmation")
+        if pending:
+            asked_at = datetime.fromisoformat(pending["asked_at"])
+            expired = (datetime.now(timezone.utc) - asked_at).total_seconds() > LANGUAGE_CONFIRMATION_TIMEOUT_S
+            if not expired:
+                answer = detect_confirmation_response(trigger_text)
+                call = await clear_language_switch_confirmation_pending(db, call)
+                if answer is True:
+                    target_code = pending["target"]
+                    call = await record_language_switch_pending(db, call, target_code)
+                    spoken_reply = build_language_switch_ack(target_code)
+                    await record_agent_utterance(db, call.id, spoken_reply, "language_switch")
+                    asyncio.create_task(trigger_language_handoff(channel_name, target_code))
+                    return spoken_reply, None
+                # answer is False or None (unrecognized/no reply) -- decline
+                # is the safe default (see detect_confirmation_response's
+                # docstring); fall through and process this turn normally,
+                # it may have real content of its own.
+            else:
+                call = await clear_language_switch_confirmation_pending(db, call)
+
+        result = detect_language_switch_trigger(trigger_text)
+        if result.target and result.target != call.language_code:
+            if result.confident:
+                call = await record_language_switch_pending(db, call, result.target)
+                spoken_reply = build_language_switch_ack(result.target)
+                await record_agent_utterance(db, call.id, spoken_reply, "language_switch")
+                asyncio.create_task(trigger_language_handoff(channel_name, result.target))
+                return spoken_reply, None
+            else:
+                call = await record_language_switch_confirmation_pending(db, call, result.target)
+                spoken_reply = await translate_fixed_line(
+                    build_language_switch_confirmation_prompt(result.target), call.language_code
+                )
+                await record_agent_utterance(db, call.id, spoken_reply, "language_switch_confirm")
+                return spoken_reply, None
 
     if _is_silence_trigger(payload.messages):
         # Confirmed live (incident-39): the room's silence timer doesn't
@@ -834,8 +977,8 @@ async def _process_turn(
     old_facts = list((call.structured_state or {}).get("facts", []))
 
     result = await generate_structuring_update(
-        payload.messages, call.structured_state or {}, service, tools=payload.tools,
-        region=region, incident_age_minutes=incident_age_minutes,
+        payload.messages, call.structured_state or {}, service, language_code=call.language_code,
+        tools=payload.tools, region=region, incident_age_minutes=incident_age_minutes,
     )
     if result.tool_call is not None:
         # The model decided to call a native MCP tool instead of answering

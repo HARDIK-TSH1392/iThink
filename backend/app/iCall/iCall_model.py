@@ -33,6 +33,15 @@ class IncidentCall(Base):
 
     structured_state: Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
 
+    # "multi" = Tier 1 (Deepgram, English+Hindi native code-switching, no
+    # vendor switch needed). Any other value is one of Sarvam's own
+    # target_language_code strings (ta-IN, te-IN, kn-IN, bn-IN, mr-IN,
+    # gu-IN, pa-IN, ml-IN, or-IN) -- reused as-is so this value flows
+    # straight into SarvamSTT/SarvamTTS with no translation table. Must be
+    # a real column, not a structured_state key: it has to be known at
+    # agent-start time, before structured_state exists.
+    language_code: Mapped[str] = mapped_column(String, default="multi")
+
     # uid -> {name, directory_matched, directory_title, directory_team,
     # directory_org_role, inferred_role, inferred_scores, rationale,
     # final_role, source}. Populated once, after the call ends (see

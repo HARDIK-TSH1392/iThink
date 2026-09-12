@@ -1,9 +1,19 @@
 "use client";
 
 import { FileText, MessageSquareDashed, Sparkles, StickyNote } from "lucide-react";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { getInitial } from "@/lib/conversation";
+import { getLanguageStatus, type LanguageStatus } from "@/services/api";
+
+const LANGUAGE_DISPLAY_NAMES: Record<string, string> = {
+	multi: "English/Hindi",
+	"ta-IN": "Tamil", "te-IN": "Telugu", "kn-IN": "Kannada", "bn-IN": "Bengali",
+	"mr-IN": "Marathi", "gu-IN": "Gujarati", "pa-IN": "Punjabi",
+	"ml-IN": "Malayalam", "or-IN": "Odia",
+};
+
+const LANGUAGE_STATUS_POLL_MS = 3_000;
 
 type TranscriptMessage = {
 	turn_id?: string | number;
@@ -24,7 +34,26 @@ type QuickstartTranscriptPanelProps = {
 	localUid: string;
 	participantNames: Record<string, string>;
 	chatNotes: ChatNote[];
+	channel: string;
 };
+
+// Deepgram mishears "Watcher" often enough that the backend now recognizes
+// these as valid wake-word attempts too (see iCall_utils.py's
+// _KNOWN_MISHEARINGS -- keep both lists in sync). That fix makes the agent
+// respond correctly, but doesn't change the text Deepgram actually
+// produced -- without this, the transcript panel would keep showing
+// "Voucher" on screen even while the agent visibly answers as if it heard
+// "Watcher". Display-only: doesn't touch persisted transcripts or
+// anything the structuring pipeline sees, just what's rendered here.
+// Extended with Sarvam-observed mishearings (vachar, vache) -- same root
+// W-to-V acoustic confusion pattern, independently confirmed on a second,
+// unrelated STT vendor. Keep in sync with iCall_utils.py's
+// _KNOWN_MISHEARINGS.
+const KNOWN_MISHEARINGS = /\b(voucher|vajar|vucher|voacher|vacher|varcher|vachar|vache)\b/gi;
+
+function displayText(text: string): string {
+	return text.replace(KNOWN_MISHEARINGS, "Watcher");
+}
 
 function formatMessageTime(createdAt?: number) {
 	if (!createdAt) return null;
@@ -41,8 +70,30 @@ export function QuickstartTranscriptPanel({
 	localUid,
 	participantNames,
 	chatNotes,
+	channel,
 }: QuickstartTranscriptPanelProps) {
 	const scrollRef = useRef<HTMLDivElement>(null);
+
+	// Polled, not pushed -- the handoff itself has real, measured latency
+	// (voice-agent server's switch_language does a stop -> poll -> start
+	// round trip), so this banner exists specifically to not make that
+	// gap look like the agent went silent.
+	const [languageStatus, setLanguageStatus] = useState<LanguageStatus | null>(null);
+	useEffect(() => {
+		if (!channel) return;
+		let cancelled = false;
+		const poll = () => {
+			getLanguageStatus(channel).then((status) => {
+				if (!cancelled) setLanguageStatus(status);
+			});
+		};
+		poll();
+		const interval = setInterval(poll, LANGUAGE_STATUS_POLL_MS);
+		return () => {
+			cancelled = true;
+			clearInterval(interval);
+		};
+	}, [channel]);
 	// Sticky-scroll, not force-scroll: without tracking this, the effect
 	// below re-ran on every render (new turns, streaming token updates) and
 	// unconditionally snapped scrollTop back to the bottom, fighting any
@@ -88,6 +139,16 @@ export function QuickstartTranscriptPanel({
 				</div>
 			</div>
 
+			{languageStatus?.switchPending ? (
+				<div
+					className="flex shrink-0 items-center gap-2 border-b border-primary/20 bg-primary/10 px-4 py-2 text-xs font-medium text-primary"
+					aria-live="polite"
+				>
+					<span className="h-2 w-2 animate-pulse rounded-full bg-primary" aria-hidden="true" />
+					Switching to {LANGUAGE_DISPLAY_NAMES[languageStatus.switchTarget ?? ""] ?? languageStatus.switchTarget}...
+				</div>
+			) : null}
+
 			{chatNotes.length > 0 ? (
 				<div
 					className="flex max-h-32 shrink-0 flex-col gap-2 overflow-y-auto border-b border-amber-500/20 bg-amber-500/10 px-4 py-3"
@@ -122,7 +183,8 @@ export function QuickstartTranscriptPanel({
 							: isLocal
 								? "You"
 								: (participantNames[uidStr] ?? `Participant ${uidStr}`);
-						const text = message.text?.trim();
+						const rawText = message.text?.trim();
+						const text = isAgent || !rawText ? rawText : displayText(rawText);
 						const time = formatMessageTime(message.createdAt);
 
 						return (
