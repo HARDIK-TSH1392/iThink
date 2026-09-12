@@ -313,6 +313,16 @@ class Agent:
         # GET /ilogs/ (see backend/ilogs_mcp_service/) -- both need a
         # publicly reachable endpoint since Agora's cloud calls them, not
         # this local process.
+        # allowed_tools/timeout_ms confirmed against Agora's actual REST API
+        # schema (Docs-Source's join.mdx Parameter definitions) -- entries
+        # are otherwise Dict[str, Any] in the SDK, completely unvalidated,
+        # so a typo'd key here would silently do nothing rather than error.
+        # Without allowed_tools, GitHub's real remote MCP server exposes its
+        # FULL tool list to the live LLM -- confirmed via tools/list --
+        # including create_pull_request, merge_pull_request, delete_file,
+        # push_files, create_repository, etc. Watcher only ever needs to
+        # answer questions during a live incident call, never take GitHub
+        # actions, so scoped to read-only investigation tools only.
         mcp_servers = []
         github_token = os.getenv("GITHUB_TOKEN")
         if github_token:
@@ -320,10 +330,21 @@ class Agent:
                 "name": "github",
                 "endpoint": "https://api.githubcopilot.com/mcp/",
                 "headers": {"Authorization": f"Bearer {github_token}"},
+                "allowed_tools": [
+                    "list_commits", "get_commit", "list_pull_requests",
+                    "pull_request_read", "list_issues", "issue_read",
+                    "get_file_contents", "search_commits", "search_code",
+                ],
+                "timeout_ms": 8000,
             })
         ilogs_mcp_url = os.getenv("ILOGS_MCP_URL")
         if ilogs_mcp_url:
-            mcp_servers.append({"name": "ilogs", "endpoint": ilogs_mcp_url})
+            mcp_servers.append({
+                "name": "ilogs",
+                "endpoint": ilogs_mcp_url,
+                "allowed_tools": ["get_recent_logs"],
+                "timeout_ms": 8000,
+            })
 
         # filler_words was removed entirely (see the interruption block below)
         # because its only mode at the time -- a static phrase list, fired
